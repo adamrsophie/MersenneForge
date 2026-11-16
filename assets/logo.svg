@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="MersenneForge">
+  <title>MersenneForge</title>
+  <rect width="512" height="512" rx="112" fill="#14161B"/>
+  <g fill="#FF6A2B">
+    <rect x="124" y="126" width="16" height="36" rx="4"/>
+    <rect x="164" y="102" width="16" height="60" rx="4"/>
+    <rect x="204" y="78" width="16" height="84" rx="4"/>
+    <rect x="244" y="54" width="16" height="108" rx="4"/>
+    <rect x="284" y="78" width="16" height="84" rx="4"/>
+    <rect x="324" y="102" width="16" height="60" rx="4"/>
+    <rect x="364" y="126" width="16" height="36" rx="4"/>
+  </g>
+  <path fill="#F2EDE4" d="M60 214 L168 190 L452 190 L452 250 L356 250 C330 250 316 268 316 296 L316 330 L404 372 L404 420 L290 420 L256 372 L222 420 L108 420 L108 372 L196 330 L196 296 C196 268 182 250 156 250 L150 250 C110 250 78 236 60 214 Z"/>
+</svg>

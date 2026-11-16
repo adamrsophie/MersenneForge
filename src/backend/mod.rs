@@ -6,14 +6,25 @@
 //! check boundaries, the checkpoint decisions, or the result classification.
 //!
 //! Implementations:
-//! - `cpu`: exact host arithmetic, always available.
-//! - `cuda`: the native facade over the pinned PRPLL kernels, behind the
-//!   `cuda` Cargo feature.
+//! - `cpu`: exact host bigint arithmetic with Mersenne folding, always available.
+//! - `dwt`: f64 irrational-base discrete weighted transform on the host, pure
+//!   Rust, with a roundoff check that reports `BackendError::Fault`.
+//! - `gpu`: exact integer NTT over GF(M31^2) on the GPU via `wgpu`, behind the
+//!   `gpu` Cargo feature.
+//! - `cuda`: NVIDIA GPU backend on `cudarc` with CUDA C kernels authored in
+//!   this repository, behind the `cuda` Cargo feature.
 //!
 //! Representation rule: the only representation that crosses this trait is the
 //! canonical [`Residue`] (little-endian 32-bit limbs, 0 <= x < N, unique zero).
 //! Balanced mixed-radix words, transformed buffers, and device memory stay
 //! inside the backend.
+
+pub mod cpu;
+#[cfg(feature = "cuda")]
+pub mod cuda;
+pub mod dwt;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 
 use crate::residue::Residue;
 

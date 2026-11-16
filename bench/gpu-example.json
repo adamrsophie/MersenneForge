@@ -1,0 +1,31 @@
+{
+  "name": "gpu-example",
+  "order": "paired",
+  "repeats": 5,
+  "warmups": 1,
+  "entries": [
+    {
+      "kind": "engine",
+      "name": "prp-gpu",
+      "test": "prp",
+      "exponent": 1257787,
+      "backend": "gpu",
+      "options": { "block_size": 1000, "proof_power": 8, "device": 0, "budget_secs": 3600 }
+    },
+    {
+      "kind": "engine",
+      "name": "prp-dwt",
+      "test": "prp",
+      "exponent": 1257787,
+      "backend": "dwt",
+      "options": { "block_size": 1000, "proof_power": 8 }
+    },
+    {
+      "kind": "external",
+      "name": "upstream-baseline",
+      "argv": ["REPLACE_WITH_THE_EXACT_TUNED_UPSTREAM_COMMAND"],
+      "cwd": "work/upstream",
+      "timeout_secs": 7200
+    }
+  ]
+}

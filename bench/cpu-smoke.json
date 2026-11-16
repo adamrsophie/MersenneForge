@@ -1,0 +1,38 @@
+{
+  "name": "cpu-smoke",
+  "order": "randomized",
+  "seed": 20261115,
+  "repeats": 3,
+  "warmups": 1,
+  "entries": [
+    {
+      "kind": "engine",
+      "name": "prp-4423-cpu",
+      "test": "prp",
+      "exponent": 4423,
+      "backend": "cpu",
+      "options": { "block_size": 200, "proof_power": 6 }
+    },
+    {
+      "kind": "engine",
+      "name": "prp-4423-dwt",
+      "test": "prp",
+      "exponent": 4423,
+      "backend": "dwt",
+      "options": { "block_size": 200, "proof_power": 6 }
+    },
+    {
+      "kind": "engine",
+      "name": "ll-4423-dwt",
+      "test": "ll",
+      "exponent": 4423,
+      "backend": "dwt",
+      "options": { "log_step": 1000 }
+    },
+    {
+      "kind": "external",
+      "name": "external-true",
+      "argv": ["true"]
+    }
+  ]
+}

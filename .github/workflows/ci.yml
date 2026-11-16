@@ -1,0 +1,48 @@
+# Copyright (C) 2026 Adam R Sophie. GPL-3.0-only.
+#
+# CPU continuous integration. GPU and CUDA tests (tests/protocol_gpu.rs,
+# tests/protocol_cuda.rs) need real hardware and are NOT run here; the gpu
+# feature is only compiled, which proves nothing about GPU arithmetic.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cpu:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Build
+        run: cargo build --locked --all-targets
+      - name: Test
+        run: cargo test --locked
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Format
+        run: cargo fmt --check
+      - name: Compile the gpu feature (no GPU needed, tests not run)
+        run: cargo check --locked --features gpu --all-targets
+      - name: Compile the cuda feature (no CUDA needed, hardware tests not run)
+        run: cargo check --locked --features cuda --all-targets
+      - name: CUDA kernel host emulation (kernel source compiled as C++ on the CPU)
+        run: cargo test --locked --features cuda --lib backend::cuda && cargo test --locked --features cuda --test cuda_kernel_emulation
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - name: Build at the minimum supported Rust version
+        run: cargo build --locked
