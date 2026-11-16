@@ -1,0 +1,7 @@
+# Internal documents, prompts, reading clones, and review outputs
+documentation/
+target/
+.DS_Store
+*.swp
+/work/
+/bench-out/
