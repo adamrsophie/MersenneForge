@@ -14,7 +14,7 @@ Host for every result below: Apple M2 (macOS 27.2, arm64), Rust 1.100.0 stable. 
 | PRP with Gerbicz check, rollback, stop conditions | yes | yes | yes (`cpu`, `dwt`) | Metal only | n/a | no |
 | LL with Jacobi check | yes | yes | yes (`cpu`, `dwt`) | Metal only | n/a | no |
 | Checkpoint format, atomic write, resume | yes | yes | yes | Metal only | no upstream savefile compatibility (by design) | no |
-| PRP proof generation and verification (v2) | yes | yes | yes | Metal only | one direction: an upstream generated proof verifies here; our proofs have NOT been checked by an upstream verifier | no |
+| PRP proof generation and verification (v2) | yes | yes | yes | Metal only | one direction: an upstream generated proof verifies here and our M786433 proof is byte-identical to it; our proofs have NOT been checked by an upstream verifier | no |
 | Bench harness | yes | yes | yes (`bench/cpu-smoke.json`) | no | n/a | no comparison measured |
 
 Continuous integration (`.github/workflows/ci.yml`) runs only the CPU checks; it compiles the `gpu` and `cuda` features but never runs GPU or CUDA tests. Every GPU result in this report was observed by hand on the host above.
@@ -46,6 +46,8 @@ Ignored tests, run explicitly:
 | `MERSENNE_FORGE_UPSTREAM_PROOF=<path>/786433-10.proof cargo test --release --test upstream_proof -- --ignored` | ok: the proof file shipped in the PRPLL source tree at the pinned commit (`test/786433-10.proof`) parses and verifies (M786433, power 10, composite); a copy with one bit flipped is rejected |
 
 The same upstream proof also verifies from the CLI on `dwt` and on `gpu` (Metal): `mersenne-forge verify --proof work/upstream-786433-10.proof --backend gpu --budget 30m` reported `accepted`, `M786433 composite`.
+
+Generation agrees with upstream on this exponent: `mersenne-forge run --test prp --exponent 786433 --backend gpu --proof-power 10 --proof-dir work/m786433/proof --checkpoint-dir work/m786433/ckpt --budget 40m` (Metal, 970 s wall) reported `composite, res64 bfb6553c004222ba`, 11 Gerbicz checks passed, self verification accepted, and `cmp work/m786433/proof/786433-10.proof <upstream>/test/786433-10.proof` exits 0: the file is byte-identical to the proof shipped upstream. This is format and generation evidence; it is not a test of an upstream verifier accepting our files.
 
 ## What the tests establish
 

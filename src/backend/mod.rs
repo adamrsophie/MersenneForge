@@ -78,7 +78,7 @@ pub type BackendResult<T> = Result<T, BackendError>;
 /// state never silently crosses incompatible configurations.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BackendIdentity {
-    /// "cpu" or "cuda".
+    /// "cpu", "dwt", "gpu", or "cuda".
     pub kind: String,
     /// Build identity: crate version plus, for native backends, the pinned
     /// upstream revision and the kernel source hash.
