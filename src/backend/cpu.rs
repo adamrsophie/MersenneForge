@@ -14,7 +14,9 @@ use std::collections::HashMap;
 use num_bigint::BigUint;
 use num_traits::Zero;
 
-use super::{Backend, BackendError, BackendIdentity, BackendResult, Reg};
+use super::{
+    new_handle, Backend, BackendError, BackendIdentity, BackendResult, MemoryEstimate, Reg,
+};
 use crate::residue::{modulus, Residue};
 
 /// Largest exponent the CPU backend accepts (residues of 512 MiB each).
@@ -23,6 +25,29 @@ pub const MAX_EXPONENT: u32 = u32::MAX;
 /// Inclusive exponent range of this backend.
 pub fn supported_exponents() -> (u32, u32) {
     (2, MAX_EXPONENT)
+}
+
+const PLAN: &str = "bigint-mersenne-fold";
+
+/// Host memory for exponent p. A register is a `BigUint` of `ceil(p / 64)`
+/// 64-bit digits. The fixed figure counts the modulus and the peak of one
+/// operation: the double-width product, the two fold halves, and the copy of
+/// the second operand in `mul`, six register sizes in all. Allocator
+/// overhead is not counted.
+pub fn memory_estimate(p: u32) -> BackendResult<MemoryEstimate> {
+    let (lo, hi) = supported_exponents();
+    if p < lo || p > hi {
+        return Err(BackendError::Unsupported(format!(
+            "exponent {p} defines no modulus"
+        )));
+    }
+    let reg = 8 * u64::from(p).div_ceil(64);
+    Ok(MemoryEstimate {
+        plan: PLAN.into(),
+        bytes_per_register: reg,
+        fixed_bytes: 6 * reg,
+        on_device: false,
+    })
 }
 
 /// A corruption applied directly to a resident residue, for protocol tests.
@@ -36,7 +61,6 @@ pub struct CpuBackend {
     p: u32,
     n: BigUint,
     regs: HashMap<u32, BigUint>,
-    next: u32,
 }
 
 impl CpuBackend {
@@ -50,7 +74,6 @@ impl CpuBackend {
             p,
             n: modulus(p),
             regs: HashMap::new(),
-            next: 0,
         })
     }
 
@@ -105,19 +128,15 @@ impl Backend for CpuBackend {
         BackendIdentity {
             kind: "cpu".into(),
             build: format!("mersenne-forge {}", env!("CARGO_PKG_VERSION")),
-            plan: "bigint-mersenne-fold".into(),
+            plan: PLAN.into(),
             device: String::new(),
         }
     }
 
     fn alloc(&mut self) -> BackendResult<Reg> {
-        let id = self.next;
-        self.next = self
-            .next
-            .checked_add(1)
-            .ok_or_else(|| BackendError::Allocation("handle space exhausted".into()))?;
-        self.regs.insert(id, BigUint::zero());
-        Ok(Reg(id))
+        let r = new_handle()?;
+        self.regs.insert(r.0, BigUint::zero());
+        Ok(r)
     }
 
     fn free(&mut self, r: Reg) -> BackendResult<()> {
@@ -191,5 +210,35 @@ impl Backend for CpuBackend {
 
     fn sync(&mut self) -> BackendResult<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_estimate_matches_the_resident_digits() {
+        assert!(matches!(
+            memory_estimate(1),
+            Err(BackendError::Unsupported(_))
+        ));
+        for p in [2u32, 61, 64, 65, 127, 86243, u32::MAX] {
+            let m = memory_estimate(p).unwrap();
+            assert_eq!(m.plan, PLAN);
+            assert!(!m.on_device);
+            assert_eq!(m.fixed_bytes, 6 * m.bytes_per_register);
+            if p > 200_000 {
+                continue;
+            }
+            let mut be = CpuBackend::new(p).unwrap();
+            assert_eq!(be.identity().plan, m.plan);
+            // The largest residue, N - 1, occupies every digit.
+            let r = be.alloc().unwrap();
+            let x = Residue::from_biguint(p, &(&be.n - 1u32));
+            be.import(r, &x).unwrap();
+            let digits = be.regs[&r.0].to_u64_digits().len() as u64;
+            assert_eq!(8 * digits, m.bytes_per_register, "p={p}");
+        }
     }
 }

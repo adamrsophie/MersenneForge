@@ -29,8 +29,8 @@ use crate::backend::{Backend, BackendError};
 use crate::checkpoint::{Checkpoint, CheckpointError, CheckpointMeta, FORMAT_VERSION};
 use crate::residue::{modulus, Residue};
 use crate::run::{
-    round_up, Control, Evidence, FaultTarget, MathResult, ProcessState, ProtocolError, RunReport,
-    Stopwatch, Timings, Verdict,
+    round_up, with_regs, Control, Evidence, FaultTarget, MathResult, ProcessState, ProtocolError,
+    RunReport, Stopwatch, Timings, Verdict,
 };
 
 pub const PROTOCOL: &str = "ll-jacobi/1";
@@ -198,194 +198,216 @@ pub fn run_ll<B: Backend>(
             )
         }
     };
-    let s = be.alloc()?;
-    be.import(s, &start_s)?;
-    let start = Stopwatch::start();
-    let mut last_check: Option<(Instant, f64)> = None;
-    let mut recheck: Option<u64> = None;
-    let mut n_seq = 0u32;
-    let mut last_failed: Option<(u64, Residue)> = None;
-    timings.init = init.secs();
+    with_regs(be, 2, |be, regs| {
+        let (s, spare) = (regs[0], regs[1]);
+        be.import(s, &start_s)?;
+        let start = Stopwatch::start();
+        let mut last_check: Option<(Instant, f64)> = None;
+        let mut recheck: Option<u64> = None;
+        let mut n_seq = 0u32;
+        let mut last_failed: Option<(u64, Residue)> = None;
+        timings.init = init.secs();
 
-    let outcome = loop {
-        let mut next = round_up(k + 1, cfg.log_step)
-            .min(kend)
-            .min(k + cfg.max_batch);
-        if let Some(h) = ctl.halt_at.filter(|&h| h > k) {
-            next = next.min(h);
-        }
-        if let Some(f) = ctl.next_fault_after(k) {
-            next = next.min(f);
-        }
-        let sw = Stopwatch::start();
-        let mut step = be.ll_step(s, next - k).and_then(|()| be.sync());
-        timings.iterations += sw.secs();
-        k = next;
-        if step.is_ok() {
-            for (target, kind) in ctl.faults_at(k) {
-                if target == FaultTarget::Data {
-                    if let Err(e) = crate::prp::inject(be, s, kind, true) {
-                        step = Err(e);
-                        break;
+        let outcome = loop {
+            let mut next = round_up(k + 1, cfg.log_step)
+                .min(kend)
+                .min(k + cfg.max_batch);
+            if let Some(h) = ctl.halt_at.filter(|&h| h > k) {
+                next = next.min(h);
+            }
+            if let Some(f) = ctl.next_fault_after(k) {
+                next = next.min(f);
+            }
+            let sw = Stopwatch::start();
+            let mut step = be.ll_step(s, next - k).and_then(|()| be.sync());
+            timings.iterations += sw.secs();
+            k = next;
+            if step.is_ok() {
+                for (target, kind) in ctl.faults_at(k) {
+                    if target == FaultTarget::Data {
+                        if let Err(e) = crate::prp::inject(be, s, kind, true) {
+                            step = Err(e);
+                            break;
+                        }
                     }
                 }
             }
-        }
-        if ctl.halt_at == Some(k) {
-            break ProcessState::Halted { k };
-        }
-        let stop = ctl.stop_requested();
-        let mut failed: Option<Option<Residue>> = None;
-        let mut data = None;
-        match step {
-            Err(BackendError::Fault(_)) => {
-                ev.backend_faults += 1;
-                failed = Some(None);
+            if ctl.halt_at == Some(k) {
+                break ProcessState::Halted { k };
             }
-            Err(e) => return Err(e.into()),
-            Ok(()) if !(k % cfg.log_step == 0 || k == kend || stop) => continue,
-            Ok(()) => {
-                let sw = Stopwatch::start();
-                match be.export(s) {
-                    Err(BackendError::Fault(_)) => {
-                        ev.backend_faults += 1;
-                        failed = Some(None);
-                    }
-                    Err(e) => return Err(e.into()),
-                    Ok(v) => {
-                        if v.is_zero() && k < kend {
-                            failed = Some(Some(v.clone()));
-                        }
-                        data = Some(v);
-                    }
+            let stop = ctl.stop_requested();
+            let mut failed: Option<Option<Residue>> = None;
+            let mut data = None;
+            match step {
+                Err(BackendError::Fault(_)) => {
+                    ev.backend_faults += 1;
+                    failed = Some(None);
                 }
-                let do_jacobi = k == kend
-                    || recheck.is_some_and(|r| k >= r)
-                    || cfg.jacobi == JacobiCadence::EveryLog
-                    || last_check.is_none_or(|(t, cost)| t.elapsed().as_secs_f64() >= 100.0 * cost);
-                if let (Some(v), true, None) = (&data, do_jacobi, &failed) {
-                    let t0 = Instant::now();
-                    let outcome = jacobi_check(v);
-                    last_check = Some((Instant::now(), t0.elapsed().as_secs_f64()));
-                    match outcome {
-                        JacobiOutcome::Pass => {
-                            ev.jacobi_passed += 1;
-                            recheck = None;
-                            n_seq = 0;
-                            verified = (k, v.clone());
+                Err(e) => return Err(e.into()),
+                Ok(()) if !(k % cfg.log_step == 0 || k == kend || stop) => continue,
+                Ok(()) => {
+                    let sw = Stopwatch::start();
+                    match be.export(s) {
+                        Err(BackendError::Fault(_)) => {
+                            ev.backend_faults += 1;
+                            failed = Some(None);
                         }
-                        JacobiOutcome::Inconclusive => {
-                            ev.jacobi_inconclusive += 1;
-                            recheck = None;
+                        Err(e) => return Err(e.into()),
+                        Ok(v) if k == kend && !same_as_resident(be, &v, s, spare)? => {
+                            ev.backend_faults += 1;
+                            failed = Some(None);
                         }
-                        JacobiOutcome::Fail => {
-                            ev.jacobi_failed += 1;
-                            failed = Some(Some(v.clone()));
+                        Ok(v) => {
+                            if v.is_zero() && k < kend {
+                                failed = Some(Some(v.clone()));
+                            }
+                            data = Some(v);
                         }
                     }
+                    let do_jacobi = k == kend
+                        || recheck.is_some_and(|r| k >= r)
+                        || cfg.jacobi == JacobiCadence::EveryLog
+                        || last_check
+                            .is_none_or(|(t, cost)| t.elapsed().as_secs_f64() >= 100.0 * cost);
+                    if let (Some(v), true, None) = (&data, do_jacobi, &failed) {
+                        let t0 = Instant::now();
+                        let outcome = jacobi_check(v);
+                        last_check = Some((Instant::now(), t0.elapsed().as_secs_f64()));
+                        match outcome {
+                            JacobiOutcome::Pass => {
+                                ev.jacobi_passed += 1;
+                                recheck = None;
+                                n_seq = 0;
+                                verified = (k, v.clone());
+                            }
+                            JacobiOutcome::Inconclusive => {
+                                ev.jacobi_inconclusive += 1;
+                                recheck = None;
+                            }
+                            JacobiOutcome::Fail => {
+                                ev.jacobi_failed += 1;
+                                failed = Some(Some(v.clone()));
+                            }
+                        }
+                    }
+                    timings.checks += sw.secs();
                 }
-                timings.checks += sw.secs();
             }
-        }
-        if let Some(res) = failed {
-            n_seq += 1;
-            if n_seq > 2 {
-                return Err(ProtocolError::TooManyErrors {
-                    k,
-                    errors: (ev.jacobi_failed + ev.backend_faults) as u32,
+            if let Some(res) = failed {
+                n_seq += 1;
+                if n_seq > 2 {
+                    return Err(ProtocolError::TooManyErrors {
+                        k,
+                        errors: (ev.jacobi_failed + ev.backend_faults) as u32,
+                    });
+                }
+                if let Some(r) = &res {
+                    if last_failed.as_ref() == Some(&(k, r.clone())) {
+                        return Err(ProtocolError::ConsistentError { k });
+                    }
+                    last_failed = Some((k, r.clone()));
+                }
+                recheck = Some(k);
+                if stop {
+                    break ProcessState::Incomplete {
+                        k: verified.0,
+                        reason: "stop requested after a failed check".into(),
+                        checkpoint: crate::prp::existing_checkpoint(cfg.checkpoint.as_deref()),
+                    };
+                }
+                ev.rollbacks += 1;
+                be.import(s, &verified.1)?;
+                k = verified.0;
+                continue;
+            }
+            let v = data.expect("a log step without failure has data");
+            if k == kend {
+                let prime = v.is_zero();
+                ev.notes.push(
+                    "the Jacobi check catches about half of all errors; it is not a Gerbicz check"
+                        .into(),
+                );
+                ev.notes.push(
+                    "a positive local result is not a discovery claim; compare with known results"
+                        .into(),
+                );
+                return Ok(RunReport {
+                    process: ProcessState::Completed,
+                    result: Some(MathResult {
+                        test: "ll".into(),
+                        exponent: p,
+                        verdict: if prime {
+                            Verdict::Prime
+                        } else {
+                            Verdict::Composite
+                        },
+                        res64: format!("{:016x}", v.res64()),
+                        res2048: v.res2048_hex(),
+                        special_case: None,
+                    }),
+                    evidence: ev,
+                    timings,
                 });
             }
-            if let Some(r) = &res {
-                if last_failed.as_ref() == Some(&(k, r.clone())) {
-                    return Err(ProtocolError::ConsistentError { k });
-                }
-                last_failed = Some((k, r.clone()));
+            if let Some(path) = &cfg.checkpoint {
+                let sw = Stopwatch::start();
+                let ck = Checkpoint {
+                    meta: CheckpointMeta {
+                        format_version: FORMAT_VERSION,
+                        protocol: PROTOCOL.into(),
+                        exponent: p,
+                        k,
+                        state: if verified.0 == k {
+                            "verified".into()
+                        } else {
+                            "provisional".into()
+                        },
+                        verified_k: verified.0,
+                        n_errors: (ev.jacobi_failed + ev.backend_faults) as u32,
+                        proof_durable_through: None,
+                        backend: be.identity(),
+                        config: config_json.clone(),
+                        requested: requested.clone(),
+                        elapsed_secs: elapsed_before + start.secs(),
+                        crate_version: env!("CARGO_PKG_VERSION").into(),
+                    },
+                    residues: vec![v.clone(), verified.1.clone()],
+                };
+                ck.save(path)?;
+                timings.checkpoint_io += sw.secs();
             }
-            recheck = Some(k);
             if stop {
                 break ProcessState::Incomplete {
-                    k: verified.0,
-                    reason: "stop requested after a failed check".into(),
-                    checkpoint: cfg.checkpoint.clone(),
+                    k,
+                    reason: "stop requested or budget exhausted".into(),
+                    checkpoint: crate::prp::existing_checkpoint(cfg.checkpoint.as_deref()),
                 };
             }
-            ev.rollbacks += 1;
-            be.import(s, &verified.1)?;
-            k = verified.0;
-            continue;
-        }
-        let v = data.expect("a log step without failure has data");
-        if k == kend {
-            let prime = v.is_zero();
-            be.free(s)?;
-            ev.notes.push(
-                "the Jacobi check catches about half of all errors; it is not a Gerbicz check"
-                    .into(),
-            );
-            ev.notes.push(
-                "a positive local result is not a discovery claim; compare with known results"
-                    .into(),
-            );
-            return Ok(RunReport {
-                process: ProcessState::Completed,
-                result: Some(MathResult {
-                    test: "ll".into(),
-                    exponent: p,
-                    verdict: if prime {
-                        Verdict::Prime
-                    } else {
-                        Verdict::Composite
-                    },
-                    res64: format!("{:016x}", v.res64()),
-                    res2048: v.res2048_hex(),
-                    special_case: None,
-                }),
-                evidence: ev,
-                timings,
-            });
-        }
-        if let Some(path) = &cfg.checkpoint {
-            let sw = Stopwatch::start();
-            let ck = Checkpoint {
-                meta: CheckpointMeta {
-                    format_version: FORMAT_VERSION,
-                    protocol: PROTOCOL.into(),
-                    exponent: p,
-                    k,
-                    state: if verified.0 == k {
-                        "verified".into()
-                    } else {
-                        "provisional".into()
-                    },
-                    verified_k: verified.0,
-                    n_errors: (ev.jacobi_failed + ev.backend_faults) as u32,
-                    proof_durable_through: None,
-                    backend: be.identity(),
-                    config: config_json.clone(),
-                    requested: requested.clone(),
-                    elapsed_secs: elapsed_before + start.secs(),
-                    crate_version: env!("CARGO_PKG_VERSION").into(),
-                },
-                residues: vec![v.clone(), verified.1.clone()],
-            };
-            ck.save(path)?;
-            timings.checkpoint_io += sw.secs();
-        }
-        if stop {
-            break ProcessState::Incomplete {
-                k,
-                reason: "stop requested or budget exhausted".into(),
-                checkpoint: cfg.checkpoint.clone(),
-            };
-        }
-    };
-    be.free(s)?;
-    Ok(RunReport {
-        process: outcome,
-        result: None,
-        evidence: ev,
-        timings,
+        };
+        Ok(RunReport {
+            process: outcome,
+            result: None,
+            evidence: ev,
+            timings,
+        })
     })
+}
+
+/// Whether the exported copy `v` equals the resident value `s` (imported
+/// into `spare` and compared there). The final residue is reported from the
+/// host copy, so it must be the value the checks covered. A detected fault
+/// counts as a mismatch.
+fn same_as_resident<B: Backend>(
+    be: &mut B,
+    v: &Residue,
+    s: crate::backend::Reg,
+    spare: crate::backend::Reg,
+) -> Result<bool, ProtocolError> {
+    match be.import(spare, v).and_then(|()| be.equal(spare, s)) {
+        Ok(same) => Ok(same),
+        Err(BackendError::Fault(_)) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[cfg(test)]

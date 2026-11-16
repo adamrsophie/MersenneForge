@@ -14,7 +14,7 @@ Host for every result below: Apple M2 (macOS 27.2, arm64), Rust 1.100.0 stable. 
 | PRP with Gerbicz check, rollback, stop conditions | yes | yes | yes (`cpu`, `dwt`) | Metal only | n/a | no |
 | LL with Jacobi check | yes | yes | yes (`cpu`, `dwt`) | Metal only | n/a | no |
 | Checkpoint format, atomic write, resume | yes | yes | yes | Metal only | no upstream savefile compatibility (by design) | no |
-| PRP proof generation and verification (v2) | yes | yes | yes | Metal only | one direction: an upstream generated proof verifies here and our M786433 proof is byte-identical to it; our proofs have NOT been checked by an upstream verifier | no |
+| PRP proof generation and verification (v2) | yes | yes | yes | Metal only | one direction: an upstream generated proof verifies here, and our M786433 proof was byte-identical to it at commit `4042941`; our proofs have NOT been checked by an upstream verifier (`tests/upstream_verifier.rs` exists and has not been run) | no |
 | Bench harness | yes | yes | yes (`bench/cpu-smoke.json`) | no | n/a | no comparison measured |
 
 Continuous integration (`.github/workflows/ci.yml`) runs only the CPU checks; it compiles the `gpu` and `cuda` features but never runs GPU or CUDA tests. Every GPU result in this report was observed by hand on the host above.
@@ -26,17 +26,17 @@ Continuous integration (`.github/workflows/ci.yml`) runs only the CPU checks; it
 | Command | Result |
 |---|---|
 | `cargo build` | ok |
-| `cargo test` | ok: 74 tests passed, 0 failed, 4 ignored (slow or needing an external file; listed below) |
+| `cargo test` | ok: 101 tests passed, 0 failed, 5 ignored (slow or needing an external file or program; listed below) |
 | `cargo clippy --all-targets -- -D warnings` | ok, no warnings |
 | `cargo clippy --features gpu --all-targets -- -D warnings` | ok, no warnings |
 | `cargo fmt --check` | ok |
 | `cargo check --features gpu --all-targets` | ok |
 | `cargo check --features cuda --all-targets` | ok |
 | `cargo build --locked --all-targets` | ok |
-| `cargo +1.85 build --locked` | ok (MSRV 1.85 for the library and binary) |
-| `cargo +1.85 test --no-run` | fails: `proptest 1.12` requires Rust 1.88, so the tests need 1.88 |
+| `cargo +1.89 check --locked --all-targets --features gpu,cuda` | ok (MSRV 1.89 for every feature and the tests) |
+| `cargo +1.88 check --locked --ignore-rust-version` | fails: `std::fs::File::try_lock` (the checkpoint lock) is stable from 1.89 |
 
-Per suite (`cargo test`, debug profile with opt-level 2): lib unit tests 13, main 1, `arithmetic` 7, `backend_fault` 2, `checkpoint` 5, `cli` 5, `cross_backend` 1, `ll_jacobi` 1, `protocol_cpu` 10, `protocol_dwt` 10, `reference` 3 (1 ignored), `upstream_proof` 0 (1 ignored), plus the DWT engineer's `dwt_backend` 16 (2 ignored). The `gpu` and `cuda` test files compile to nothing without their features.
+Per suite (`cargo test`, debug profile with opt-level 2): lib unit tests 16, main 1, `arithmetic` 9, `backend_fault` 4, `checkpoint` 8, `cli` 13, `cross_backend` 1, `dwt_backend` 16 (2 ignored), `ll_jacobi` 1, `proof_forgery` 5, `proof_stage` 4, `protocol_cpu` 10, `protocol_dwt` 10, `reference` 3 (1 ignored), `upstream_proof` 0 (1 ignored), `upstream_verifier` 0 (1 ignored). The `gpu` and `cuda` test files compile to nothing without their features.
 
 Ignored tests, run explicitly:
 
@@ -44,10 +44,18 @@ Ignored tests, run explicitly:
 |---|---|
 | `cargo test --release --test reference -- --ignored` | ok: M9689, M9941, M11213, M19937 prime by LL and probable prime by PRP on `dwt`; M9689 on `cpu` |
 | `MERSENNE_FORGE_UPSTREAM_PROOF=<path>/786433-10.proof cargo test --release --test upstream_proof -- --ignored` | ok: the proof file shipped in the PRPLL source tree at the pinned commit (`test/786433-10.proof`) parses and verifies (M786433, power 10, composite); a copy with one bit flipped is rejected |
+| `MERSENNE_FORGE_UPSTREAM_VERIFIER=<prpll> cargo test --release --test upstream_verifier -- --ignored` | NOT run: the upstream build cannot execute on this machine (see the end of this document). It generates a proof (M786433, power 10, `dwt`), runs `prpll -verify` on it and on a corrupted copy, and fails when the variable is unset |
 
-The same upstream proof also verifies from the CLI on `dwt` and on `gpu` (Metal): `mersenne-forge verify --proof work/upstream-786433-10.proof --backend gpu --budget 30m` reported `accepted`, `M786433 composite`.
+The same upstream proof also verifies from the CLI on `dwt`. M786433 is above the direct recomputation cutoff (2^17), so the acceptance is by the proof equation alone, and the output says so:
 
-Generation agrees with upstream on this exponent: `mersenne-forge run --test prp --exponent 786433 --backend gpu --proof-power 10 --proof-dir work/m786433/proof --checkpoint-dir work/m786433/ckpt --budget 40m` (Metal, 970 s wall) reported `composite, res64 bfb6553c004222ba`, 11 Gerbicz checks passed, self verification accepted, and `cmp work/m786433/proof/786433-10.proof <upstream>/test/786433-10.proof` exits 0: the file is byte-identical to the proof shipped upstream. This is format and generation evidence; it is not a test of an upstream verifier accepting our files.
+```text
+$ ./target/release/mersenne-forge verify --proof work/upstream-786433-10.proof --backend dwt
+proof work/upstream-786433-10.proof: accepted
+M786433 composite: the file satisfies the version 2 proof equation (the relation the upstream verifier checks). That is sound against computation errors and against a prover who skipped the work, not against a prover who knows a factor of M786433 or elements of small order modulo M786433; the challenge is 64 bits. A probable prime claim from a proof needs an independent test
+[exit 0]
+```
+
+Generation agreed with upstream on this exponent at commit `4042941` (not regenerated since): `mersenne-forge run --test prp --exponent 786433 --backend gpu --proof-power 10 --proof-dir work/m786433/proof --checkpoint-dir work/m786433/ckpt --budget 40m` (Metal, 970 s wall) reported `composite, res64 bfb6553c004222ba`, 11 Gerbicz checks passed, self verification accepted, and `cmp work/m786433/proof/786433-10.proof <upstream>/test/786433-10.proof` exited 0: the file was byte-identical to the proof shipped upstream. Later changes to the run (the terminal round trip, the proof stage) do not change the residues a run stores, and the cross backend and interrupted run tests still give byte-identical proofs, but this exponent was not rerun. This is format and generation evidence; it is not a test of an upstream verifier accepting our files.
 
 ## What the tests establish
 
@@ -55,17 +63,23 @@ Generation agrees with upstream on this exponent: `mersenne-forge run --test prp
 - Representation: canonical encoding at 0, 1, 2, N - 1, N - 2, N / 2, around every 32-bit limb boundary, all-ones words, the value N, bits above p, wrong lengths; word aligned and non aligned exponents; randomized residues (proptest).
 - Differential arithmetic: `cpu` (folding) and `dwt` (transform) against the oracle (division) for mul, square, ll_step, copy, equal.
 - PRP protocol on `cpu`, `dwt`, and (with `--features gpu`) `gpu`: complete prime and composite runs with full 2048-bit residues equal to the oracle; data and check value corruption (bit flip, zero, triple) detected and rolled back with a correct result; an engine injected `BackendError::Fault` rolled back; the same wrong residue twice stops; three failures in a row stop.
-- Late backend faults (`tests/backend_fault.rs`, a wrapper around the `cpu` backend only): faults raised from `equal`, `export`, and `ll_step`, including at the initial load, are rolled back with a correct result; persistent faults end in an execution error, never a verdict.
+- Late backend faults (`tests/backend_fault.rs`, a wrapper around the `cpu` backend only): faults raised from `equal`, `export`, and `ll_step`, including at the initial load, are rolled back with a correct result; persistent faults end in an execution error, never a verdict; every register is freed on those error paths (PRP, LL, proof verification).
+- Terminal export: a wrapper that corrupts only the host copy of the terminal residue (PRP x_p = 9 for M1279; LL s_(p-2) = 0, corrupted to 1, which passes the Jacobi check) is caught by the round trip after the export, counted as one fault, and the run ends with the correct result. With the round trip disabled the same test fails.
 - Interruption: simulated abrupt termination at k = 77 (mid block), 128 and 129 (at and after a check), 639, 640, 641 (before, at, after a proof point), 1279 (the final residue), 1280 (the final check), and a budget stop; every resumed run reached the same result and a byte-identical, accepted proof.
 - Proof durability: a proof residue write failure at k = 680 stops the run; the checkpoint on disk is at 640; resume completes with an accepted proof. A deleted durable residue makes resume refuse.
-- Proof rejection: altered B or middles (rejected by the final check), truncated, trailing data, wrong exponent, unknown version, bits above p; each a distinct error.
-- Checkpoints: corrupted bytes anywhere fall back to `.prev`; a crash between rotation and rename falls back to `.prev`; oversized metadata is refused before allocation; a different backend, configuration, exponent, or protocol is refused; a checkpoint with a valid hash but a wrong residue is refused by the on-load Gerbicz check.
+- Proof rejection: altered B or middles (rejected both by `verify` and by the proof equation alone), truncated, trailing data, wrong exponent, unknown version, bits above p; each a distinct error.
+- Chosen proofs for small moduli (`tests/proof_forgery.rs`): the proof equation alone accepts the wrong terminal values M13 B = 8182 (= -9) with middle 7434, and M11 B = 9 with middles 9 (a unit) and 1513 (a zero divisor); `verify` rejects all three by recomputing the terminal residue. Over every (B, middle) pair for M11 at power 1, `verify` accepts only B = 929, the true terminal residue, while the equation alone accepts some middle for 1992 of the 2046 wrong values of B. Middles 23 and 89 for M11 fold to zero and are rejected; a zero middle in a directly constructed proof is rejected; M13 at power 3 (colliding generation schedule) parses and verifies.
+- Proof stage (`tests/proof_stage.rs`, `tests/cli.rs`): `not_requested`, `generated`, `verified`, `rejected` (a stored proof residue replaced with a different intact value before resume), `failed` (a directory in place of the proof file; CLI exit 5), `interrupted` (a stop request after the final check); the PRP result is kept in every case.
+- Checkpoints: corrupted bytes anywhere fall back to `.prev`; a crash between rotation and rename falls back to `.prev`; after falling back, the next save removes the corrupt primary instead of rotating it over the good `.prev`; oversized metadata is refused before allocation; a different backend, configuration, exponent, or protocol is refused; forged `state`, `verified_k`, or `proof_durable_through` is refused; a checkpoint with a valid hash but a damaged residue pair is refused by the on-load Gerbicz check; a stop or fault before the first save reports no checkpoint.
+- CLI: `run` over an existing checkpoint (or only its `.prev`) exits 6 naming `resume` and leaves the file unchanged; a lock held by another process makes `run` and `resume` exit 6; a primary with a valid hash and a damaged residue pair makes `resume` fall back to `.prev` (reported as `loaded_from`); an unrepresentable `--budget` exits 2; JSON failures are JSON objects; a process killed with SIGKILL after its first checkpoint resumes to the same result and a byte-identical proof as an uninterrupted run; `doctor --exponent` reports per backend memory figures.
+- Bench: a preexisting scratch directory is a failed observation and is left untouched; external output is saved to files; the output file is rewritten after every observation; a SIGINT during an external command stops the plan (exit 3); invalid plan budgets exit 2.
+- Not observable in a test: the fsync of newly created directories.
 - LL Jacobi: a symbol flipping fault at a check is always caught; over 64 single bit flips on M521, the detected ones recover and the undetected ones end with a wrong final residue (the test asserts both), which is the documented limit of the LL check.
 - Cross backend: `cpu`, `dwt`, and `gpu` give identical full final residues and byte-identical proof files for M1279 and M1277.
 
 ## End-to-end CLI demonstration (default build, release)
 
-Commands run from the repository root after `cargo build --release`. Output pasted verbatim.
+Commands run from the repository root after `cargo build --release`, starting from an empty `work/`. Output pasted verbatim. A completed run keeps its checkpoint, so a second pass of the same commands is refused by `run` (exit 6) until `work/` is emptied.
 
 ```text
 $ ./target/release/mersenne-forge run --test ll --exponent 4423 --backend cpu --log-step 1000 --jacobi every-log
@@ -85,34 +99,48 @@ note: a positive local result is not a discovery claim; compare with known resul
 $ ./target/release/mersenne-forge run --test prp --exponent 4423 --backend cpu --block-size 200 --check-step 400 --proof-power 6 --proof-dir work/proof --checkpoint-dir work/ckpt
 M4423 PRP: probable prime (base 3), res64 0000000000000001
 gerbicz checks: 12 passed, 0 failed and rolled back
+gerbicz check step: 400
 proof: work/proof/4423-6.proof (power 6, self verification accepted)
+proof stage: verified
 note: a positive local result is not a discovery claim; compare with known results
 [exit 0]
 
 $ ./target/release/mersenne-forge run --test prp --exponent 4421 --backend cpu --block-size 200 --check-step 400 --proof-power 6 --proof-dir work/proof --checkpoint-dir work/ckpt
 M4421 PRP: composite, res64 b45cf72f1682620c
 gerbicz checks: 12 passed, 0 failed and rolled back
+gerbicz check step: 400
 proof: work/proof/4421-6.proof (power 6, self verification accepted)
+proof stage: verified
 note: a positive local result is not a discovery claim; compare with known results
 [exit 0]
 
 $ ./target/release/mersenne-forge run --test prp --exponent 44497 --backend dwt --block-size 200 --check-step 2000 --proof-power 8 --proof-dir work/proof --checkpoint-dir work/ckpt --budget 2s
-incomplete at iteration 16600: stop requested or budget exhausted
+incomplete at iteration 18200: stop requested or budget exhausted
 resume with: mersenne-forge resume --checkpoint work/ckpt/M44497-prp.ckpt
-gerbicz checks: 10 passed, 0 failed and rolled back
+gerbicz checks: 11 passed, 0 failed and rolled back
+gerbicz check step: 2000
 [exit 3]
 
+$ ./target/release/mersenne-forge run --test prp --exponent 44497 --backend dwt --block-size 200 --check-step 2000 --proof-power 8 --proof-dir work/proof --checkpoint-dir work/ckpt
+error: a checkpoint for this run already exists at work/ckpt/M44497-prp.ckpt: continue it with `mersenne-forge resume --checkpoint work/ckpt/M44497-prp.ckpt`, or delete work/ckpt/M44497-prp.ckpt and work/ckpt/M44497-prp.ckpt.prev to start over
+[exit 6]
+
 $ ./target/release/mersenne-forge resume --checkpoint work/ckpt/M44497-prp.ckpt --budget 10m
+resumed from work/ckpt/M44497-prp.ckpt at iteration 18200
 M44497 PRP: probable prime (base 3), res64 0000000000000001
-gerbicz checks: 16 passed, 0 failed and rolled back
+gerbicz checks: 15 passed, 0 failed and rolled back
+gerbicz check step: 2000
 proof: work/proof/44497-8.proof (power 8, self verification accepted)
+proof stage: verified
 note: a positive local result is not a discovery claim; compare with known results
 [exit 0]
 
 $ ./target/release/mersenne-forge run --test prp --exponent 44497 --backend dwt --block-size 200 --check-step 2000 --proof-power 8 --proof-dir work/proof-uninterrupted
 M44497 PRP: probable prime (base 3), res64 0000000000000001
 gerbicz checks: 24 passed, 0 failed and rolled back
+gerbicz check step: 2000
 proof: work/proof-uninterrupted/44497-8.proof (power 8, self verification accepted)
+proof stage: verified
 note: a positive local result is not a discovery claim; compare with known results
 [exit 0]
 
@@ -121,7 +149,7 @@ $ cmp work/proof/44497-8.proof work/proof-uninterrupted/44497-8.proof
 
 $ ./target/release/mersenne-forge verify --proof work/proof/44497-8.proof --backend cpu
 proof work/proof/44497-8.proof: accepted
-M44497 probable prime: the proof verifies the PRP computation, not deterministic primality
+M44497 probable prime: the terminal residue was recomputed directly and matches the proof; this verifies the PRP computation, not deterministic primality
 [exit 0]
 
 $ python3 (flip one bit of a middle residue into work/proof/corrupt.proof)
@@ -140,17 +168,22 @@ $ ./target/release/mersenne-forge verify --proof work/proof/truncated.proof --ba
 proof work/proof/truncated.proof: rejected
 proof truncated: 3000 bytes, header requires 3924
 [exit 7]
+
+$ ./target/release/mersenne-forge verify --proof work/proof/4423-6.proof --backend cpu
+proof work/proof/4423-6.proof: accepted
+M4423 probable prime: the terminal residue was recomputed directly and matches the proof; this verifies the PRP computation, not deterministic primality
+[exit 0]
 ```
 
 (`work/proof/truncated.proof` is the first 3000 bytes of `work/proof/4423-6.proof`.)
 
-Ctrl-C: an LL run of M86243 on `dwt` with `--checkpoint-dir work/ctrlc` received SIGINT after 2 seconds, printed `stop requested; finishing at the next valid boundary`, exited 3 with JSON process state `{"state": "incomplete", "k": 16000, "checkpoint": "work/ctrlc/M86243-ll.ckpt"}`, and `mersenne-forge resume --checkpoint work/ctrlc/M86243-ll.ckpt` then reported `M86243 LL: prime (LL criterion satisfied)` with exit 0.
+Ctrl-C: an LL run of M86243 on `dwt` with `--checkpoint-dir work/ctrlc --json` received SIGINT after 2 seconds, printed `stop requested; finishing at the next valid boundary (press Ctrl-C again to abort)`, exited 3 with JSON process state `{"state": "incomplete", "k": 21000, "checkpoint": "work/ctrlc/M86243-ll.ckpt", ...}`, and `mersenne-forge resume --checkpoint work/ctrlc/M86243-ll.ckpt` then printed `resumed from work/ctrlc/M86243-ll.ckpt at iteration 21000` and `M86243 LL: prime (LL criterion satisfied)` with exit 0.
 
 Bench: `mersenne-forge bench --plan bench/cpu-smoke.json --output work/bench/cpu-smoke.json` wrote 16 observations (4 warmups, 12 measured), all completed. These timings are a harness check, not a performance result.
 
 ## GPU demonstration (Apple M2, Metal, `--features gpu`)
 
-`cargo test --release --features gpu --test protocol_gpu`: 11 passed, 0 failed (the full generic protocol suite above on the `gpu` backend, plus the cpu, dwt, gpu identity test).
+`cargo test --features gpu --test protocol_gpu` (debug profile with opt-level 2): 11 passed, 0 failed (the full generic protocol suite above on the `gpu` backend, plus the cpu, dwt, gpu identity test).
 
 ```text
 $ ./target/release/mersenne-forge doctor
@@ -166,7 +199,9 @@ note: listing a device is not validation of its arithmetic
 $ ./target/release/mersenne-forge run --test prp --exponent 44497 --backend gpu --block-size 200 --check-step 2000 --proof-power 8 --proof-dir work/gpu-proof --budget 10m
 M44497 PRP: probable prime (base 3), res64 0000000000000001
 gerbicz checks: 24 passed, 0 failed and rolled back
+gerbicz check step: 2000
 proof: work/gpu-proof/44497-8.proof (power 8, self verification accepted)
+proof stage: verified
 note: a positive local result is not a discovery claim; compare with known results
 [exit 0]
 
@@ -186,7 +221,7 @@ error: the gpu backend requires a bounded --budget
 
 $ ./target/release/mersenne-forge verify --proof work/proof/44497-8.proof --backend gpu --budget 5m
 proof work/proof/44497-8.proof: accepted
-M44497 probable prime: the proof verifies the PRP computation, not deterministic primality
+M44497 probable prime: the terminal residue was recomputed directly and matches the proof; this verifies the PRP computation, not deterministic primality
 [exit 0]
 ```
 
@@ -216,6 +251,6 @@ cmp work/cuda-proof/44497-8.proof work/proof-uninterrupted/44497-8.proof   # aft
 
 For AMD or Intel GPUs, run the `gpu` lines (Vulkan) the same way.
 
-Upstream verifier interoperability (our proofs accepted by PRPLL): build PRPLL at commit `90a3d8db84e742773f45e2adfba3131199fa8101` per its README, generate a proof here for an exponent inside the upstream FFT range (for example the M1257787 run above), and run the upstream verifier with its documented interface `prpll -verify <file>`. This has not been done.
+Upstream verifier interoperability (our proofs accepted by PRPLL): build PRPLL at commit `90a3d8db84e742773f45e2adfba3131199fa8101` per its README, generate a proof here for an exponent inside the upstream FFT range (for example the M1257787 run above), and run the upstream verifier with its documented interface `prpll -verify <file>`. This has not been done. One attempt was made on the development machine (Apple M2, macOS, 2026-11-16): PRPLL at that commit builds with Apple clang and lists the Apple M2 as an OpenCL 1.2 device, but `prpll -verify test/786433-10.proof` cannot run there. With the default FP64 transform it stops with "FP64 not supported"; with the integer transforms (`-fft 1:256:1:256`, `-fft 3:256:1:256`) the process aborts inside the Apple OpenCL compiler during `clCompileProgram`, before any arithmetic. So the upstream verifier needs a host with a working OpenCL or CUDA driver.
 
 Performance: no measurement exists. See [BENCHMARK.md](BENCHMARK.md).

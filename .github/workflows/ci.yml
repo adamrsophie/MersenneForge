@@ -43,6 +43,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85
-      - name: Build at the minimum supported Rust version
-        run: cargo build --locked
+      - uses: dtolnay/rust-toolchain@1.89
+      - name: Build and test at the minimum supported Rust version (1.89, for std::fs::File::try_lock)
+        run: cargo test --locked
+      - name: Compile every feature at the minimum supported Rust version
+        run: cargo check --locked --all-targets --features gpu,cuda

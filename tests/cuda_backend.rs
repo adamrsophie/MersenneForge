@@ -94,6 +94,22 @@ fn edges(p: u32, rng: &mut Rng) -> Vec<BigUint> {
     ]
 }
 
+/// The value whose balanced words in the CUDA layout all have magnitude
+/// 2^(w_k - 1) - 1, the largest digit `import` produces without a carry.
+fn maximal_words(p: u32) -> BigUint {
+    let pl = model::plan(p).unwrap();
+    let (p64, l) = (u64::from(p), u64::from(pl.log_n));
+    let mut v = BigUint::from(0u32);
+    for k in 0..pl.n {
+        // Digit 2^(w - 1) - 1: the low w - 1 bits of word k set.
+        let b = model::offset(p64, l, k);
+        for t in 0..model::width(p64, l, k) - 1 {
+            v.set_bit(b + t, true);
+        }
+    }
+    v % modulus(p)
+}
+
 fn load(be: &mut CudaBackend, x: &BigUint) -> Reg {
     let r = be.alloc().unwrap();
     be.import(r, &Residue::from_biguint(be.exponent(), x))
@@ -198,23 +214,32 @@ fn multiplication_copy_and_equal() {
         let n = modulus(p);
         let mut be = open(p);
         let vals = edges(p, &mut rng);
+        // Dense second operands (a random value distinct from the first x,
+        // and one whose words all have maximal magnitude) are chosen before
+        // the budget cut, so large exponents still multiply dense by dense.
+        // Small constants, including N - 1 = -1, are a separate case.
+        let dense = [vals[9].clone(), maximal_words(p)];
+        let small = [BigUint::from(1u32), BigUint::from(2u32), &n - 1u32];
+        let mut pairs: Vec<(&BigUint, &BigUint)> = vec![(&dense[1], &dense[1])];
         for x in vals.iter().take(budget(p, 5)) {
-            for y in vals.iter().skip(3).take(budget(p, 4)) {
-                let a = load(&mut be, x);
-                let b = load(&mut be, y);
-                be.mul(a, b).unwrap();
-                assert_eq!(read(&mut be, a), (x * y) % &n, "mul p={p}");
-                assert_eq!(read(&mut be, b), *y, "mul leaves src unchanged p={p}");
-                be.copy(b, a).unwrap();
-                assert!(be.equal(a, b).unwrap());
-                be.copy(a, a).unwrap();
-                assert_eq!(read(&mut be, a), (x * y) % &n);
-                be.square(b, 1).unwrap();
-                let prod = (x * y) % &n;
-                assert_eq!(be.equal(a, b).unwrap(), (&prod * &prod) % &n == prod);
-                be.free(a).unwrap();
-                be.free(b).unwrap();
-            }
+            pairs.extend(dense.iter().map(|y| (x, y)));
+        }
+        pairs.extend(small.iter().map(|y| (&vals[0], y)));
+        for (x, y) in pairs {
+            let a = load(&mut be, x);
+            let b = load(&mut be, y);
+            be.mul(a, b).unwrap();
+            assert_eq!(read(&mut be, a), (x * y) % &n, "mul p={p}");
+            assert_eq!(read(&mut be, b), *y, "mul leaves src unchanged p={p}");
+            be.copy(b, a).unwrap();
+            assert!(be.equal(a, b).unwrap());
+            be.copy(a, a).unwrap();
+            assert_eq!(read(&mut be, a), (x * y) % &n);
+            be.square(b, 1).unwrap();
+            let prod = (x * y) % &n;
+            assert_eq!(be.equal(a, b).unwrap(), (&prod * &prod) % &n == prod);
+            be.free(a).unwrap();
+            be.free(b).unwrap();
         }
         be.sync().unwrap();
     }
@@ -294,7 +319,10 @@ fn error_paths() {
         Err(BackendError::Unsupported(_))
     ));
     be.free(b).unwrap();
-    let bad = [b, Reg(4242)];
+    // A handle of another live instance on the same device is foreign here.
+    let mut other = open(127);
+    let foreign = other.alloc().unwrap();
+    let bad = [b, foreign, Reg(0), Reg(u32::MAX)];
     for r in bad {
         assert_eq!(be.free(r), Err(BackendError::InvalidHandle(r.0)));
         assert_eq!(be.export(r).err(), Some(BackendError::InvalidHandle(r.0)));

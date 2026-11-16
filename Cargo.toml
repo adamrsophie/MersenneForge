@@ -2,7 +2,7 @@
 name = "mersenne-forge"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Rust Mersenne Lucas-Lehmer and base-3 PRP engine with Gerbicz checks and PRP proofs"
 license = "GPL-3.0-only"
 authors = ["Adam R Sophie <adamrsophie@gmail.com>"]

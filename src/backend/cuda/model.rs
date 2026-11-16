@@ -612,7 +612,8 @@ impl Plan {
         let mut d: Vec<i64> = words.iter().map(|&w| w as i64).collect();
         for (k, &v) in d.iter().enumerate() {
             let lim = (1i64 << (width(p, l, k as u64) - 1)) + self.slack as i64;
-            if v.abs() > lim {
+            // unsigned_abs: i64::MIN has no positive counterpart.
+            if v.unsigned_abs() > lim as u64 {
                 return Err(format!("word {k} = {v} exceeds the bound {lim}"));
             }
         }
@@ -1159,7 +1160,7 @@ mod tests {
                         0 => zb,
                         1 => -zb,
                         2 => {
-                            if rng.next() % 2 == 0 {
+                            if rng.next() & 1 == 0 {
                                 zb
                             } else {
                                 -zb
@@ -1248,5 +1249,10 @@ mod tests {
             assert!(pl.from_words(&w).is_ok());
         }
         assert!(pl.from_words(&[0u64; 3]).is_err());
+        for v in [i64::MIN, i64::MAX] {
+            let mut w = vec![0u64; pl.n as usize];
+            w[1] = v as u64;
+            assert!(pl.from_words(&w).is_err(), "{v}");
+        }
     }
 }

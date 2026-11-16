@@ -35,7 +35,7 @@ hardware, Rust 1.100) and their observed results:
 * `cargo build --features cuda`: builds.
 * `cargo clippy --features cuda --all-targets -- -D warnings`: no issues.
 * `cargo check --features cuda --all-targets --target x86_64-unknown-linux-gnu`: compiles (a compile check for Linux; not linked or run).
-* `cargo test --features cuda --lib backend::cuda`: 18 model and host unit tests pass (level a). The largest transform length executed by the model is n = 2^18 (p = 5242880, one squaring, one LL step, one multiplication against `num-bigint`).
+* `cargo test --features cuda --lib backend::cuda`: 19 model and host unit tests pass (level a), including the memory estimate against the buffer lengths and the export range check at `i64::MIN` and `i64::MAX`. The largest transform length executed by the model is n = 2^18 (p = 5242880, one squaring, one LL step, one multiplication against `num-bigint`).
 * `cargo test --features cuda --test cuda_kernel_emulation`: 5 tests pass (level b), with Apple clang as `c++`; the largest length emulated is n = 2^12. GCC on Linux has not been tried here. As a check that the emulation detects faults, three deliberate kernel bugs were each caught: an off by one index guard (AddressSanitizer heap overflow), a wrong neighbor width in carry pass B, and a missing Mersenne fold in the modular multiply (both word for word mismatches against the model).
 * `cargo test --features cuda --test cuda_backend`: all 7 tests fail, as required, with "no CUDA driver: this suite needs an NVIDIA GPU with libcuda and NVRTC" and the list of library names searched.
 * `probe()` on this Mac returns `driver_loaded: false`, no devices, and notes naming the missing `libcuda` and `libnvrtc` libraries with every file name searched. The kernel source hash at the time of writing is `2cc097172814308d421731e706e5692646c993432dfaa823cc58338219246c4c`.
@@ -195,6 +195,12 @@ Device memory, all buffers of 64-bit elements:
   224 MiB at n = 2^22.
 * per resident residue: **8 n bytes**, 128 MiB at n = 2^24.
 
+`cuda::memory_estimate(p)` returns these two figures without loading the
+driver (the `doctor` command shows them). A unit test checks them against the
+buffer lengths the backend passes to the driver; the real device allocation
+has not been observed. Host staging copies made by `import` and `export` are
+not counted.
+
 `ponytail:` words are stored as 64-bit values although they fit in 32 bits;
 the upgrade halves residue and scratch memory.
 
@@ -250,7 +256,7 @@ Every driver and NVRTC call is checked.
 | NVRTC compile failure | `Native` with the NVRTC code and the full compile log |
 | any other driver code | `Native` with code, name, and message |
 | exported word outside the proven bound | `Fault` |
-| unknown or freed handle | `InvalidHandle` |
+| unknown or freed handle, or a handle of another backend instance | `InvalidHandle` |
 
 None of these is a mathematical result; the protocol never turns one into
 "composite". The code to error mapping is unit tested.

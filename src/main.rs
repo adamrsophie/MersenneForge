@@ -3,10 +3,13 @@
 //! The `mersenne-forge` command line.
 //!
 //! Exit codes: 0 success (completed run, accepted proof, doctor, bench);
-//! 2 usage error; 3 incomplete (budget or stop request); 4 unsupported
-//! (backend not built, exponent or option out of range); 5 execution failure
-//! (repeated check failures, backend error); 6 checkpoint, proof residue, or
-//! file error; 7 proof rejected; 1 any other error.
+//! 2 usage error; 3 incomplete (budget or stop request, also during the proof
+//! stage); 4 unsupported (backend not built, exponent or option out of
+//! range); 5 execution failure (repeated check failures, backend error, proof
+//! generation or write failure); 6 checkpoint, proof residue, or file error;
+//! 7 proof rejected (also a rejected self verification); 1 any other error.
+//! With `--json`, a failure is printed on stdout as a JSON object with
+//! `kind`, `message`, and `exit_code`.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -17,11 +20,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
 
 use mersenne_forge::bench;
-use mersenne_forge::checkpoint::Checkpoint;
+use mersenne_forge::checkpoint::{create_dir_all_durable, prev_path, Checkpoint};
 use mersenne_forge::ll::{self, JacobiCadence, LlConfig};
 use mersenne_forge::proof::{self, Proof, ProofError};
 use mersenne_forge::prp::{self, PrpConfig};
-use mersenne_forge::run::{Control, ProcessState, ProtocolError, RunReport};
+use mersenne_forge::run::{Control, ProcessState, ProofStage, ProtocolError, RunReport};
 use mersenne_forge::select::{self, BackendKind};
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -76,8 +79,12 @@ enum JacobiArg {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Report backends, build identity, and supported ranges.
+    /// Report backends, build identity, supported ranges, and (with
+    /// --exponent) per backend memory figures.
     Doctor {
+        /// Exponent for the memory figures.
+        #[arg(long)]
+        exponent: Option<u32>,
         #[arg(long)]
         json: bool,
     },
@@ -211,7 +218,10 @@ fn parse_duration(s: &str) -> Option<Duration> {
         total += num.parse::<f64>().ok()?;
         any = true;
     }
-    (any && total > 0.0 && total.is_finite()).then(|| Duration::from_secs_f64(total))
+    if !(any && total > 0.0 && total.is_finite()) {
+        return None;
+    }
+    Duration::try_from_secs_f64(total).ok()
 }
 
 fn deadline(budget: &Option<String>, kind: BackendKind) -> Result<Option<Instant>, Failure> {
@@ -222,9 +232,40 @@ fn deadline(budget: &Option<String>, kind: BackendKind) -> Result<Option<Instant
         )),
         None => Ok(None),
         Some(b) => {
-            let d = parse_duration(b).ok_or_else(|| fail(2, format!("invalid --budget {b:?}")))?;
-            Ok(Some(Instant::now() + d))
+            let invalid = || fail(2, format!("invalid --budget {b:?}"));
+            let d = parse_duration(b).ok_or_else(invalid)?;
+            Ok(Some(Instant::now().checked_add(d).ok_or_else(invalid)?))
         }
+    }
+}
+
+/// Hold an advisory lock on `<checkpoint>.lock` for as long as the returned
+/// file lives, or refuse when another process holds it. The lock file is
+/// never deleted.
+fn lock_checkpoint(ckpt: &Path) -> Result<std::fs::File, Failure> {
+    let mut name = ckpt.as_os_str().to_owned();
+    name.push(".lock");
+    let lock = PathBuf::from(name);
+    let state = |e: std::io::Error| fail(EXIT_STATE, format!("{}: {e}", lock.display()));
+    if let Some(dir) = lock.parent().filter(|d| !d.as_os_str().is_empty()) {
+        create_dir_all_durable(dir).map_err(state)?;
+    }
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock)
+        .map_err(state)?;
+    match f.try_lock() {
+        Ok(()) => Ok(f),
+        Err(std::fs::TryLockError::WouldBlock) => Err(fail(
+            EXIT_STATE,
+            format!(
+                "{} is held by another run or resume of this checkpoint",
+                lock.display()
+            ),
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(state(e)),
     }
 }
 
@@ -269,7 +310,7 @@ fn print_report(report: &RunReport, out: &serde_json::Value, as_json: bool) {
                     "resume with: mersenne-forge resume --checkpoint {}",
                     c.display()
                 ),
-                None => println!("no checkpoint directory was given; progress is lost"),
+                None => println!("no checkpoint was written; progress is lost"),
             }
         }
         (s, _) => println!("{s:?}"),
@@ -287,6 +328,9 @@ fn print_report(report: &RunReport, out: &serde_json::Value, as_json: bool) {
             e.jacobi_passed, e.jacobi_failed, e.jacobi_inconclusive
         );
     }
+    if let Some(step) = e.check_step {
+        println!("gerbicz check step: {step}");
+    }
     if e.backend_faults > 0 {
         println!(
             "backend faults detected and rolled back: {}",
@@ -301,14 +345,20 @@ fn print_report(report: &RunReport, out: &serde_json::Value, as_json: bool) {
             pr.self_verification
         );
     }
+    if e.proof_stage != ProofStage::NotRequested {
+        println!("proof stage: {}", e.proof_stage.name());
+    }
     for n in &e.notes {
         println!("note: {n}");
     }
 }
 
 fn exit_for(report: &RunReport) -> u8 {
-    match report.process {
-        ProcessState::Completed => 0,
+    match (&report.process, report.evidence.proof_stage) {
+        (ProcessState::Completed, ProofStage::Failed) => EXIT_EXECUTION,
+        (ProcessState::Completed, ProofStage::Rejected) => EXIT_REJECTED,
+        (ProcessState::Completed, ProofStage::Interrupted) => EXIT_INCOMPLETE,
+        (ProcessState::Completed, _) => 0,
         _ => EXIT_INCOMPLETE,
     }
 }
@@ -341,6 +391,28 @@ fn cmd_run(
     });
     let deadline = deadline(&budget, kind)?;
     mersenne_forge::exponent::validate(p).map_err(|e| fail(EXIT_UNSUPPORTED, e.to_string()))?;
+    let ckpt = checkpoint_dir.as_ref().map(|d| {
+        d.join(match test {
+            Test::Prp => format!("M{p}-prp.ckpt"),
+            Test::Ll => format!("M{p}-ll.ckpt"),
+        })
+    });
+    // The lock comes first, so two runs cannot both pass the check below.
+    let _lock = ckpt.as_deref().map(lock_checkpoint).transpose()?;
+    if let Some(c) = &ckpt {
+        if c.exists() || prev_path(c).exists() {
+            return Err(fail(
+                EXIT_STATE,
+                format!(
+                    "a checkpoint for this run already exists at {}: continue it with `mersenne-forge resume --checkpoint {}`, or delete {} and {} to start over",
+                    c.display(),
+                    c.display(),
+                    c.display(),
+                    prev_path(c).display()
+                ),
+            ));
+        }
+    }
     let mut be = open(kind, p, device)?;
     let mut ctl = Control {
         stop: Some(&STOP),
@@ -355,7 +427,7 @@ fn cmd_run(
                 proof_power,
                 proof_dir,
                 verify_proof: !no_proof_verify,
-                checkpoint: checkpoint_dir.map(|d| d.join(format!("M{p}-prp.ckpt"))),
+                checkpoint: ckpt.clone(),
                 max_batch: 1000,
             };
             let eff = prp::effective_config(p, &cfg).map_err(protocol_failure)?;
@@ -377,7 +449,7 @@ fn cmd_run(
                 } else {
                     JacobiCadence::EveryLog
                 },
-                checkpoint: checkpoint_dir.map(|d| d.join(format!("M{p}-ll.ckpt"))),
+                checkpoint: ckpt.clone(),
                 max_batch: 1000,
             };
             let r = ll::run_ll(&mut be, p, &cfg, requested.clone(), None, &mut ctl)
@@ -390,47 +462,109 @@ fn cmd_run(
     Ok(exit_for(&report))
 }
 
+/// One resume attempt from `ck`, saving to `path`.
+fn resume_from(
+    be: &mut Box<dyn mersenne_forge::backend::Backend>,
+    ck: &Checkpoint,
+    path: &Path,
+    ctl: &mut Control,
+) -> Result<Result<RunReport, ProtocolError>, Failure> {
+    let m = &ck.meta;
+    let bad = |e: serde_json::Error| fail(EXIT_STATE, format!("checkpoint configuration: {e}"));
+    if m.protocol == prp::PROTOCOL {
+        let mut cfg: PrpConfig = serde_json::from_value(m.config.clone()).map_err(bad)?;
+        cfg.checkpoint = Some(path.to_path_buf());
+        Ok(prp::run_prp(
+            be,
+            m.exponent,
+            &cfg,
+            m.requested.clone(),
+            Some(ck),
+            ctl,
+        ))
+    } else if m.protocol == ll::PROTOCOL {
+        let mut cfg: LlConfig = serde_json::from_value(m.config.clone()).map_err(bad)?;
+        cfg.checkpoint = Some(path.to_path_buf());
+        Ok(ll::run_ll(
+            be,
+            m.exponent,
+            &cfg,
+            m.requested.clone(),
+            Some(ck),
+            ctl,
+        ))
+    } else {
+        Err(fail(
+            EXIT_UNSUPPORTED,
+            format!("unknown protocol {:?}", m.protocol),
+        ))
+    }
+}
+
 fn cmd_resume(
     path: &Path,
     budget: Option<String>,
     device: Option<u32>,
     as_json: bool,
 ) -> Result<u8, Failure> {
-    let (ck, used) = Checkpoint::load_latest(path).map_err(|e| fail(EXIT_STATE, e.to_string()))?;
-    let m = &ck.meta;
-    let kind = BackendKind::parse(&m.backend.kind).ok_or_else(|| {
+    let _lock = lock_checkpoint(path)?;
+    let (mut ck, mut used) =
+        Checkpoint::load_latest(path).map_err(|e| fail(EXIT_STATE, e.to_string()))?;
+    let kind = BackendKind::parse(&ck.meta.backend.kind).ok_or_else(|| {
         fail(
             EXIT_UNSUPPORTED,
-            format!("unknown backend {:?} in checkpoint", m.backend.kind),
+            format!("unknown backend {:?} in checkpoint", ck.meta.backend.kind),
         )
     })?;
     let deadline = deadline(&budget, kind)?;
-    let p = m.exponent;
-    let mut be = open(kind, p, device)?;
+    let mut be = open(kind, ck.meta.exponent, device)?;
     let mut ctl = Control {
         stop: Some(&STOP),
         deadline,
         ..Control::default()
     };
+    let mut fallback_note = None;
+    let mut result = resume_from(&mut be, &ck, path, &mut ctl)?;
+    // A primary that loads but fails the resume validation (its on-load check
+    // or a missing proof residue) falls back to `.prev`. An identity or
+    // configuration mismatch does not: `.prev` belongs to the same run.
+    if used == path
+        && matches!(
+            result,
+            Err(ProtocolError::CheckpointRejected { .. }
+                | ProtocolError::ProofResidueMissing { .. })
+        )
+    {
+        let prev = prev_path(path);
+        if let Ok(pck) = Checkpoint::load_file(&prev) {
+            // Move the rejected primary aside, so the next save cannot rotate
+            // it over the good `.prev`; it is kept for inspection.
+            let mut aside = path.as_os_str().to_owned();
+            aside.push(".rejected");
+            std::fs::rename(path, &aside)
+                .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", path.display())))?;
+            let why = result.err().map(|e| e.to_string()).unwrap_or_default();
+            fallback_note = Some(format!(
+                "{} was not usable ({why}); it was moved to {} and the run resumed from {}",
+                path.display(),
+                PathBuf::from(&aside).display(),
+                prev.display()
+            ));
+            ck = pck;
+            used = prev;
+            result = resume_from(&mut be, &ck, path, &mut ctl)?;
+        }
+    }
+    let mut report = result.map_err(protocol_failure)?;
+    if let Some(n) = fallback_note {
+        report.evidence.notes.insert(0, n);
+    }
     let requested =
         json!({ "checkpoint": path, "loaded_from": used, "budget": budget, "device": device });
-    let bad = |e: serde_json::Error| fail(EXIT_STATE, format!("checkpoint configuration: {e}"));
-    let report = if m.protocol == prp::PROTOCOL {
-        let mut cfg: PrpConfig = serde_json::from_value(m.config.clone()).map_err(bad)?;
-        cfg.checkpoint = Some(path.to_path_buf());
-        prp::run_prp(&mut be, p, &cfg, m.requested.clone(), Some(&ck), &mut ctl)
-    } else if m.protocol == ll::PROTOCOL {
-        let mut cfg: LlConfig = serde_json::from_value(m.config.clone()).map_err(bad)?;
-        cfg.checkpoint = Some(path.to_path_buf());
-        ll::run_ll(&mut be, p, &cfg, m.requested.clone(), Some(&ck), &mut ctl)
-    } else {
-        return Err(fail(
-            EXIT_UNSUPPORTED,
-            format!("unknown protocol {:?}", m.protocol),
-        ));
+    let out = json!({ "command": "resume", "requested": requested, "loaded_from": used, "resumed_at": ck.meta.k, "effective": ck.meta.config, "report": report });
+    if !as_json {
+        println!("resumed from {} at iteration {}", used.display(), ck.meta.k);
     }
-    .map_err(protocol_failure)?;
-    let out = json!({ "command": "resume", "requested": requested, "resumed_at": m.k, "effective": m.config, "report": report });
     print_report(&report, &out, as_json);
     Ok(exit_for(&report))
 }
@@ -492,9 +626,10 @@ fn cmd_verify(
                 "accepted",
                 json!({
                     "exponent": proof.p, "power": proof.power(), "claim": claim,
+                    "terminal_recomputed": v.terminal_recomputed,
                     "squarings": v.squarings, "gerbicz_passed": v.gerbicz_passed, "gerbicz_failed": v.gerbicz_failed,
                     "secs": start.elapsed().as_secs_f64(),
-                    "message": format!("M{} {claim}: the proof verifies the PRP computation, not deterministic primality", proof.p),
+                    "message": verify_message(proof.p, claim, v.terminal_recomputed),
                 }),
                 0,
             ))
@@ -508,13 +643,30 @@ fn cmd_verify(
     }
 }
 
+/// What an accepted proof establishes, for the `verify` output.
+fn verify_message(p: u32, claim: &str, recomputed: bool) -> String {
+    if recomputed {
+        format!(
+            "M{p} {claim}: the terminal residue was recomputed directly and matches the proof; this verifies the PRP computation, not deterministic primality"
+        )
+    } else {
+        format!(
+            "M{p} {claim}: the file satisfies the version 2 proof equation (the relation the upstream verifier checks). \
+             That is sound against computation errors and against a prover who skipped the work, \
+             not against a prover who knows a factor of M{p} or elements of small order modulo M{p}; \
+             the challenge is 64 bits. A probable prime claim from a proof needs an independent test"
+        )
+    }
+}
+
 fn cmd_bench(plan: &Path, output: &Path) -> Result<u8, Failure> {
     let text = std::fs::read_to_string(plan)
         .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", plan.display())))?;
     let plan: bench::Plan =
         serde_json::from_str(&text).map_err(|e| fail(2, format!("invalid plan: {e}")))?;
-    let work = output.with_extension("work");
-    let out = bench::run_plan(&plan, &work, |o| {
+    plan.validate()
+        .map_err(|e| fail(2, format!("invalid plan: {e}")))?;
+    let out = bench::run_plan(&plan, output, Some(&STOP), |o| {
         eprintln!(
             "{:>4} {:<24} repeat {:<3}{} {:<10} {:.3}s",
             o.sequence,
@@ -524,17 +676,8 @@ fn cmd_bench(plan: &Path, output: &Path) -> Result<u8, Failure> {
             o.status,
             o.wall_secs
         )
-    });
-    if let Some(dir) = output.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir).map_err(|e| fail(EXIT_STATE, e.to_string()))?;
-    }
-    let body = if output.extension().is_some_and(|e| e == "csv") {
-        bench::to_csv(&out)
-    } else {
-        serde_json::to_string_pretty(&out).expect("serializes")
-    };
-    std::fs::write(output, body)
-        .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", output.display())))?;
+    })
+    .map_err(|e| fail(EXIT_STATE, e))?;
     let failed = out
         .observations
         .iter()
@@ -545,10 +688,38 @@ fn cmd_bench(plan: &Path, output: &Path) -> Result<u8, Failure> {
         out.observations.len(),
         output.display()
     );
-    Ok(0)
+    Ok(if STOP.load(Ordering::SeqCst) {
+        EXIT_INCOMPLETE
+    } else {
+        0
+    })
 }
 
-fn cmd_doctor(as_json: bool) -> Result<u8, Failure> {
+/// Memory figures of one backend for exponent p. Canonical residues (what
+/// crosses the backend trait and goes into files) are shown apart from the
+/// backend's resident registers and fixed scratch.
+fn memory_entry(kind: BackendKind, p: u32) -> serde_json::Value {
+    match kind.memory_estimate(p) {
+        None => json!(null),
+        Some(Err(e)) => json!({ "error": e.to_string() }),
+        Some(Ok(m)) => {
+            let power = proof::default_power(p);
+            let regs = |n: u64| m.fixed_bytes + n * m.bytes_per_register;
+            json!({
+                "plan": m.plan,
+                "on_device": m.on_device,
+                "canonical_residue_bytes": 4 * mersenne_forge::residue::limb_count(p) as u64,
+                "bytes_per_register": m.bytes_per_register,
+                "fixed_bytes": m.fixed_bytes,
+                "registers": { "prp": 4, "ll": 2, "proof_verification": 4, "proof_generation": power + 2 },
+                "default_proof_power": power,
+                "peak_bytes": { "prp": regs(4), "ll": regs(2), "proof_generation": regs(u64::from(power) + 2) },
+            })
+        }
+    }
+}
+
+fn cmd_doctor(exponent: Option<u32>, as_json: bool) -> Result<u8, Failure> {
     let mut backends = Vec::new();
     for kind in [
         BackendKind::Cpu,
@@ -561,6 +732,9 @@ fn cmd_doctor(as_json: bool) -> Result<u8, Failure> {
             "built": kind.built(),
             "supported_exponents": kind.supported_exponents(),
         });
+        if let Some(p) = exponent {
+            entry["memory"] = memory_entry(kind, p);
+        }
         match kind {
             BackendKind::Cpu => entry["arithmetic"] = json!("exact bigint, Mersenne folding"),
             BackendKind::Dwt => {
@@ -600,8 +774,9 @@ fn cmd_doctor(as_json: bool) -> Result<u8, Failure> {
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "backends": backends,
+        "exponent": exponent,
         "requirements": {
-            "residue_bytes": "about p / 8 per resident residue; a run keeps 4 to 6",
+            "memory": "per backend with --exponent: resident registers (PRP 4, LL 2, proof generation power + 2) plus fixed scratch",
             "proof_disk_bytes": "2^power * ((p - 1) / 8 + 1) for the proof residues, plus the proof file",
             "checkpoint_bytes": "about 2 * p / 8 plus metadata",
         },
@@ -631,6 +806,24 @@ fn cmd_doctor(as_json: bool) -> Result<u8, Failure> {
                 b["kind"].as_str().unwrap_or(""),
                 b["arithmetic"].as_str().unwrap_or("")
             );
+            let m = &b["memory"];
+            if let Some(e) = m["error"].as_str() {
+                println!("        memory: {e}");
+            } else if m.is_object() {
+                println!(
+                    "        memory for M{}: plan {}, canonical residue {} B, register {} B{}, fixed {} B; peak PRP {} B, LL {} B, proof generation (power {}) {} B",
+                    exponent.unwrap_or(0),
+                    m["plan"].as_str().unwrap_or(""),
+                    m["canonical_residue_bytes"],
+                    m["bytes_per_register"],
+                    if m["on_device"] == true { " on device" } else { "" },
+                    m["fixed_bytes"],
+                    m["peak_bytes"]["prp"],
+                    m["peak_bytes"]["ll"],
+                    m["default_proof_power"],
+                    m["peak_bytes"]["proof_generation"]
+                );
+            }
             if let Some(devs) = b["probe"]["devices"].as_array() {
                 for d in devs {
                     println!(
@@ -646,8 +839,51 @@ fn cmd_doctor(as_json: bool) -> Result<u8, Failure> {
     Ok(0)
 }
 
+/// The `kind` of a failure in JSON output, from its exit code.
+fn failure_kind(code: u8) -> &'static str {
+    match code {
+        2 => "usage",
+        EXIT_INCOMPLETE => "incomplete",
+        EXIT_UNSUPPORTED => "unsupported",
+        EXIT_EXECUTION => "execution",
+        EXIT_STATE => "state",
+        EXIT_REJECTED => "rejected",
+        _ => "error",
+    }
+}
+
+fn emit_failure(f: &Failure, as_json: bool) {
+    if as_json {
+        let out =
+            json!({ "kind": failure_kind(f.code), "message": f.message, "exit_code": f.code });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&out).expect("serializes")
+        );
+    } else {
+        eprintln!("error: {}", f.message);
+    }
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => {
+            let json = std::env::args().any(|a| a == "--json");
+            if !json || !e.use_stderr() {
+                e.exit();
+            }
+            emit_failure(&fail(2, e.to_string().trim_end()), true);
+            return ExitCode::from(2);
+        }
+    };
+    let as_json = match &cli.cmd {
+        Cmd::Doctor { json, .. }
+        | Cmd::Run { json, .. }
+        | Cmd::Resume { json, .. }
+        | Cmd::Verify { json, .. } => *json,
+        Cmd::Bench { .. } => false,
+    };
     let _ = ctrlc::set_handler(|| {
         if STOP.swap(true, Ordering::SeqCst) {
             std::process::exit(130);
@@ -657,7 +893,7 @@ fn main() -> ExitCode {
         );
     });
     let r = match cli.cmd {
-        Cmd::Doctor { json } => cmd_doctor(json),
+        Cmd::Doctor { exponent, json } => cmd_doctor(exponent, json),
         Cmd::Run {
             test,
             exponent,
@@ -708,7 +944,7 @@ fn main() -> ExitCode {
     match r {
         Ok(code) => ExitCode::from(code),
         Err(f) => {
-            eprintln!("error: {}", f.message);
+            emit_failure(&f, as_json);
             ExitCode::from(f.code)
         }
     }

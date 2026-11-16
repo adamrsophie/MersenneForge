@@ -132,9 +132,42 @@ fn backend_handle_errors() {
     );
     be.free(a).unwrap();
     assert_eq!(be.export(a), Err(BackendError::InvalidHandle(a.0)));
-    assert_eq!(be.square(Reg(99), 1), Err(BackendError::InvalidHandle(99)));
+    for bad in [Reg(0), Reg(u32::MAX)] {
+        assert_eq!(be.square(bad, 1), Err(BackendError::InvalidHandle(bad.0)));
+    }
     let b = be.alloc().unwrap();
     assert!(be.import(b, &Residue::from_u64(61, 1)).is_err());
+}
+
+/// A handle issued by one instance is `InvalidHandle` on another instance
+/// of the same kind, and neither instance's residue changes.
+fn handles_stay_with_their_instance<B: Backend>(make: impl Fn() -> B) {
+    let p = make().exponent();
+    let (mut one, mut two) = (make(), make());
+    let a = one.alloc().unwrap();
+    let b = two.alloc().unwrap();
+    one.import(a, &Residue::from_u64(p, 5)).unwrap();
+    two.import(b, &Residue::from_u64(p, 7)).unwrap();
+    let inv = BackendError::InvalidHandle(a.0);
+    assert_eq!(two.export(a).err(), Some(inv.clone()));
+    assert_eq!(two.square(a, 1), Err(inv.clone()));
+    assert_eq!(two.import(a, &Residue::from_u64(p, 9)), Err(inv.clone()));
+    assert_eq!(two.copy(b, a), Err(inv.clone()));
+    assert_eq!(two.mul(b, a), Err(inv.clone()));
+    assert_eq!(two.free(a), Err(inv));
+    assert_eq!(one.free(b), Err(BackendError::InvalidHandle(b.0)));
+    assert_eq!(one.export(a).unwrap(), Residue::from_u64(p, 5));
+    assert_eq!(two.export(b).unwrap(), Residue::from_u64(p, 7));
+}
+
+#[test]
+fn cpu_handles_stay_with_their_instance() {
+    handles_stay_with_their_instance(|| CpuBackend::new(127).unwrap());
+}
+
+#[test]
+fn dwt_handles_stay_with_their_instance() {
+    handles_stay_with_their_instance(|| DwtBackend::new(127).unwrap());
 }
 
 #[test]

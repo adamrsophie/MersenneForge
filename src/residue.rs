@@ -189,8 +189,10 @@ impl Residue {
             });
         }
         let limbs = bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
             .collect();
         Residue::from_limbs(p, limbs)
     }
@@ -217,8 +219,10 @@ impl Residue {
         let mut padded = bytes.to_vec();
         padded.resize(4 * limb_count(p), 0);
         let limbs = padded
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
             .collect();
         Residue::from_limbs_normalizing(p, limbs)
     }

@@ -16,7 +16,8 @@ use mersenne_forge::proof::{self, Proof, ProofError};
 use mersenne_forge::prp::{run_prp, PrpConfig};
 use mersenne_forge::residue::Residue;
 use mersenne_forge::run::{
-    Control, FaultKind, FaultPlan, FaultTarget, ProcessState, ProtocolError, RunReport, Verdict,
+    Control, FaultKind, FaultPlan, FaultTarget, ProcessState, ProofStage, ProtocolError, RunReport,
+    Verdict,
 };
 
 /// M1279 is prime; M1277 is composite.
@@ -109,6 +110,11 @@ pub fn prp_prime_and_composite_with_proofs<B: Backend>(mk: impl Fn(u32) -> B) {
         assert_eq!(proof.power(), 5);
         let v = proof::verify(&mut be, &proof, &mut Control::default()).unwrap();
         assert_eq!(v.probable_prime, oracle::prp(p).positive);
+        assert!(
+            v.terminal_recomputed,
+            "p = {p} is below the recompute cutoff"
+        );
+        assert_eq!(r.evidence.proof_stage, ProofStage::Verified);
     }
 }
 
@@ -416,7 +422,12 @@ pub fn proof_rejections<B: Backend>(mk: impl Fn(u32) -> B) {
     let proof = parse(&good, Some(p)).unwrap();
     assert!(proof::verify(&mut be, &proof, &mut Control::default()).is_ok());
 
-    // Altered middle: parses, verification rejects.
+    let v = proof::verify_equation(&mut be, &proof, &mut Control::default()).unwrap();
+    assert!(!v.terminal_recomputed);
+
+    // Altered B or middle: parses; the full verification (which recomputes
+    // the terminal residue for this small p) and the proof equation alone
+    // both reject.
     let hlen = good.len() - 5 * mersenne_forge::residue::proof_byte_len(p);
     for at in [hlen + 3, hlen + 170, good.len() - 2] {
         let mut bad = good.clone();
@@ -426,6 +437,11 @@ pub fn proof_rejections<B: Backend>(mk: impl Fn(u32) -> B) {
         assert!(
             matches!(e, ProtocolError::Proof(ProofError::Rejected)),
             "byte {at}: {e}"
+        );
+        let e = proof::verify_equation(&mut be, &pr, &mut Control::default()).unwrap_err();
+        assert!(
+            matches!(e, ProtocolError::Proof(ProofError::Rejected)),
+            "equation, byte {at}: {e}"
         );
     }
     assert!(matches!(

@@ -15,15 +15,18 @@
 //! ```
 //!
 //! The total size is computed from the header and metadata and compared with
-//! the file size before any residue is read. The hash detects corrupted bytes;
-//! it is not mathematical verification. The state machines check the loaded
-//! residues mathematically (PRP: a Gerbicz check on load; LL: the residue is
-//! resumed and the next Jacobi check covers it).
+//! the file size before any residue is read. The hash detects damaged bytes;
+//! it authenticates nothing (anyone can recompute it). The PRP on-load check
+//! detects a damaged residue pair; the LL residue is covered by the next
+//! Jacobi check. The iteration count and the configuration are trusted
+//! metadata that no local check can authenticate.
 //!
 //! Durability: the new file is written to `<path>.tmp` and fsynced; the
-//! existing checkpoint is renamed to `<path>.prev`; the temporary file is
-//! renamed to `<path>`; the directory is fsynced. A crash at any point leaves
-//! either `<path>` or `<path>.prev` intact, and the loader falls back to
+//! existing `<path>` is renamed to `<path>.prev` only if it loads and passes
+//! its hash, and is otherwise removed so that a good `<path>.prev` is kept;
+//! the temporary file is renamed to `<path>`; the directory is fsynced. If
+//! `<path>` or `<path>.prev` loaded before a save, a crash at any point of
+//! the save leaves one of them loadable, and the loader falls back to
 //! `<path>.prev` when `<path>` is missing or corrupt.
 
 use std::fs;
@@ -109,6 +112,7 @@ fn tmp_path(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Fsync the directory that contains `path`.
 fn sync_dir(path: &Path) -> std::io::Result<()> {
     let dir = path
         .parent()
@@ -117,17 +121,43 @@ fn sync_dir(path: &Path) -> std::io::Result<()> {
     fs::File::open(dir)?.sync_all()
 }
 
-/// Write `bytes` to `path` atomically: temporary file, fsync, optional
-/// rotation of the old file to `.prev`, rename, directory fsync.
-pub fn write_atomic(path: &Path, bytes: &[u8], keep_prev: bool) -> std::io::Result<()> {
+/// `create_dir_all`, then fsync the parent of every directory it created,
+/// so the new directory entries are durable before files inside them are
+/// relied on.
+pub fn create_dir_all_durable(dir: &Path) -> std::io::Result<()> {
+    let mut missing = Vec::new();
+    let mut d = dir;
+    while !d.as_os_str().is_empty() && !d.exists() {
+        missing.push(d.to_path_buf());
+        match d.parent() {
+            Some(parent) => d = parent,
+            None => break,
+        }
+    }
+    fs::create_dir_all(dir)?;
+    for m in missing.iter().rev() {
+        sync_dir(m)?;
+    }
+    Ok(())
+}
+
+/// Write `bytes` to `path` atomically: temporary file, fsync, rename,
+/// directory fsync. With `checkpoint_rotation`, the existing `path` is first
+/// renamed to `.prev` if it is a checkpoint that loads, and removed if it
+/// does not, so a corrupt file never replaces a good `.prev`.
+pub fn write_atomic(path: &Path, bytes: &[u8], checkpoint_rotation: bool) -> std::io::Result<()> {
     let tmp = tmp_path(path);
     {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
-    if keep_prev && path.exists() {
-        fs::rename(path, prev_path(path))?;
+    if checkpoint_rotation && path.exists() {
+        if Checkpoint::load_file(path).is_ok() {
+            fs::rename(path, prev_path(path))?;
+        } else {
+            fs::remove_file(path)?;
+        }
     }
     fs::rename(&tmp, path)?;
     sync_dir(path)
@@ -155,7 +185,7 @@ impl Checkpoint {
 
     pub fn save(&self, path: &Path) -> Result<(), CheckpointError> {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            fs::create_dir_all(dir).map_err(|e| CheckpointError::Io(e.to_string()))?;
+            create_dir_all_durable(dir).map_err(|e| CheckpointError::Io(e.to_string()))?;
         }
         write_atomic(path, &self.to_bytes(), true)
             .map_err(|e| CheckpointError::Io(format!("{}: {e}", path.display())))
@@ -197,15 +227,18 @@ impl Checkpoint {
                 "size {file_len} does not match the header ({want})"
             )));
         }
-        let mut rest = Vec::with_capacity((file_len - 32 - meta_len - 4) as usize);
+        let rest_len = usize::try_from(file_len - 32 - meta_len - 4)
+            .map_err(|_| corrupt("residues too large for this platform"))?;
+        let mut rest = Vec::new();
+        rest.try_reserve_exact(rest_len).map_err(|e| {
+            CheckpointError::Io(format!("{}: cannot allocate: {e}", path.display()))
+        })?;
         f.read_to_end(&mut rest).map_err(io)?;
-        let mut all = Vec::with_capacity(file_len as usize);
-        all.extend_from_slice(&head);
-        all.extend_from_slice(&meta_bytes);
-        all.extend_from_slice(&cnt);
-        all.extend_from_slice(&rest);
-        let (body, hash) = all.split_at(all.len() - 32);
-        if sha3_256(&[body]) != hash {
+        if rest.len() != rest_len {
+            return Err(corrupt("file changed while it was read"));
+        }
+        let (residue_bytes, hash) = rest.split_at(rest_len - 32);
+        if sha3_256(&[&head, &meta_bytes, &cnt, residue_bytes]) != hash {
             return Err(corrupt("integrity hash mismatch"));
         }
         if version != FORMAT_VERSION || meta.format_version != FORMAT_VERSION {

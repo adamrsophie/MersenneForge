@@ -6,10 +6,12 @@ mod common;
 
 use mersenne_forge::backend::cpu::CpuBackend;
 use mersenne_forge::backend::dwt::DwtBackend;
-use mersenne_forge::checkpoint::{prev_path, Checkpoint, CheckpointError};
+use mersenne_forge::checkpoint::{create_dir_all_durable, prev_path, Checkpoint, CheckpointError};
 use mersenne_forge::ll::run_ll;
 use mersenne_forge::prp::run_prp;
-use mersenne_forge::run::{Control, ProtocolError};
+use mersenne_forge::run::{
+    Control, FaultKind, FaultPlan, FaultTarget, ProcessState, ProtocolError,
+};
 
 use common::{ll_cfg, prp_cfg, PRIME_P};
 
@@ -179,6 +181,29 @@ fn mismatched_identity_or_configuration_is_refused() {
             "{e}"
         );
     }
+    // Metadata fields with one valid value for a PRP state.
+    let forgeries: [fn(&mut Checkpoint); 3] = [
+        |c| c.meta.state = "provisional".into(),
+        |c| c.meta.verified_k = 896,
+        |c| c.meta.proof_durable_through = Some(640),
+    ];
+    for forge in forgeries {
+        let mut forged = ck.clone();
+        forge(&mut forged);
+        let e = run_prp(
+            &mut CpuBackend::new(PRIME_P).unwrap(),
+            PRIME_P,
+            &cfg,
+            serde_json::json!({}),
+            Some(&forged),
+            &mut Control::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(e, ProtocolError::Checkpoint(CheckpointError::Mismatch(_))),
+            "{e}"
+        );
+    }
     // An LL checkpoint given to PRP.
     let mut ctl = Control {
         halt_at: Some(300),
@@ -212,8 +237,10 @@ fn mismatched_identity_or_configuration_is_refused() {
 
 #[test]
 fn mathematically_wrong_checkpoint_is_rejected_on_load() {
-    // Valid bytes and hash, wrong mathematics: the on-load Gerbicz check
-    // catches what the integrity hash cannot.
+    // Valid bytes and hash, damaged residue pair: the on-load Gerbicz check
+    // catches what the integrity hash cannot. It cannot catch a consistent
+    // pair under a wrong iteration count: k and the configuration are trusted
+    // metadata, and the hash only detects damaged bytes.
     let dir = tempfile::tempdir().unwrap();
     let path = halted_prp(dir.path());
     let (mut ck, _) = Checkpoint::load_latest(&path).unwrap();
@@ -234,4 +261,136 @@ fn mathematically_wrong_checkpoint_is_rejected_on_load() {
         matches!(e, ProtocolError::CheckpointRejected { k: 960 }),
         "{e}"
     );
+}
+
+#[test]
+fn a_save_after_falling_back_keeps_the_good_previous_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = halted_prp(dir.path());
+    let mut bad = std::fs::read(&path).unwrap();
+    let n = bad.len();
+    bad[n / 2] ^= 0x01;
+    std::fs::write(&path, &bad).unwrap();
+    let (ck, used) = Checkpoint::load_latest(&path).unwrap();
+    assert_eq!((ck.meta.k, &used), (896, &prev_path(&path)));
+    // Resume from 896 and stop right after the one save, at the early check
+    // at 896 + 2 * 16 = 928.
+    let mut ctl = Control {
+        halt_at: Some(929),
+        ..Control::default()
+    };
+    run_prp(
+        &mut CpuBackend::new(PRIME_P).unwrap(),
+        PRIME_P,
+        &prp_cfg(dir.path(), None),
+        serde_json::json!({}),
+        Some(&ck),
+        &mut ctl,
+    )
+    .unwrap();
+    assert_eq!(Checkpoint::load_file(&path).unwrap().meta.k, 928);
+    // The corrupt primary was removed, not rotated over the good .prev.
+    assert_eq!(
+        Checkpoint::load_file(&prev_path(&path)).unwrap().meta.k,
+        896
+    );
+}
+
+#[test]
+fn a_report_names_only_a_checkpoint_that_exists() {
+    // A stop request and a fault before the first checkpoint: nothing was
+    // written, so no resume command may be offered.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = prp_cfg(dir.path(), None);
+    let mut ctl = Control {
+        deadline: Some(std::time::Instant::now()),
+        faults: vec![FaultPlan::once(
+            16,
+            FaultTarget::Data,
+            FaultKind::BackendFault,
+        )],
+        ..Control::default()
+    };
+    let r = run_prp(
+        &mut CpuBackend::new(PRIME_P).unwrap(),
+        PRIME_P,
+        &cfg,
+        serde_json::json!({}),
+        None,
+        &mut ctl,
+    )
+    .unwrap();
+    assert!(!cfg.checkpoint.as_ref().unwrap().exists());
+    assert!(
+        matches!(
+            r.process,
+            ProcessState::Incomplete {
+                checkpoint: None,
+                ..
+            }
+        ),
+        "{:?}",
+        r.process
+    );
+
+    let lcfg = ll_cfg(dir.path());
+    let mut ctl = Control {
+        deadline: Some(std::time::Instant::now()),
+        faults: vec![FaultPlan::once(
+            50,
+            FaultTarget::Data,
+            FaultKind::BackendFault,
+        )],
+        ..Control::default()
+    };
+    let r = run_ll(
+        &mut CpuBackend::new(PRIME_P).unwrap(),
+        PRIME_P,
+        &lcfg,
+        serde_json::json!({}),
+        None,
+        &mut ctl,
+    )
+    .unwrap();
+    assert!(!lcfg.checkpoint.as_ref().unwrap().exists());
+    assert!(
+        matches!(
+            r.process,
+            ProcessState::Incomplete {
+                checkpoint: None,
+                ..
+            }
+        ),
+        "{:?}",
+        r.process
+    );
+
+    // After a save, the report names the file.
+    let mut ctl = Control {
+        deadline: Some(std::time::Instant::now()),
+        ..Control::default()
+    };
+    let r = run_prp(
+        &mut CpuBackend::new(PRIME_P).unwrap(),
+        PRIME_P,
+        &cfg,
+        serde_json::json!({}),
+        None,
+        &mut ctl,
+    )
+    .unwrap();
+    assert!(
+        matches!(&r.process, ProcessState::Incomplete { checkpoint: Some(c), .. } if c.exists()),
+        "{:?}",
+        r.process
+    );
+}
+
+#[test]
+fn nested_directories_are_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let deep = dir.path().join("a").join("b").join("c");
+    create_dir_all_durable(&deep).unwrap();
+    assert!(deep.is_dir());
+    create_dir_all_durable(&deep).unwrap();
 }

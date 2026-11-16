@@ -31,8 +31,8 @@ use crate::checkpoint::{Checkpoint, CheckpointError, CheckpointMeta, FORMAT_VERS
 use crate::proof::{self, ProofSchedule, ProofStore};
 use crate::residue::Residue;
 use crate::run::{
-    round_up, Control, Evidence, FaultKind, FaultTarget, MathResult, ProcessState, ProofEvidence,
-    ProtocolError, RunReport, Stopwatch, Timings, Verdict,
+    round_up, with_regs, Control, Evidence, FaultKind, FaultTarget, MathResult, ProcessState,
+    ProofEvidence, ProofStage, ProtocolError, RunReport, Stopwatch, Timings, Verdict,
 };
 
 pub const PROTOCOL: &str = "prp-base3-gerbicz/1";
@@ -246,7 +246,7 @@ impl<'b, B: Backend> Engine<'b, B> {
     ) -> Result<Step, StepErr> {
         let b = spec.block;
         let k = self.k;
-        if k % b == 0 {
+        if k.is_multiple_of(b) {
             if self.skip_update {
                 self.skip_update = false;
             } else {
@@ -283,8 +283,24 @@ impl<'b, B: Backend> Engine<'b, B> {
             };
             apply_fault(self.be, r, kind, false)?;
         }
-        if let Some(store) = spec.proof.filter(|s| s.schedule.contains(k)) {
+        if k == spec.kend {
+            // The terminal residue is reported from this host copy, and the
+            // later checks cover only the resident value: import the copy
+            // and require it to equal the resident value.
             let v = self.be.export(self.x)?;
+            self.be.import(self.t, &v)?;
+            if !self.be.equal(self.t, self.x)? {
+                return Err(StepErr::Fault(format!(
+                    "the exported terminal residue at {k} differs from the resident value"
+                )));
+            }
+            self.final_x = Some(v);
+        }
+        if let Some(store) = spec.proof.filter(|s| s.schedule.contains(k)) {
+            let v = match &self.final_x {
+                Some(v) if k == spec.kend => v.clone(),
+                _ => self.be.export(self.x)?,
+            };
             if v.is_zero() {
                 return Err(StepErr::Fault(format!("zero residue at proof point {k}")));
             }
@@ -301,18 +317,15 @@ impl<'b, B: Backend> Engine<'b, B> {
                 })
             })?;
         }
-        if k == spec.kend {
-            self.final_x = Some(self.be.export(self.x)?);
-        }
         if ctl.halt_at == Some(k) {
             return Ok(Step::Halted);
         }
-        if k % b != 0 {
+        if !k.is_multiple_of(b) {
             return Ok(Step::Continue);
         }
         let stop = ctl.stop_requested();
         let kendend = round_up(spec.kend, b);
-        if !(stop || k % self.step == 0 || k >= kendend || k == self.early) {
+        if !(stop || k.is_multiple_of(self.step) || k >= kendend || k == self.early) {
             return Ok(Step::Continue);
         }
         let sw = Stopwatch::start();
@@ -343,25 +356,22 @@ fn run_engine<B: Backend>(
     on_verified: Option<OnVerified>,
     cnt: &mut Counters,
 ) -> Result<End, ProtocolError> {
-    let regs = [be.alloc()?, be.alloc()?, be.alloc()?, be.alloc()?];
-    be.import(regs[2], a)?;
-    let mut eng = Engine {
-        be,
-        x: regs[0],
-        c: regs[1],
-        a: regs[2],
-        t: regs[3],
-        k: from.k,
-        skip_update: true,
-        early: 0,
-        step: spec.rule.effective(spec.block, n_errors),
-        final_x: None,
-    };
-    let out = drive(&mut eng, from, n_errors, spec, ctl, on_verified, cnt);
-    for r in regs {
-        eng.be.free(r)?;
-    }
-    out
+    with_regs(be, 4, |be, regs| {
+        be.import(regs[2], a)?;
+        let mut eng = Engine {
+            be,
+            x: regs[0],
+            c: regs[1],
+            a: regs[2],
+            t: regs[3],
+            k: from.k,
+            skip_update: true,
+            early: 0,
+            step: spec.rule.effective(spec.block, n_errors),
+            final_x: None,
+        };
+        drive(&mut eng, from, n_errors, spec, ctl, on_verified, cnt)
+    })
 }
 
 fn drive<B: Backend>(
@@ -522,14 +532,32 @@ pub fn checked_power<B: Backend>(
     cfg: &CheckedPowerConfig,
     ctl: &mut Control,
 ) -> Result<CheckedPower, ProtocolError> {
+    let p = a.exponent();
+    if be.exponent() != p {
+        return Err(ProtocolError::Config(format!(
+            "backend is for M{}, start value for M{p}",
+            be.exponent()
+        )));
+    }
+    if cfg.block < 2 || cfg.max_batch == 0 || cfg.check_step == 0 {
+        return Err(ProtocolError::Config(
+            "checked power needs a block of at least 2 and a positive check step and batch".into(),
+        ));
+    }
     if a.is_zero() {
+        // Every power of zero is zero, and the Gerbicz check cannot cover a
+        // zero value: refuse instead of returning an unchecked result.
+        return Err(ProtocolError::Config(
+            "checked power needs a nonzero start value".into(),
+        ));
+    }
+    if n == 0 {
         return Ok(CheckedPower {
             residue: a.clone(),
             passed: 0,
             failed: 0,
         });
     }
-    let p = a.exponent();
     let spec = Spec {
         block: u64::from(cfg.block),
         kend: n,
@@ -591,6 +619,19 @@ fn validate(p: u32, cfg: &PrpConfig) -> Result<Option<ProofSchedule>, ProtocolEr
             power.unwrap_or_else(|| proof::default_power(p)),
         )?)),
         (Some(_), _) => Err(ProtocolError::Config("no proof exists for p = 2".into())),
+    }
+}
+
+fn step_rule(p: u32, cfg: &PrpConfig) -> StepRule {
+    match cfg.check_step {
+        Some(s) => StepRule {
+            base: s,
+            scale_for: None,
+        },
+        None => StepRule {
+            base: upstream_check_step(cfg.block_size).expect("validated"),
+            scale_for: Some(u64::from(p)),
+        },
     }
 }
 
@@ -700,6 +741,15 @@ pub fn run_prp<B: Backend>(
             if without_checkpoint(&m.config) != without_checkpoint(&config_json) {
                 return Err(CheckpointError::Mismatch("run configuration differs".into()).into());
             }
+            // The remaining metadata has one valid value for a PRP state.
+            let through = spec_proof_through(store.as_ref(), m.k);
+            if m.state != "verified" || m.verified_k != m.k || m.proof_durable_through != through {
+                return Err(CheckpointError::Mismatch(format!(
+                    "inconsistent metadata: state {:?}, verified_k {}, proof_durable_through {:?} at k = {}",
+                    m.state, m.verified_k, m.proof_durable_through, m.k
+                ))
+                .into());
+            }
             if let Some(s) = &store {
                 s.check_through(m.k)?;
             }
@@ -715,19 +765,11 @@ pub fn run_prp<B: Backend>(
     let spec = Spec {
         block: u64::from(cfg.block_size),
         kend: u64::from(p),
-        rule: match cfg.check_step {
-            Some(s) => StepRule {
-                base: s,
-                scale_for: None,
-            },
-            None => StepRule {
-                base: upstream_check_step(cfg.block_size).expect("validated"),
-                scale_for: Some(u64::from(p)),
-            },
-        },
+        rule: step_rule(p, cfg),
         max_batch: cfg.max_batch,
         proof: store.as_ref(),
     };
+    evidence.check_step = Some(spec.rule.effective(spec.block, 0));
     let start = Stopwatch::start();
     let identity = be.identity();
     let ckpt_path = cfg.checkpoint.clone();
@@ -791,7 +833,7 @@ pub fn run_prp<B: Backend>(
                 process: ProcessState::Incomplete {
                     k: state.k,
                     reason: "stop requested or budget exhausted".into(),
-                    checkpoint: cfg.checkpoint.clone(),
+                    checkpoint: existing_checkpoint(cfg.checkpoint.as_deref()),
                 },
                 result: None,
                 evidence,
@@ -803,30 +845,41 @@ pub fn run_prp<B: Backend>(
     let result = final_result(p, &final_x);
     if let Some(store) = &store {
         let sw = Stopwatch::start();
-        let generated = proof::generate(be, store).and_then(|pr| {
+        let generated = proof::generate(be, store, ctl).and_then(|pr| {
             let path = pr.write(cfg.proof_dir.as_deref().expect("store implies dir"))?;
             Ok((pr, path))
         });
         timings.proof_generation = sw.secs();
         match generated {
-            Err(e) => evidence.notes.push(format!("proof generation failed: {e}")),
+            Err(e) => {
+                evidence.proof_stage = match e {
+                    ProtocolError::Interrupted { .. } => ProofStage::Interrupted,
+                    _ => ProofStage::Failed,
+                };
+                evidence.notes.push(format!("proof generation failed: {e}"));
+            }
             Ok((pr, path)) => {
                 let hashes = pr.hashes().iter().map(|h| format!("{h:016x}")).collect();
-                let self_verification = if cfg.verify_proof {
+                let (stage, self_verification) = if cfg.verify_proof {
                     let sw = Stopwatch::start();
                     let v = proof::verify(be, &pr, ctl);
                     timings.proof_verification = sw.secs();
                     match v {
                         Ok(v) if v.probable_prime == (result.verdict == Verdict::ProbablePrime) => {
-                            "accepted".into()
+                            (ProofStage::Verified, "accepted".into())
                         }
-                        Ok(_) => "rejected".into(),
-                        Err(ProtocolError::Proof(_)) => "rejected".into(),
-                        Err(e) => format!("not completed: {e}"),
+                        Ok(_) | Err(ProtocolError::Proof(_)) => {
+                            (ProofStage::Rejected, "rejected".into())
+                        }
+                        Err(e @ ProtocolError::Interrupted { .. }) => {
+                            (ProofStage::Interrupted, format!("not completed: {e}"))
+                        }
+                        Err(e) => (ProofStage::Failed, format!("not completed: {e}")),
                     }
                 } else {
-                    "not run".into()
+                    (ProofStage::Generated, "not run".into())
                 };
+                evidence.proof_stage = stage;
                 evidence.proof = Some(ProofEvidence {
                     path,
                     power: pr.power(),
@@ -834,6 +887,12 @@ pub fn run_prp<B: Backend>(
                     hashes,
                 });
             }
+        }
+        if evidence.proof_stage == ProofStage::Interrupted {
+            evidence.notes.push(
+                "the proof stage was stopped; a resume from the checkpoint redoes the last check interval and the proof"
+                    .into(),
+            );
         }
     }
     evidence.notes.push(
@@ -857,6 +916,13 @@ fn spec_proof_through(store: Option<&ProofStore>, k: u64) -> Option<u64> {
             .max()
             .unwrap_or(0)
     })
+}
+
+/// The checkpoint path to name in a report: only when a file there (or its
+/// `.prev`, which `resume` falls back to) exists.
+pub(crate) fn existing_checkpoint(path: Option<&std::path::Path>) -> Option<PathBuf> {
+    path.filter(|c| c.exists() || crate::checkpoint::prev_path(c).exists())
+        .map(|c| c.to_path_buf())
 }
 
 /// The configuration without the checkpoint path, which may move on resume.

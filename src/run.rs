@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::backend::{BackendError, BackendIdentity};
+use crate::backend::{Backend, BackendError, BackendIdentity, Reg};
 use crate::checkpoint::CheckpointError;
 use crate::proof::ProofError;
 
@@ -296,7 +296,46 @@ pub struct Evidence {
     /// Rollbacks to the last verified state.
     pub rollbacks: u64,
     pub proof: Option<ProofEvidence>,
+    /// PRP: what happened to the requested proof, separately from the result.
+    pub proof_stage: ProofStage,
+    /// PRP: the Gerbicz check step derived from the configuration at the
+    /// start (before any halving after an error). Informational output; not
+    /// part of the configuration a resume compares.
+    pub check_step: Option<u64>,
     pub notes: Vec<String>,
+}
+
+/// Status of the proof stage of a PRP run. The PRP result is kept whatever
+/// happens here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofStage {
+    /// No proof directory was given (or the test is LL).
+    #[default]
+    NotRequested,
+    /// The proof was written; self verification was not requested.
+    Generated,
+    /// The proof was written and its self verification accepted it.
+    Verified,
+    /// The proof was written and its self verification rejected it.
+    Rejected,
+    /// Generation, writing, or verification failed with an error.
+    Failed,
+    /// Generation or verification was stopped by the budget or a stop request.
+    Interrupted,
+}
+
+impl ProofStage {
+    pub fn name(self) -> &'static str {
+        match self {
+            ProofStage::NotRequested => "not requested",
+            ProofStage::Generated => "generated",
+            ProofStage::Verified => "verified",
+            ProofStage::Rejected => "rejected",
+            ProofStage::Failed => "failed",
+            ProofStage::Interrupted => "interrupted",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -314,6 +353,37 @@ pub struct RunReport {
     pub result: Option<MathResult>,
     pub evidence: Evidence,
     pub timings: Timings,
+}
+
+/// Allocate `n` registers, run `f`, then free every register that was
+/// allocated, on every path (a failed partial allocation included). An error
+/// from `f` takes precedence over an error from `free`.
+pub(crate) fn with_regs<B: Backend, T>(
+    be: &mut B,
+    n: usize,
+    f: impl FnOnce(&mut B, &[Reg]) -> Result<T, ProtocolError>,
+) -> Result<T, ProtocolError> {
+    let mut regs = Vec::with_capacity(n);
+    let mut alloc = Ok(());
+    for _ in 0..n {
+        match be.alloc() {
+            Ok(r) => regs.push(r),
+            Err(e) => {
+                alloc = Err(ProtocolError::Backend(e));
+                break;
+            }
+        }
+    }
+    let out = alloc.and_then(|()| f(be, &regs));
+    let mut freed = Ok(());
+    for r in regs {
+        if let Err(e) = be.free(r) {
+            freed = freed.and(Err(ProtocolError::Backend(e)));
+        }
+    }
+    let v = out?;
+    freed?;
+    Ok(v)
 }
 
 pub(crate) fn round_up(k: u64, m: u64) -> u64 {

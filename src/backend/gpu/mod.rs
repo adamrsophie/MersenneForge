@@ -11,13 +11,14 @@
 pub mod model;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use sha3::{Digest, Sha3_256};
 use wgpu::util::DeviceExt;
 
-use super::{Backend, BackendError, BackendIdentity, BackendResult, Reg};
+use super::{
+    new_handle, Backend, BackendError, BackendIdentity, BackendResult, MemoryEstimate, Reg,
+};
 use crate::residue::Residue;
 use model::Plan;
 
@@ -34,10 +35,6 @@ const MIN_ITERS_PER_SUBMIT: u64 = 4;
 const MAX_ITERS_PER_SUBMIT: u64 = 256;
 /// Submissions allowed in flight before the host waits for the oldest.
 const MAX_IN_FLIGHT: usize = 2;
-
-/// Process-wide handle counter, so a handle from another backend instance is
-/// never accepted by this one.
-static NEXT_HANDLE: AtomicU32 = AtomicU32::new(0x4750_0001);
 
 #[derive(Debug, Clone, Default)]
 pub struct GpuOptions {
@@ -65,6 +62,44 @@ pub struct GpuProbe {
 /// Inclusive range of exponents with a plan (see [`model::supported_range`]).
 pub fn supported_exponents() -> (u32, u32) {
     model::supported_range()
+}
+
+fn plan_name(n: u32) -> String {
+    format!("ntt-gf-m31sq n={n}")
+}
+
+/// Uniform parameter blocks of 16 bytes: the base and LL blocks plus one per
+/// forward and one per inverse transform stage.
+fn uniform_bytes(log_n: u32) -> u64 {
+    16 * (2 + 2 * u64::from(log_n))
+}
+
+/// Device memory for exponent p, without opening a device. A register is
+/// `n` balanced `i32` words. The fixed figure counts the two transform
+/// buffers (8n bytes each), the two carry buffers (4n each), the twiddle
+/// table (n / 2 elements of 8 bytes), the word table (4n), the fault flags,
+/// the uniform blocks, and the 4n readback staging buffer that `export`
+/// creates for the time of one read.
+pub fn memory_estimate(p: u32) -> BackendResult<MemoryEstimate> {
+    let (lo, hi) = supported_exponents();
+    let n = model::choose_n(p).ok_or_else(|| {
+        BackendError::Unsupported(format!(
+            "exponent {p} is outside the GPU backend range {lo}..={hi}"
+        ))
+    })?;
+    let n64 = u64::from(n);
+    Ok(MemoryEstimate {
+        plan: plan_name(n),
+        bytes_per_register: 4 * n64,
+        fixed_bytes: 2 * 8 * n64
+            + 2 * 4 * n64
+            + 4 * n64
+            + 4 * n64
+            + 16
+            + uniform_bytes(n.trailing_zeros())
+            + 4 * n64,
+        on_device: true,
+    })
 }
 
 pub fn kernel_source_hash() -> String {
@@ -577,7 +612,7 @@ impl Backend for GpuBackend {
                 env!("CARGO_PKG_VERSION"),
                 kernel_source_hash()
             ),
-            plan: format!("ntt-gf-m31sq n={}", self.plan.n),
+            plan: plan_name(self.plan.n),
             device: self.device_name.clone(),
         }
     }
@@ -598,9 +633,9 @@ impl Backend for GpuBackend {
             finish: self.sh.bind(&self.base, last, &buf),
             buf,
         };
-        let id = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-        self.regs.insert(id, reg);
-        Ok(Reg(id))
+        let r = new_handle()?;
+        self.regs.insert(r.0, reg);
+        Ok(r)
     }
 
     fn free(&mut self, r: Reg) -> BackendResult<()> {
@@ -790,6 +825,36 @@ mod tests {
                 u64::from(a) * u64::from(b) % u64::from(Q),
                 "{a} * {b}"
             );
+        }
+    }
+
+    #[test]
+    fn memory_estimate_matches_the_device_buffers() {
+        let (lo, hi) = supported_exponents();
+        for p in [lo - 1, hi + 1] {
+            assert!(matches!(
+                memory_estimate(p),
+                Err(BackendError::Unsupported(_))
+            ));
+        }
+        for p in [lo, 127, 4423, 86243, model::edge(1 << 16).unwrap()] {
+            let m = memory_estimate(p).unwrap();
+            let mut g = backend(p);
+            assert_eq!(m.plan, g.identity().plan, "p={p}");
+            assert!(m.on_device);
+            let r = g.alloc().unwrap();
+            assert_eq!(m.bytes_per_register, g.reg(r).unwrap().buf.size(), "p={p}");
+            let sh = &g.sh;
+            let resident: u64 = [&sh.t, &sh.t2, &g.s[0], &g.s[1], &sh.tw, &sh.wt, &sh.err]
+                .iter()
+                .map(|b| b.size())
+                .sum();
+            // Uniform blocks: the stored base block plus the LL block and one
+            // per stage, which only the bind groups hold.
+            let stages = (g.bg_dif.len() + g.bg_dit.len()) as u64;
+            let uniforms = g.base.size() + 16 + 16 * stages;
+            let staging = 4 * u64::from(g.plan.n);
+            assert_eq!(m.fixed_bytes, resident + uniforms + staging, "p={p}");
         }
     }
 

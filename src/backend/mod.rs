@@ -26,7 +26,47 @@ pub mod dwt;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use crate::residue::Residue;
+
+/// Memory needed for exponent p, from the plan the backend would choose.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MemoryEstimate {
+    /// Plan description, same wording as `BackendIdentity::plan`.
+    pub plan: String,
+    /// Bytes of one resident register.
+    pub bytes_per_register: u64,
+    /// Fixed scratch, tables, and staging, independent of the register count.
+    pub fixed_bytes: u64,
+    /// True when the bytes are device memory.
+    pub on_device: bool,
+}
+
+/// Process-wide handle counter shared by every backend instance, so a handle
+/// issued by one instance is never valid on another. Starts at 1 and stops
+/// below `u32::MAX`, so `Reg(0)` and `Reg(u32::MAX)` are never issued.
+static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
+
+/// A fresh handle that no backend instance in this process has issued.
+pub(crate) fn new_handle() -> BackendResult<Reg> {
+    take_handle(&NEXT_HANDLE)
+}
+
+fn take_handle(counter: &AtomicU32) -> BackendResult<Reg> {
+    let mut h = counter.load(Ordering::Relaxed);
+    loop {
+        if h >= u32::MAX - 1 {
+            return Err(BackendError::Allocation(
+                "residue handle space exhausted".into(),
+            ));
+        }
+        match counter.compare_exchange_weak(h, h + 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(Reg(h)),
+            Err(current) => h = current,
+        }
+    }
+}
 
 /// Handle of a resident residue owned by one backend instance.
 ///
@@ -137,5 +177,22 @@ pub trait Backend {
     /// statistics). Informational: never a substitute for the protocol checks.
     fn diagnostics(&mut self) -> BackendResult<Vec<(String, String)>> {
         Ok(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handles_are_unique_and_exhaustion_is_an_allocation_error() {
+        let a = new_handle().unwrap();
+        let b = new_handle().unwrap();
+        assert_ne!(a, b);
+        assert_ne!(a, Reg(0));
+        let c = AtomicU32::new(u32::MAX - 2);
+        assert_eq!(take_handle(&c), Ok(Reg(u32::MAX - 2)));
+        assert!(matches!(take_handle(&c), Err(BackendError::Allocation(_))));
+        assert!(matches!(take_handle(&c), Err(BackendError::Allocation(_))));
     }
 }

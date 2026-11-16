@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::backend::{Backend, BackendError, BackendIdentity, BackendResult, Reg};
+use crate::backend::{Backend, BackendError, BackendIdentity, BackendResult, MemoryEstimate, Reg};
 use crate::residue::Residue;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +61,21 @@ impl BackendKind {
             BackendKind::Gpu => Some(crate::backend::gpu::supported_exponents()),
             #[cfg(feature = "cuda")]
             BackendKind::Cuda => Some(crate::backend::cuda::supported_exponents()),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    /// Memory figures for exponent p from the plan this backend would choose,
+    /// if built. Pure host computation; no device is opened.
+    pub fn memory_estimate(self, p: u32) -> Option<BackendResult<MemoryEstimate>> {
+        match self {
+            BackendKind::Cpu => Some(crate::backend::cpu::memory_estimate(p)),
+            BackendKind::Dwt => Some(crate::backend::dwt::memory_estimate(p)),
+            #[cfg(feature = "gpu")]
+            BackendKind::Gpu => Some(crate::backend::gpu::memory_estimate(p)),
+            #[cfg(feature = "cuda")]
+            BackendKind::Cuda => Some(crate::backend::cuda::memory_estimate(p)),
             #[allow(unreachable_patterns)]
             _ => None,
         }

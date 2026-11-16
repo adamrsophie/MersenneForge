@@ -66,7 +66,9 @@ use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 
 use super::cpu::Corruption;
-use super::{Backend, BackendError, BackendIdentity, BackendResult, Reg};
+use super::{
+    new_handle, Backend, BackendError, BackendIdentity, BackendResult, MemoryEstimate, Reg,
+};
 use crate::residue::Residue;
 
 /// Bits of the f64 mantissa kept free for rounding error by the length bound.
@@ -140,6 +142,53 @@ fn choose_length(p: u32) -> Option<usize> {
 pub fn supported_exponents() -> (u32, u32) {
     let max = MAX_LENGTH as u64 * max_word_bits(MAX_LENGTH) as u64;
     (2, max.min(u32::MAX as u64) as u32)
+}
+
+fn plan_name(n: usize) -> String {
+    format!("f64-dwt n={n}")
+}
+
+/// Host memory for exponent p at the length `new` would choose. A register
+/// is `n` balanced `i32` digits. The fixed figure counts the plan tables
+/// (word offsets, widths, weights, inverse weights) and the transform
+/// scratch (two complex buffers, the FFT scratch, and the carry buffer). The
+/// FFT library's own twiddle tables (about one complex value per element for
+/// each direction) are not counted.
+pub fn memory_estimate(p: u32) -> BackendResult<MemoryEstimate> {
+    let n = length_for(p)?;
+    let mut planner = FftPlanner::<f64>::new();
+    let fft = fft_scratch_len(&*planner.plan_fft_forward(n), &*planner.plan_fft_inverse(n));
+    Ok(MemoryEstimate {
+        plan: plan_name(n),
+        bytes_per_register: 4 * n as u64,
+        fixed_bytes: fixed_bytes(n, fft),
+        on_device: false,
+    })
+}
+
+fn fft_scratch_len(fwd: &dyn Fft<f64>, inv: &dyn Fft<f64>) -> usize {
+    fwd.get_inplace_scratch_len()
+        .max(inv.get_inplace_scratch_len())
+}
+
+/// Bytes of the plan tables and scratch built by `DwtBackend::build`.
+fn fixed_bytes(n: usize, fft_scratch: usize) -> u64 {
+    let (n, f) = (n as u64, fft_scratch as u64);
+    let c = std::mem::size_of::<C64>() as u64;
+    let tables = 4 * (n + 1) + 4 * n + 8 * n + 8 * n;
+    let scratch = 2 * c * n + c * f + 8 * n;
+    tables + scratch
+}
+
+fn length_for(p: u32) -> BackendResult<usize> {
+    let (lo, hi) = supported_exponents();
+    if p < lo || p > hi {
+        return Err(BackendError::Unsupported(format!(
+            "exponent {p} is outside the dwt backend range {lo}..={hi}"
+        )));
+    }
+    choose_length(p)
+        .ok_or_else(|| BackendError::Unsupported(format!("no transform length for exponent {p}")))
 }
 
 /// Fixed data of one (p, n) plan.
@@ -309,8 +358,6 @@ pub struct DwtBackend {
     plan: Plan,
     scratch: Scratch,
     regs: HashMap<u32, BalancedWords>,
-    /// Handles are never reused, so a freed handle stays invalid.
-    next_handle: u32,
     max_roundoff: f64,
 }
 
@@ -318,16 +365,7 @@ impl DwtBackend {
     /// Picks the smallest supported transform length for p. Errors with
     /// BackendError::Unsupported outside supported_exponents().
     pub fn new(p: u32) -> BackendResult<DwtBackend> {
-        let (lo, hi) = supported_exponents();
-        if p < lo || p > hi {
-            return Err(BackendError::Unsupported(format!(
-                "exponent {p} is outside the dwt backend range {lo}..={hi}"
-            )));
-        }
-        let n = choose_length(p).ok_or_else(|| {
-            BackendError::Unsupported(format!("no transform length for exponent {p}"))
-        })?;
-        Ok(Self::build(p, n))
+        Ok(Self::build(p, length_for(p)?))
     }
 
     /// Test-only: use transform length `n` regardless of the bits-per-word
@@ -349,10 +387,7 @@ impl DwtBackend {
 
     fn build(p: u32, n: usize) -> DwtBackend {
         let plan = Plan::new(p, n);
-        let fft_len = plan
-            .fwd
-            .get_inplace_scratch_len()
-            .max(plan.inv.get_inplace_scratch_len());
+        let fft_len = fft_scratch_len(&*plan.fwd, &*plan.inv);
         let zero = C64::new(0.0, 0.0);
         DwtBackend {
             scratch: Scratch {
@@ -363,7 +398,6 @@ impl DwtBackend {
             },
             plan,
             regs: HashMap::new(),
-            next_handle: 0,
             max_roundoff: 0.0,
         }
     }
@@ -436,18 +470,17 @@ impl Backend for DwtBackend {
         BackendIdentity {
             kind: "dwt".into(),
             build: format!("mersenne-forge {}", env!("CARGO_PKG_VERSION")),
-            plan: format!("f64-dwt n={}", self.plan.n),
+            plan: plan_name(self.plan.n),
             device: String::new(),
         }
     }
 
     fn alloc(&mut self) -> BackendResult<Reg> {
-        let h = self.next_handle;
-        self.next_handle = h
-            .checked_add(1)
-            .ok_or_else(|| BackendError::Allocation("residue handles exhausted".into()))?;
-        self.regs.insert(h, BalancedWords(vec![0; self.plan.n]));
-        Ok(Reg(h))
+        // Handles come from a process-wide counter and are never reused, so a
+        // freed or foreign handle stays invalid.
+        let r = new_handle()?;
+        self.regs.insert(r.0, BalancedWords(vec![0; self.plan.n]));
+        Ok(r)
     }
 
     fn free(&mut self, r: Reg) -> BackendResult<()> {
@@ -531,5 +564,46 @@ impl Backend for DwtBackend {
                 format!("{:.4}", self.plan.p as f64 / self.plan.n as f64),
             ),
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_estimate_matches_the_built_backend() {
+        let (lo, hi) = supported_exponents();
+        for p in [lo - 1, hi + 1] {
+            assert!(matches!(
+                memory_estimate(p),
+                Err(BackendError::Unsupported(_))
+            ));
+        }
+        let mut odd_parts = std::collections::BTreeSet::new();
+        for p in [
+            2u32, 31, 127, 521, 1279, 4423, 9689, 21701, 44497, 86243, 132049,
+        ] {
+            let m = memory_estimate(p).unwrap();
+            let mut be = DwtBackend::new(p).unwrap();
+            let n = be.transform_length();
+            odd_parts.insert(n >> n.trailing_zeros());
+            assert_eq!(m.plan, be.identity().plan, "p={p}");
+            assert!(!m.on_device);
+            let r = be.alloc().unwrap();
+            assert_eq!(
+                m.bytes_per_register,
+                4 * be.regs[&r.0].0.len() as u64,
+                "p={p}"
+            );
+            let (sc, pl) = (&be.scratch, &be.plan);
+            let c = std::mem::size_of::<C64>();
+            let real = c * (sc.a.len() + sc.b.len() + sc.fft.len())
+                + 8 * sc.vals.len()
+                + 4 * (pl.offsets.len() + pl.widths.len())
+                + 8 * (pl.weight.len() + pl.inv_weight.len());
+            assert_eq!(m.fixed_bytes, real as u64, "p={p}");
+        }
+        assert_eq!(odd_parts.into_iter().collect::<Vec<_>>(), [1, 3, 5, 7]);
     }
 }

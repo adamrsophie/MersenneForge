@@ -35,7 +35,7 @@ CI runs the CPU checks and only compiles the `gpu` and `cuda` features; GPU and 
 
 ## Build
 
-Rust 1.85 or newer builds the library and binary (the test suite needs 1.88 because of `proptest`).
+Rust 1.89 or newer builds and tests every feature (1.89 is the first version with `std::fs::File::try_lock`, used for the checkpoint lock; it also covers the minimums of `wgpu` and `proptest`). CI builds and tests at 1.89.
 
 ```sh
 cargo build --release                  # cpu and dwt backends
@@ -47,17 +47,17 @@ cargo test
 ## Usage
 
 ```sh
-mersenne-forge doctor --json
+mersenne-forge doctor --json --exponent 44497
 mersenne-forge run --test ll --exponent 4423 --backend cpu
-mersenne-forge run --test prp --exponent 44497 --backend dwt --proof-dir work/proof --checkpoint-dir work/ckpt --budget 1h
+mersenne-forge run --test prp --exponent 44497 --backend dwt --proof-power 8 --proof-dir work/proof --checkpoint-dir work/ckpt --budget 1h
 mersenne-forge resume --checkpoint work/ckpt/M44497-prp.ckpt --budget 1h
 mersenne-forge verify --proof work/proof/44497-8.proof --backend cpu
 mersenne-forge bench --plan bench/cpu-smoke.json --output work/bench/cpu-smoke.json
 ```
 
-`--backend gpu` and `--backend cuda` require `--budget`; `--device N` selects the adapter index or CUDA ordinal. Add `--json` for machine-readable output. Exit codes: 0 success, 2 usage, 3 incomplete (budget or Ctrl-C; a checkpoint is written when a checkpoint directory was given), 4 unsupported, 5 execution failure, 6 checkpoint or file error, 7 proof rejected.
+`--backend gpu` and `--backend cuda` require `--budget`; `--device N` selects the adapter index or CUDA ordinal. Add `--json` for machine-readable output (failures too, as a JSON object with `kind`, `message`, and `exit_code`). Exit codes: 0 success, 2 usage, 3 incomplete (budget or Ctrl-C, also during the proof stage; a checkpoint is written when a checkpoint directory was given), 4 unsupported, 5 execution failure (also a failed proof generation or write), 6 checkpoint or file error, 7 proof rejected (also a rejected self verification). `run` refuses to start over an existing checkpoint: continue with `resume`, or delete the checkpoint and its `.prev` to start over. A run or resume holds a lock on `<checkpoint>.lock`, so a second process on the same checkpoint is refused.
 
-A PRP pass means probable prime. A verified proof establishes that the PRP computation was done, not that M_p is prime. An LL zero residue satisfies the LL criterion for the arithmetic used. No local result is a discovery claim.
+A PRP pass means probable prime. A proof accepted by `verify` below p = 2^17 has had its terminal residue recomputed directly. At or above that, acceptance means the file satisfies the version 2 proof equation, the relation the upstream verifier checks: that is sound against computation errors and against a prover who skipped the work, but not against a prover who knows a factor of M_p or elements of small order modulo M_p (the challenge is 64 bits), so a probable prime claim from a proof needs an independent test (see [docs/PROTOCOL.md](docs/PROTOCOL.md)). No proof establishes that M_p is prime. An LL zero residue satisfies the LL criterion for the arithmetic used. No local result is a discovery claim.
 
 ## License and credits
 

@@ -508,7 +508,9 @@ impl Plan {
                 "word buffer has the wrong length".into(),
             ));
         }
-        if let Some(k) = (0..words.len()).find(|&k| words[k].abs() > self.word_limit(k)) {
+        if let Some(k) =
+            (0..words.len()).find(|&k| words[k].unsigned_abs() > self.word_limit(k) as u32)
+        {
             return Err(BackendError::Fault(format!(
                 "word {k} = {} is outside its range +-{}",
                 words[k],
@@ -848,6 +850,28 @@ mod tests {
                         "p={p} pattern={pattern} k={k}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn export_rejects_out_of_range_words_including_the_extremes() {
+        let plan = Plan::new(1279).unwrap();
+        let lim = plan.word_limit(1);
+        for (v, ok) in [
+            (lim, true),
+            (-lim, true),
+            (lim + 1, false),
+            (-lim - 1, false),
+            (i32::MIN, false),
+            (i32::MAX, false),
+        ] {
+            let mut w = vec![0i32; plan.n as usize];
+            w[1] = v;
+            let r = plan.residue_from_words(&w);
+            assert_eq!(r.is_ok(), ok, "{v}");
+            if !ok {
+                assert!(matches!(r, Err(BackendError::Fault(_))), "{v}");
             }
         }
     }

@@ -29,7 +29,9 @@ use cudarc::driver::{
 use cudarc::nvrtc::{CompileError, CompileOptions};
 use sha3::{Digest, Sha3_256};
 
-use super::{Backend, BackendError, BackendIdentity, BackendResult, Reg};
+use super::{
+    new_handle, Backend, BackendError, BackendIdentity, BackendResult, MemoryEstimate, Reg,
+};
 use crate::residue::Residue;
 use model::{Arg, Buf, Kernel, Launch, Plan};
 
@@ -57,6 +59,33 @@ pub fn kernel_source_hash() -> String {
 /// Inclusive exponent range with a transform plan; see [`model::supported_exponents`].
 pub fn supported_exponents() -> (u32, u32) {
     model::supported_exponents()
+}
+
+fn plan_name(n: u64) -> String {
+    format!("ntt-gf-m61sq n={n}")
+}
+
+/// Device buffers allocated once per backend, besides the registers.
+const FIXED_BUFS: [Buf; 5] = [Buf::T, Buf::T2, Buf::Tw, Buf::Z, Buf::A];
+
+/// Device memory for exponent p, without loading the driver. A register is
+/// `n` words of 8 bytes. The fixed figure counts the two transform buffers
+/// (2n words each), the twiddle table, and the two carry buffers (n words
+/// each). The host staging copies of `import` and `export` are not counted.
+pub fn memory_estimate(p: u32) -> BackendResult<MemoryEstimate> {
+    let (lo, hi) = supported_exponents();
+    let plan = model::plan(p).ok_or_else(|| {
+        BackendError::Unsupported(format!(
+            "exponent {p} is outside the CUDA range {lo}..={hi}"
+        ))
+    })?;
+    let bytes = |b: Buf| 8 * plan.buf_len(b) as u64;
+    Ok(MemoryEstimate {
+        plan: plan_name(plan.n),
+        bytes_per_register: bytes(Buf::X),
+        fixed_bytes: FIXED_BUFS.iter().map(|&b| bytes(b)).sum(),
+        on_device: true,
+    })
 }
 
 /// The complete NVRTC option list for a device of compute capability major.minor.
@@ -282,7 +311,6 @@ pub struct CudaBackend {
     z: CudaSlice<u64>,
     a: CudaSlice<u64>,
     regs: HashMap<u32, CudaSlice<u64>>,
-    next: u32,
     poisoned: Option<String>,
     device: String,
     build: String,
@@ -382,7 +410,6 @@ impl CudaBackend {
             z,
             a,
             regs: HashMap::new(),
-            next: 0,
             poisoned: None,
             device: format!("{name} (CUDA {ordinal}, cc {major}.{minor})"),
             build,
@@ -491,25 +518,21 @@ impl Backend for CudaBackend {
         BackendIdentity {
             kind: "cuda".into(),
             build: self.build.clone(),
-            plan: format!("ntt-gf-m61sq n={}", self.plan.n),
+            plan: plan_name(self.plan.n),
             device: self.device.clone(),
         }
     }
 
     fn alloc(&mut self) -> BackendResult<Reg> {
         self.live()?;
-        let id = self.next;
-        let next = id
-            .checked_add(1)
-            .ok_or_else(|| BackendError::Allocation("handle space exhausted".into()))?;
         let r = self
             .stream
             .alloc_zeros::<u64>(self.plan.buf_len(Buf::X))
             .map_err(|e| driver_err("allocate residue", e));
         let slice = self.note(r)?;
-        self.regs.insert(id, slice);
-        self.next = next;
-        Ok(Reg(id))
+        let h = new_handle()?;
+        self.regs.insert(h.0, slice);
+        Ok(h)
     }
 
     fn free(&mut self, r: Reg) -> BackendResult<()> {
@@ -678,6 +701,31 @@ mod tests {
                 matches!(e, BackendError::Unsupported(ref m) if m.contains("outside")),
                 "{p}: {e}"
             );
+        }
+    }
+
+    /// The device buffers cannot be measured without a driver; the estimate
+    /// is checked against the lengths `open` and `alloc` pass to the driver.
+    #[test]
+    fn memory_estimate_matches_the_buffer_lengths() {
+        let (lo, hi) = supported_exponents();
+        for p in [lo - 1, hi + 1] {
+            assert!(matches!(
+                memory_estimate(p),
+                Err(BackendError::Unsupported(_))
+            ));
+        }
+        assert!(memory_estimate(hi).is_ok());
+        for p in [lo, 127, 86243, 1_257_787] {
+            let m = memory_estimate(p).unwrap();
+            let pl = model::plan(p).unwrap();
+            let n = pl.n;
+            assert_eq!(m.plan, format!("ntt-gf-m61sq n={n}"));
+            assert!(m.on_device);
+            assert_eq!(m.bytes_per_register, 8 * n);
+            assert_eq!(pl.twiddles().len(), pl.buf_len(Buf::Tw), "p={p}");
+            // T and T2 hold 2n words, twiddles, Z, and A hold n words.
+            assert_eq!(m.fixed_bytes, 8 * (2 * n + 2 * n + 3 * n), "p={p}");
         }
     }
 

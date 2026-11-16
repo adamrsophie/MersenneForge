@@ -446,8 +446,8 @@ fn handle_misuse_and_range_errors() {
     assert_eq!(be.copy(b, a), Err(BackendError::InvalidHandle(b.0)));
     assert_eq!(be.mul(a, b), Err(BackendError::InvalidHandle(b.0)));
     assert_eq!(
-        be.equal(a, Reg(9999)),
-        Err(BackendError::InvalidHandle(9999))
+        be.equal(a, Reg(u32::MAX)),
+        Err(BackendError::InvalidHandle(u32::MAX))
     );
     // A freed handle is never reissued.
     let c = be.alloc().unwrap();

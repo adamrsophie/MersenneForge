@@ -86,6 +86,24 @@ limits (storage binding size, buffer size, storage buffers per stage,
 workgroup size) and returns `Unsupported` if the plan does not fit. The
 backend does not check that p is prime; the protocol layer does.
 
+## Memory
+
+`gpu::memory_estimate(p)` returns these figures without opening a device
+(the `doctor` command shows them), and a unit test checks them against the
+sizes of the buffers a real backend creates:
+
+* per resident register: n words of 4 bytes, **4 n bytes** (16 MiB at
+  n = 2^22).
+* fixed per backend: two transform buffers (8 n bytes each), two carry
+  buffers (4 n each), the twiddle table (n / 2 elements of 8 bytes), the word
+  table (4 n), 16 bytes of fault flags, 16 bytes of uniform parameters for
+  each of the 2 + 2 log2(n) parameter blocks, and the 4 n byte staging buffer
+  that `export` creates for one read: **36 n + 16 (3 + 2 log2(n)) bytes**
+  (144 MiB plus 752 bytes at n = 2^22).
+
+Memory the driver and `wgpu` use internally (pipelines, bind groups, command
+buffers) is not counted.
+
 ## Carry
 
 After unweighting, word 0 also receives the Lucas-Lehmer subtraction of 2
@@ -150,8 +168,9 @@ Only `export`, `equal`, and `sync` read data back.
 * The inverse transform of a real convolution is real. The unweight kernel
   flags any nonzero imaginary part in a device error word; the flag is read
   at the next `sync`, `export`, or `equal`, reported as `Fault`, and cleared.
-* Handles come from a process-wide counter, so freed handles and handles of
-  another backend instance are `InvalidHandle`. A residue of the wrong
+* Handles come from one process-wide counter shared by every backend, so
+  freed handles and handles of another backend instance are `InvalidHandle`;
+  exhausting the counter is `Allocation`. A residue of the wrong
   exponent is `Unsupported`, as is `mul` with the same handle twice.
 
 ## Identity and device selection
@@ -173,11 +192,13 @@ Only this machine: **Apple M2, Metal backend** (macOS arm64, Rust 1.100.0,
 
 * `cargo build --features gpu`: builds. `cargo build`: builds, and
   `cargo tree -e normal` lists no `wgpu` crate.
-* `cargo test --features gpu --lib backend::gpu`: 14 passed (9 host model
-  tests against `num-bigint` and exact i64 or u64 arithmetic; 5 GPU tests:
-  WGSL mulmod on edge pairs, the GPU forward transform equal to the model for
-  p = 127, 4423, 86243, a forced nonzero imaginary part reported once as
-  `Fault`, a destroyed device reported as `Poisoned`, and the batch floor).
+* `cargo test --features gpu --lib backend::gpu`: 16 passed (10 host model
+  tests against `num-bigint` and exact i64 or u64 arithmetic, including the
+  export range check at `i32::MIN` and `i32::MAX`; 6 GPU tests: WGSL mulmod
+  on edge pairs, the GPU forward transform equal to the model for p = 127,
+  4423, 86243, a forced nonzero imaginary part reported once as `Fault`, a
+  destroyed device reported as `Poisoned`, the batch floor, and the memory
+  estimate equal to the created buffer sizes).
 * `cargo test --features gpu --test gpu_backend`: 9 passed, 1 ignored, about
   21 s. Every expected value is plain `num-bigint` arithmetic in the test.
   Covered: import and export round trips (0, 1, 2, N - 1, N - 2, long runs of
@@ -203,10 +224,12 @@ Only this machine: **Apple M2, Metal backend** (macOS arm64, Rust 1.100.0,
 
 * Every other vendor and API: NVIDIA, AMD, and Intel GPUs, Vulkan, DX12, and
   software adapters. The code is written for them but has never run on them.
-* Complete LL or PRP runs at transform lengths above 2^14 (lengths up to 2^22
-  are covered by single and short repeated squarings only). The protocol
-  tests in `tests/protocol_gpu.rs` belong to the core and are not described
-  here.
+* Complete LL or PRP runs at transform lengths above 2^17. Lengths 2^18
+  through 2^22 are covered by single and short repeated squarings only. The
+  largest complete run on this machine is the M786433 PRP with a power 10
+  proof (n = 2^17) recorded in `docs/VALIDATION.md`; the complete runs listed
+  above use n = 2^14 and below. The protocol tests in `tests/protocol_gpu.rs` belong
+  to the core and are not described here.
 * Performance tuning of any kind (workgroup size, radix, fused stages, memory
   layout). No speed claims are made.
 * Long-run behavior under device resets, thermal throttling, or driver
