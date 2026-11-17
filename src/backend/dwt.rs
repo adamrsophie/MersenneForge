@@ -238,8 +238,9 @@ impl Plan {
     }
 
     /// Inverse transform, unweight, round, check roundoff, add `addend` to
-    /// word 0, and carry into balanced words. Returns the words and the
-    /// largest distance from an integer. On `Err` nothing is written.
+    /// word 0, and carry into balanced words, written to `out` (reused, no
+    /// allocation). Records the largest distance from an integer in
+    /// `max_seen`. On `Err`, `out` is unchanged.
     fn finish(
         &self,
         buf: &mut [C64],
@@ -247,7 +248,8 @@ impl Plan {
         vals: &mut [i64],
         addend: i64,
         max_seen: &mut f64,
-    ) -> BackendResult<BalancedWords> {
+        out: &mut BalancedWords,
+    ) -> BackendResult<()> {
         self.inv.process_with_scratch(buf, scratch);
         let scale = 1.0 / self.n as f64;
         let mut worst = 0.0f64;
@@ -270,7 +272,10 @@ impl Plan {
         *max_seen = max_seen.max(worst);
         vals[0] += addend;
         self.carry(vals, true)?;
-        Ok(BalancedWords(vals.iter().map(|&v| v as i32).collect()))
+        for (o, &v) in out.0.iter_mut().zip(vals.iter()) {
+            *o = v as i32;
+        }
+        Ok(())
     }
 
     /// Carry propagation in the variable base. `balanced` selects digits in
@@ -442,9 +447,8 @@ impl DwtBackend {
             for c in a.iter_mut() {
                 *c = *c * *c;
             }
-            *x = self
-                .plan
-                .finish(a, fft, vals, -minus, &mut self.max_roundoff)?;
+            self.plan
+                .finish(a, fft, vals, -minus, &mut self.max_roundoff, x)?;
         }
         Ok(())
     }
@@ -541,9 +545,12 @@ impl Backend for DwtBackend {
         for (u, v) in a.iter_mut().zip(b.iter()) {
             *u *= *v;
         }
-        let product = self.plan.finish(a, fft, vals, 0, &mut self.max_roundoff)?;
-        self.regs.insert(dst.0, product);
-        Ok(())
+        let out = self
+            .regs
+            .get_mut(&dst.0)
+            .ok_or(BackendError::InvalidHandle(dst.0))?;
+        self.plan
+            .finish(a, fft, vals, 0, &mut self.max_roundoff, out)
     }
 
     fn equal(&mut self, a: Reg, b: Reg) -> BackendResult<bool> {
