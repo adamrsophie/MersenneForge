@@ -108,16 +108,18 @@ pub fn prev_path(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// A temporary name next to `path` that no other writer uses:
-/// `<path>.tmp.<pid>.<n>`, with n unique within this process.
+/// Counter for temporary names, unique within this process.
+static NEXT_TMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A temporary name next to `path`: `<path>.tmp.<pid>.<n>`. A file left at
+/// that name by someone else is possible; `write_atomic` then picks another.
 fn tmp_path(path: &Path) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
+    use std::sync::atomic::Ordering;
     let mut s = path.as_os_str().to_owned();
     s.push(format!(
         ".tmp.{}.{}",
         std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
+        NEXT_TMP.fetch_add(1, Ordering::Relaxed)
     ));
     PathBuf::from(s)
 }
@@ -156,23 +158,37 @@ pub fn create_dir_all_durable(dir: &Path) -> std::io::Result<()> {
 /// renamed to `.prev` if it is a checkpoint that loads, and removed if it
 /// does not, so a corrupt file never replaces a good `.prev`.
 pub fn write_atomic(path: &Path, bytes: &[u8], checkpoint_rotation: bool) -> std::io::Result<()> {
-    let tmp = tmp_path(path);
-    // Exclusive creation: the file is this writer's alone. On any failure
-    // only this writer's temporary file is removed.
-    let result = write_new(&tmp, bytes).and_then(|()| publish(path, &tmp, checkpoint_rotation));
+    // Exclusive creation: the file is this writer's alone. A name that
+    // already exists belongs to someone else, is left untouched, and another
+    // name is tried.
+    let (tmp, mut f) = (0..1000)
+        .find_map(|_| {
+            let tmp = tmp_path(path);
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+            {
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+                r => Some(r.map(|f| (tmp, f))),
+            }
+        })
+        .unwrap_or_else(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("{}: no free temporary name", path.display()),
+            ))
+        })?;
+    // From here the file is ours: on any failure it is removed.
+    let result = f
+        .write_all(bytes)
+        .and_then(|()| f.sync_all())
+        .and_then(|()| publish(path, &tmp, checkpoint_rotation));
+    drop(f);
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
     result
-}
-
-fn write_new(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()
 }
 
 fn publish(path: &Path, tmp: &Path, checkpoint_rotation: bool) -> std::io::Result<()> {
@@ -299,5 +315,62 @@ impl Checkpoint {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// Files at the next temporary names belong to someone else: they keep
+    /// their bytes, and the write is published through a name of its own.
+    #[test]
+    fn existing_temporary_names_are_skipped_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        // Other tests may take names concurrently; cover a wide window.
+        let start = NEXT_TMP.load(Ordering::SeqCst);
+        let sentinels: Vec<PathBuf> = (start..start + 64)
+            .map(|n| {
+                let mut s = path.as_os_str().to_owned();
+                s.push(format!(".tmp.{}.{n}", std::process::id()));
+                PathBuf::from(s)
+            })
+            .collect();
+        for s in &sentinels {
+            fs::write(s, b"someone else's").unwrap();
+        }
+        write_atomic(&path, b"new contents", false).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new contents");
+        assert!(
+            NEXT_TMP.load(Ordering::SeqCst) > start + 1,
+            "a collision was retried"
+        );
+        for s in &sentinels {
+            assert_eq!(fs::read(s).unwrap(), b"someone else's", "{}", s.display());
+        }
+        // Nothing else is left behind.
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            sentinels.len() + 1
+        );
+    }
+
+    /// A temporary file this writer created is removed when publication
+    /// fails (here the target is a nonempty directory, so the rename fails).
+    #[test]
+    fn a_failed_publication_removes_only_its_own_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("target");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("inside"), b"x").unwrap();
+        assert!(write_atomic(&path, b"data", false).is_err());
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["target"]);
+        assert_eq!(fs::read(path.join("inside")).unwrap(), b"x");
     }
 }
