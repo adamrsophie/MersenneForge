@@ -72,12 +72,14 @@ fn a_damaged_stored_residue_gives_a_rejected_proof() {
     prp_run(&mut cpu(), PRIME_P, &cfg, &mut ctl).unwrap();
     // The checkpoint is at 960, so the residue at 640 is not recomputed; a
     // different, intact value there makes the generated proof wrong.
-    let store = ProofStore {
-        schedule: ProofSchedule::new(PRIME_P, 5).unwrap(),
-        dir: ProofStore::residue_dir(cfg.proof_dir.as_ref().unwrap(), PRIME_P),
-    };
+    let store = ProofStore::open(
+        cfg.proof_dir.as_ref().unwrap(),
+        ProofSchedule::new(PRIME_P, 5).unwrap(),
+    )
+    .unwrap();
     let x = store.load(640).unwrap();
     store.save(640, &x.add_small(1)).unwrap();
+    drop(store);
     let r = prp_resume(&mut cpu(), PRIME_P, &cfg, &mut Control::default()).unwrap();
     assert_result_kept(&r);
     assert_eq!(r.evidence.proof_stage, ProofStage::Rejected);

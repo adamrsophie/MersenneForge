@@ -202,10 +202,17 @@ const RESIDUE_MAGIC: &[u8; 16] = b"MF-PROOF-RESIDUE";
 /// Durable storage of proof residues: one file per point, written to a
 /// temporary file, fsynced, renamed, the directory fsynced, then read back
 /// and compared.
+///
+/// A store owns its residue directory: [`ProofStore::open`] takes an advisory
+/// lock on `<dir>/.lock` and refuses when another store (in this or another
+/// process) holds it. Clones share the lock, which is released when the last
+/// clone is dropped. Lock order: a caller that also locks a checkpoint takes
+/// the checkpoint lock first.
 #[derive(Debug, Clone)]
 pub struct ProofStore {
     pub schedule: ProofSchedule,
     pub dir: PathBuf,
+    _lock: std::sync::Arc<fs::File>,
 }
 
 impl ProofStore {
@@ -216,7 +223,30 @@ impl ProofStore {
     pub fn open(proof_dir: &Path, schedule: ProofSchedule) -> std::io::Result<ProofStore> {
         let dir = Self::residue_dir(proof_dir, schedule.exponent());
         crate::checkpoint::create_dir_all_durable(&dir)?;
-        Ok(ProofStore { schedule, dir })
+        let path = dir.join(".lock");
+        let f = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)?;
+        match f.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!(
+                        "{} is held by another run using this proof directory",
+                        path.display()
+                    ),
+                ))
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(e),
+        }
+        Ok(ProofStore {
+            schedule,
+            dir,
+            _lock: std::sync::Arc::new(f),
+        })
     }
 
     fn path(&self, k: u64) -> PathBuf {
@@ -252,11 +282,14 @@ impl ProofStore {
             message: m.into(),
         };
         let expected = 16 + 4 + 8 + 4 * crate::residue::limb_count(p) + 32;
-        let meta = fs::metadata(self.path(k)).map_err(|e| err(&e.to_string()))?;
-        if meta.len() != expected as u64 {
+        // One handle for the size check and the read, and never more than
+        // expected + 1 bytes, so a file that changes meanwhile is an error.
+        let f = fs::File::open(self.path(k)).map_err(|e| err(&e.to_string()))?;
+        let len = f.metadata().map_err(|e| err(&e.to_string()))?.len();
+        if len != expected as u64 {
             return Err(err("wrong size"));
         }
-        let b = fs::read(self.path(k)).map_err(|e| err(&e.to_string()))?;
+        let b = read_exact_len(f, expected).map_err(|m| err(&m))?;
         let (body, h) = b.split_at(b.len() - 32);
         if sha3_256(&[body]) != h || &body[..16] != RESIDUE_MAGIC {
             return Err(err("integrity hash mismatch"));
@@ -278,6 +311,25 @@ impl ProofStore {
         }
         Ok(())
     }
+}
+
+/// Read exactly `expected` bytes, never more than `expected + 1`: a source
+/// that is shorter or longer (for example a file truncated or grown after its
+/// size was checked) is an error, not a panic or an unbounded read.
+fn read_exact_len(r: impl Read, expected: usize) -> Result<Vec<u8>, String> {
+    let mut b = Vec::new();
+    b.try_reserve_exact(expected + 1)
+        .map_err(|e| format!("cannot allocate {expected} bytes: {e}"))?;
+    r.take(expected as u64 + 1)
+        .read_to_end(&mut b)
+        .map_err(|e| e.to_string())?;
+    if b.len() != expected {
+        return Err(format!(
+            "file changed size while reading: {} bytes, expected {expected}",
+            b.len()
+        ));
+    }
+    Ok(b)
 }
 
 /// A parsed PRP proof (version 2).
@@ -355,10 +407,11 @@ impl Proof {
     pub fn validate(&self) -> Result<(), ProofError> {
         let power = u32::try_from(self.middles.len()).unwrap_or(u32::MAX);
         check_header(self.p, power)?;
+        // Borrowed checks only: validation allocates nothing.
         for (i, r) in std::iter::once(&self.b).chain(&self.middles).enumerate() {
-            let x = Residue::from_proof_bytes(self.p, r)
+            let zero = Residue::proof_bytes_are_zero(self.p, r)
                 .map_err(|_| ProofError::NoncanonicalResidue { index: i })?;
-            if i > 0 && x.is_zero() {
+            if i > 0 && zero {
                 return Err(ProofError::ZeroResidue { index: i });
             }
         }
@@ -466,6 +519,9 @@ impl Proof {
         };
         let b = take(&mut f)?;
         let mut middles = Vec::new();
+        middles
+            .try_reserve_exact(power as usize)
+            .map_err(|e| ProofError::Io(e.to_string()))?;
         for _ in 0..power {
             middles.push(take(&mut f)?);
         }
@@ -734,6 +790,33 @@ mod tests {
         assert_eq!(s.next_after(0), Some(160));
         assert_eq!(s.next_after(160), Some(320));
         assert_eq!(s.next_after(1279), None);
+    }
+
+    #[test]
+    fn residue_reads_are_bounded_and_exact() {
+        assert_eq!(read_exact_len(&[1u8, 2, 3][..], 3).unwrap(), [1, 2, 3]);
+        assert!(read_exact_len(&[1u8, 2][..], 3).is_err());
+        assert!(read_exact_len(&[0u8; 4096][..], 3).is_err());
+        // An endless source stops after expected + 1 bytes.
+        assert!(read_exact_len(std::io::repeat(7), 3).is_err());
+    }
+
+    #[test]
+    fn a_store_owns_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = ProofSchedule::new(1279, 4).unwrap();
+        let a = ProofStore::open(dir.path(), s.clone()).unwrap();
+        let e = ProofStore::open(dir.path(), s.clone()).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{e}");
+        // Clones share the lock: it is held until the last one is dropped.
+        let b = a.clone();
+        drop(a);
+        assert!(ProofStore::open(dir.path(), s.clone()).is_err());
+        drop(b);
+        let c = ProofStore::open(dir.path(), s.clone()).unwrap();
+        // Another exponent has its own directory and lock.
+        ProofStore::open(dir.path(), ProofSchedule::new(1277, 4).unwrap()).unwrap();
+        drop(c);
     }
 
     #[test]

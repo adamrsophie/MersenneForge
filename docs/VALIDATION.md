@@ -2,6 +2,41 @@
 
 Historical results below used Apple M2 (macOS 27.2, arm64), Rust 1.100.0 stable. The completion checks dated 2026-11-16 used the same hardware with macOS 27.2.1. No NVIDIA, AMD, or Intel GPU was available. Nothing here was run on CUDA hardware.
 
+## Storage, proof reading, and benchmark checks (2026-11-17)
+
+Implementation source SHA3-256: `6e50fefa7278c56f6e78146fb1ac2b30986c82c6c22de8b81d01b9cefbe8c4ca` (Apple M2, macOS 27.2.1, Rust 1.100.0, Apple clang 21.0.0). Checkpoints from earlier builds are refused, as intended. These regression tests were also run against the previous code and failed there: `concurrent_atomic_writers_never_share_a_temporary_file`, `a_held_proof_directory_refuses_a_second_writer`, `huge_batch_sizes_stop_at_the_boundaries`, `proof_allocation` (SIGABRT), and `dwt_allocation`. A driver forced to exit 86 after its last correct response passed the previous emulation harness and now fails `thread_order_and_block_size_do_not_change_results`. Rerunning the earlier benchmark scenarios (two entries named `candidate` at p = 127 and 521; `report.json` then `report.csv`; an empty plan) on the new build gave distinct CSV rows with exponent, seed, options, and build, an unchanged first capture, and exit 2 with no output file. The other tests listed cover new behavior.
+
+| Problem | Change | Regression test |
+|---|---|---|
+| Two writers of the same file shared `<path>.tmp`; one could truncate or rename the other's temporary file | Each write uses its own exclusively created `<path>.tmp.<pid>.<n>` | `concurrent_atomic_writers_never_share_a_temporary_file` (8 threads) |
+| Two runs on one proof store (different or no checkpoint directories) could overwrite each other's residues | `ProofStore::open` holds an advisory lock on `M<p>.residues/.lock` for the whole PRP run; a second `run` or `resume` exits 6 before writing, and `resume` does not move the checkpoint aside | `a_held_proof_directory_refuses_a_second_writer`, `resume_refuses_a_held_proof_store_without_touching_the_checkpoint`, `a_store_owns_its_directory` |
+| LL `k + max_batch` overflowed for a batch limit near `u64::MAX` | Saturating boundary; `max_batch` 0 is still a configuration error | `huge_batch_sizes_stop_at_the_boundaries` |
+| Proof validation copied every residue with infallible allocation, so a large proof could abort the process | Canonicality and zero checks on borrowed bytes; residue buffers reserved fallibly | `proof_allocation` (a fault injecting allocator: the old code aborts with SIGABRT, the new code returns a typed error), `proof_bytes_check_matches_the_parser` (exhaustive for p <= 13) |
+| CUDA emulation ignored the driver's exit status, so a sanitizer report at shutdown passed | Checked shutdown on every success path; `Drop` also fails a nonzero exit unless already unwinding | `a_failed_driver_exit_fails_the_test` |
+| `report.json` and `report.csv` shared capture files `report.0.stdout`; a later run overwrote an earlier report's evidence | Each invocation owns `<output>.runs/<id>`; captures go there | `bench_captures_belong_to_their_run` |
+| CSV rows lost provenance and could not tell entries of the same name apart | Entry index, workload, engine options, argv, check counts, diagnostics, plan hash, build, platform, and execution directory in every row; the exact hashed plan bytes in `<execution_dir>/plan.json`; transform plan named apart from workload plan | `bench_csv_keeps_the_provenance` |
+| A proof residue file that changed between its size check and its read panicked | One handle, bounded read, size mismatch is an error | `residue_reads_are_bounded_and_exact`, `damaged_proof_residue_files_are_errors` |
+| DWT allocated a word vector per squaring, contrary to its comment | `finish` writes into a reused buffer; the batch still commits only after every step passes | `dwt_allocation` (old code: 501 allocations for 500 squarings; new: equal to one squaring). No speed claim: nothing was timed |
+| An empty plan exited 0 without writing output, leaving a stale report in place | Empty plans and `repeats` 0 are usage errors (exit 2); nothing is written | `bench_refuses_an_empty_plan` |
+
+Benchmark observations now also record Gerbicz and Jacobi outcomes, faults, rollbacks, backend diagnostics (DWT maximum roundoff), whether the run started clean (engine runs always do, with checkpointing disabled), and label external observations as process timings whose results are not verified. Energy stays null.
+
+| Command | Observed result |
+|---|---|
+| `cargo test --locked` | 119 passed, 0 failed, 5 ignored by default |
+| `cargo clippy --locked --all-targets -- -D warnings`, also with `--features gpu`, `--features cuda`, `--features gpu,cuda` | passed |
+| `cargo fmt --check` | passed |
+| `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --features gpu,cuda` | passed |
+| `cargo +1.89 check --locked --all-targets --features gpu,cuda` | passed |
+| `cargo test --locked --features gpu --lib --test gpu_backend --test protocol_gpu -- --test-threads=1` | 56 passed, 0 failed, 1 ignored; real Apple M2 through Metal |
+| `cargo test --locked --features cuda --lib backend::cuda` | 19 passed; CPU model and host code only |
+| `cargo test --locked --features cuda --test cuda_kernel_emulation` | 6 passed under AddressSanitizer and UndefinedBehaviorSanitizer; CPU emulation of the kernel source, not CUDA hardware. LeakSanitizer is unsupported by Apple clang on macOS (`detect_leaks is not supported on this platform`), so leaks are not checked |
+| `cargo test --locked --test reference -- --ignored` | 1 passed |
+| `MERSENNE_FORGE_UPSTREAM_PROOF=documentation/upstream/gpuowl/test/786433-10.proof cargo test --locked --test upstream_proof -- --ignored` | 1 passed |
+| An independent Python big-integer sweep (generic modular arithmetic, no shared code) against the debug CLI | 688 of 688 agree: complete LL and PRP residues on `cpu` and `dwt` for all 172 prime exponents up to 1024 |
+
+Still open: no CUDA kernel has run on NVIDIA hardware; no upstream verifier has checked a proof generated here; no Vulkan or discrete GPU run; no performance comparison.
+
 ## Completion checks (2026-11-16)
 
 Implementation source SHA3-256: `6fda9a8a4729907828eacdc6dd17a9aa003de729b9a754ae10017f7ba114e018`. The source identity covers the implementation, manifest, and lockfile as specified in [PROTOCOL.md](PROTOCOL.md). It does not cover this report or the test files.

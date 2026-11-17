@@ -332,8 +332,8 @@ fn bench_writes_observations() {
     )
     .unwrap();
     let out = dir.path().join("out.json");
-    // A preexisting scratch directory is reported, never reused or deleted.
-    let mine = dir.path().join("out.work").join("run-0");
+    // Directories of other invocations are never reused or deleted.
+    let mine = dir.path().join("out.json.runs").join("earlier");
     std::fs::create_dir_all(&mine).unwrap();
     std::fs::write(mine.join("keep"), b"user data").unwrap();
     let o = cli(&["bench", "--plan", s(&plan), "--output", s(&out)]);
@@ -356,22 +356,28 @@ fn bench_writes_observations() {
         .all(|o| o["status"] == "failed"));
     assert!(obs
         .iter()
-        .filter(|o| o["entry"] == "prp-127" && o["sequence"] != 0)
+        .filter(|o| o["entry"] == "prp-127")
         .all(|o| o["verdict"] == "ProbablePrime"
             && o["backend"]["kind"] == "cpu"
             && o["proof_stage"] == "not_requested"
-            && o["check_step"] == 20_000));
-    assert_eq!(obs[0]["status"], "failed");
-    assert!(obs[0]["error"].as_str().unwrap().contains("run-0"));
+            && o["check_step"] == 20_000
+            && o["test"] == "prp"
+            && o["exponent"] == 127
+            && o["entry_index"] == 0
+            && o["result_source"] == "engine checked run"
+            && o["reliability"]["gerbicz_passed"].as_u64().unwrap() > 0));
     assert_eq!(std::fs::read(mine.join("keep")).unwrap(), b"user data");
-    for o in obs
-        .iter()
-        .filter(|o| o["entry"] == "true" && o["sequence"] != 0)
-    {
+    assert_eq!(v["build"], mersenne_forge::build_identity());
+    assert_eq!(v["plan_sha3"].as_str().unwrap().len(), 64);
+    for o in obs.iter().filter(|o| o["entry"] == "true") {
+        assert_eq!(o["argv"], serde_json::json!(["true"]));
+        assert_eq!(
+            o["result_source"],
+            "external process timing; result not verified"
+        );
         assert!(Path::new(o["stdout"].as_str().unwrap()).is_file());
         assert!(Path::new(o["stderr"].as_str().unwrap()).is_file());
     }
-    std::fs::remove_dir_all(dir.path().join("out.work")).unwrap();
     let csv = dir.path().join("out.csv");
     assert_eq!(
         cli(&["bench", "--plan", s(&plan), "--output", s(&csv)])
@@ -451,7 +457,13 @@ fn bench_stops_an_external_command_on_ctrl_c() {
         .spawn()
         .unwrap();
     // Wait until the first observation is running, then send SIGINT once.
-    while !dir.path().join("out.0.stdout").exists() {
+    let started = || {
+        std::fs::read_dir(dir.path().join("out.json.runs"))
+            .into_iter()
+            .flatten()
+            .any(|e| e.unwrap().path().join("0.stdout").exists())
+    };
+    while !started() {
         assert!(child.try_wait().unwrap().is_none(), "bench ended early");
         assert!(
             start.elapsed() < Duration::from_secs(20),
@@ -799,4 +811,291 @@ fn resume_refuses_to_add_a_proof_schedule() {
         .unwrap()
         .contains("proof schedule"));
     assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+/// A run that holds a proof directory owns it: a second run with the same
+/// exponent and proof directory is refused, with or without a checkpoint and
+/// whatever its checkpoint path, and the first run's residue files stay
+/// byte for byte as they were.
+#[test]
+fn a_held_proof_directory_refuses_a_second_writer() {
+    use mersenne_forge::proof::{ProofSchedule, ProofStore};
+    let dir = tempfile::tempdir().unwrap();
+    let proof = dir.path().join("proof");
+    let store = ProofStore::open(&proof, ProofSchedule::new(1279, 4).unwrap()).unwrap();
+    let x = mersenne_forge::residue::Residue::from_u64(1279, 12345);
+    let k = store.schedule.points()[0];
+    store.save(k, &x).unwrap();
+    let rdir = ProofStore::residue_dir(&proof, 1279);
+    let snapshot = |d: &Path| {
+        let mut v: Vec<(String, Vec<u8>)> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .map(|p| (p.display().to_string(), std::fs::read(&p).unwrap()))
+            .collect();
+        v.sort();
+        v
+    };
+    let before = snapshot(&rdir);
+    let base = [
+        "run",
+        "--test",
+        "prp",
+        "--exponent",
+        "1279",
+        "--backend",
+        "cpu",
+    ];
+    let other_ckpt = dir.path().join("other");
+    let cases: [Vec<&str>; 2] = [
+        vec!["--proof-dir", s(&proof), "--proof-power", "4", "--json"],
+        vec![
+            "--proof-dir",
+            s(&proof),
+            "--proof-power",
+            "4",
+            "--checkpoint-dir",
+            s(&other_ckpt),
+            "--json",
+        ],
+    ];
+    for extra in cases {
+        let args: Vec<&str> = base.iter().copied().chain(extra).collect();
+        let o = cli(&args);
+        assert_eq!(
+            o.status.code(),
+            Some(6),
+            "{}",
+            String::from_utf8_lossy(&o.stdout)
+        );
+        assert!(json(&o)["message"].as_str().unwrap().contains(".lock"));
+        assert_eq!(snapshot(&rdir), before, "the held store was modified");
+    }
+    assert_eq!(store.load(k).unwrap(), x);
+    drop(store);
+    // Released: the same command now runs to completion.
+    let args: Vec<&str> = base
+        .iter()
+        .copied()
+        .chain(["--proof-dir", s(&proof), "--proof-power", "4", "--json"])
+        .collect();
+    let o = cli(&args);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    assert_eq!(json(&o)["report"]["evidence"]["proof_stage"], "verified");
+}
+
+fn bench(plan: &serde_json::Value, out: &Path) -> Output {
+    let path = out.with_extension("plan");
+    std::fs::write(&path, plan.to_string()).unwrap();
+    cli(&["bench", "--plan", s(&path), "--output", s(out)])
+}
+
+fn read_json(p: &Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap()
+}
+
+/// Reports that share a stem (report.json, report.csv) and a rerun of the
+/// same output each keep their own capture files; an older report's files
+/// are never changed by a later run.
+#[test]
+fn bench_captures_belong_to_their_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan = |word: &str| {
+        serde_json::json!({"name": "t", "order": "sequential", "repeats": 1, "entries": [
+            {"kind": "external", "name": "echo", "argv": ["echo", word]}]})
+    };
+    let json_out = dir.path().join("report.json");
+    let csv_out = dir.path().join("report.csv");
+    assert_eq!(bench(&plan("FIRST_RUN"), &json_out).status.code(), Some(0));
+    assert_eq!(bench(&plan("SECOND_RUN"), &csv_out).status.code(), Some(0));
+    let first = read_json(&json_out);
+    let first_capture = first["observations"][0]["stdout"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        std::fs::read_to_string(&first_capture).unwrap(),
+        "FIRST_RUN\n"
+    );
+    let csv = std::fs::read_to_string(&csv_out).unwrap();
+    assert!(!csv.contains(&first_capture));
+    // A rerun to the same output replaces the report, not the old captures.
+    assert_eq!(bench(&plan("THIRD_RUN"), &json_out).status.code(), Some(0));
+    let third = read_json(&json_out);
+    assert_ne!(third["execution_dir"], first["execution_dir"]);
+    assert_eq!(
+        std::fs::read_to_string(&first_capture).unwrap(),
+        "FIRST_RUN\n"
+    );
+    let third_capture = third["observations"][0]["stdout"].as_str().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(third_capture).unwrap(),
+        "THIRD_RUN\n"
+    );
+}
+
+/// CSV rows carry the same provenance as the JSON output, and entries that
+/// share a display name stay distinguishable by index and workload.
+#[test]
+fn bench_csv_keeps_the_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan = serde_json::json!({"name": "dup", "order": "sequential", "repeats": 1, "entries": [
+        {"kind": "engine", "name": "same", "test": "ll", "exponent": 89, "backend": "cpu"},
+        {"kind": "engine", "name": "same", "test": "ll", "exponent": 127, "backend": "dwt"}]});
+    let json_out = dir.path().join("p.json");
+    let csv_out = dir.path().join("p.csv");
+    assert_eq!(bench(&plan, &json_out).status.code(), Some(0));
+    assert_eq!(bench(&plan, &csv_out).status.code(), Some(0));
+    let v = read_json(&json_out);
+    let csv = std::fs::read_to_string(&csv_out).unwrap();
+    let mut lines = csv.lines();
+    let header: Vec<&str> = lines.next().unwrap().split(',').collect();
+    let col = |name: &str| {
+        header
+            .iter()
+            .position(|h| *h == name)
+            .unwrap_or_else(|| panic!("{name}"))
+    };
+    // Quote-aware split: "" inside quotes is one quote.
+    let split = |l: &str| -> Vec<String> {
+        let (mut out, mut cur, mut quoted) = (Vec::new(), String::new(), false);
+        let mut it = l.chars().peekable();
+        while let Some(c) = it.next() {
+            match (c, quoted) {
+                ('"', true) if it.peek() == Some(&'"') => {
+                    cur.push('"');
+                    it.next();
+                }
+                ('"', _) => quoted = !quoted,
+                (',', false) => out.push(std::mem::take(&mut cur)),
+                _ => cur.push(c),
+            }
+        }
+        out.push(cur);
+        out
+    };
+    let rows: Vec<Vec<String>> = lines.map(split).collect();
+    assert_eq!(rows.len(), 2);
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row.len(), header.len());
+        assert_eq!(row[col("plan_name")], "dup");
+        assert_eq!(row[col("plan_sha3")], v["plan_sha3"].as_str().unwrap());
+        assert_eq!(row[col("build")], mersenne_forge::build_identity());
+        assert_eq!(row[col("entry")], "same");
+        assert_eq!(row[col("entry_index")], i.to_string());
+        assert_eq!(row[col("test")], "ll");
+        assert_eq!(row[col("exponent")], ["89", "127"][i]);
+        assert_eq!(row[col("backend")], ["cpu", "dwt"][i]);
+        assert_eq!(row[col("verdict")], "Prime");
+        let obs = &v["observations"][i];
+        assert_eq!(
+            row[col("transform_plan")],
+            obs["backend"]["plan"].as_str().unwrap()
+        );
+        assert_eq!(row[col("exponent")], obs["exponent"].to_string());
+        assert_eq!(
+            row[col("options")],
+            r#"{"block_size":null,"check_step":null,"proof_power":null,"verify_proof":null,"log_step":null,"jacobi_every_log":null,"device":null,"budget_secs":null}"#
+        );
+    }
+    // The manifest beside the captures holds the exact hashed plan bytes.
+    use sha3::Digest;
+    let manifest = Path::new(&rows[0][col("execution_dir")]).join("plan.json");
+    let bytes = std::fs::read(&manifest).unwrap();
+    let digest: String = sha3::Sha3_256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(digest, rows[0][col("plan_sha3")]);
+    let recorded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(recorded["entries"][1]["exponent"], 127);
+    // DWT reports its roundoff as a diagnostic.
+    assert!(
+        rows[1][col("diagnostics")].contains("roundoff"),
+        "{}",
+        rows[1][col("diagnostics")]
+    );
+}
+
+/// An empty plan, or one without measured repeats, is a usage error and
+/// writes nothing; a stale report is left alone, not passed off as new.
+#[test]
+fn bench_refuses_an_empty_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("e.json");
+    std::fs::write(&out, b"stale").unwrap();
+    for plan in [
+        serde_json::json!({"name": "e", "order": "sequential", "repeats": 1, "entries": []}),
+        serde_json::json!({"name": "e", "order": "sequential", "repeats": 0, "entries": [
+            {"kind": "external", "name": "t", "argv": ["true"]}]}),
+    ] {
+        let o = bench(&plan, &out);
+        assert_eq!(
+            o.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), b"stale");
+    }
+    assert!(!dir.path().join("e.json.runs").exists());
+}
+
+/// `resume` on a proof store held by another run is refused like `run`: the
+/// checkpoint is not moved aside and no file changes.
+#[test]
+fn resume_refuses_a_held_proof_store_without_touching_the_checkpoint() {
+    use mersenne_forge::proof::{ProofSchedule, ProofStore};
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = common::prp_cfg(dir.path(), Some(4));
+    let mut ctl = Control {
+        halt_at: Some(1000),
+        ..Control::default()
+    };
+    common::prp_run(&mut CpuBackend::new(1279).unwrap(), 1279, &cfg, &mut ctl).unwrap();
+    let ckpt = cfg.checkpoint.unwrap();
+    let proof = cfg.proof_dir.unwrap();
+    let snapshot = || {
+        let mut v = Vec::new();
+        for d in [
+            ckpt.parent().unwrap().to_path_buf(),
+            ProofStore::residue_dir(&proof, 1279),
+        ] {
+            for e in std::fs::read_dir(d).unwrap() {
+                let p = e.unwrap().path();
+                // Lock files are empty and created on demand.
+                if p.extension().is_some_and(|x| x == "lock") || p.ends_with(".lock") {
+                    continue;
+                }
+                v.push((p.display().to_string(), std::fs::read(&p).unwrap()));
+            }
+        }
+        v.sort();
+        v
+    };
+    let held = ProofStore::open(&proof, ProofSchedule::new(1279, 4).unwrap()).unwrap();
+    let before = snapshot();
+    let o = cli(&["resume", "--checkpoint", s(&ckpt), "--json"]);
+    assert_eq!(
+        o.status.code(),
+        Some(6),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    assert!(json(&o)["message"].as_str().unwrap().contains(".lock"));
+    assert_eq!(snapshot(), before, "nothing was renamed or written");
+    drop(held);
+    let o = cli(&["resume", "--checkpoint", s(&ckpt), "--json"]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    assert_eq!(json(&o)["report"]["evidence"]["proof_stage"], "verified");
 }

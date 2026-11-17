@@ -459,3 +459,71 @@ fn completed_prp_states_validate_metadata_and_all_residues() {
         }
     }
 }
+
+/// Concurrent atomic writers of one path each use a temporary file of their
+/// own: every write succeeds, the result is one complete payload, and no
+/// temporary file is left behind. A barrier releases all writers together.
+#[test]
+fn concurrent_atomic_writers_never_share_a_temporary_file() {
+    use mersenne_forge::checkpoint::write_atomic;
+    use std::sync::{Arc, Barrier};
+    for identical in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join("640"));
+        let n = 8;
+        let barrier = Arc::new(Barrier::new(n));
+        let payload = |i: usize| -> Vec<u8> {
+            let tag = if identical { 0 } else { i as u8 };
+            vec![tag; 4096]
+        };
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let (path, barrier) = (path.clone(), barrier.clone());
+                let bytes = payload(i);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    write_atomic(&path, &bytes, false)
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+        let got = std::fs::read(&*path).unwrap();
+        assert!((0..n).any(|i| got == payload(i)), "torn or mixed payload");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["640"], "stray files: {names:?}");
+    }
+}
+
+/// A proof residue that is truncated, grown, or missing is a typed error.
+#[test]
+fn damaged_proof_residue_files_are_errors() {
+    use mersenne_forge::proof::{ProofError, ProofSchedule, ProofStore};
+    let dir = tempfile::tempdir().unwrap();
+    let store = ProofStore::open(dir.path(), ProofSchedule::new(PRIME_P, 4).unwrap()).unwrap();
+    let k = store.schedule.points()[0];
+    let x = mersenne_forge::residue::Residue::from_u64(PRIME_P, 77);
+    store.save(k, &x).unwrap();
+    let file = ProofStore::residue_dir(dir.path(), PRIME_P).join(k.to_string());
+    let good = std::fs::read(&file).unwrap();
+    let mut grown = good.clone();
+    grown.push(0);
+    let mut flipped = good.clone();
+    flipped[40] ^= 1;
+    for bytes in [
+        &good[..good.len() - 1],
+        &good[..10],
+        &[][..],
+        &grown[..],
+        &flipped[..],
+    ] {
+        std::fs::write(&file, bytes).unwrap();
+        assert!(matches!(store.load(k), Err(ProofError::Residue { .. })));
+    }
+    std::fs::remove_file(&file).unwrap();
+    assert!(matches!(store.load(k), Err(ProofError::Residue { .. })));
+}

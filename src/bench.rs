@@ -103,7 +103,16 @@ fn deadline_after(start: Instant, what: &str, s: f64) -> Result<Instant, String>
 
 impl Plan {
     /// Check every value that would otherwise fail or panic during the run.
+    /// A plan with no entries or no measured repeats is refused: it would
+    /// produce no observation, and an old output file must not pass for its
+    /// result.
     pub fn validate(&self) -> Result<(), String> {
+        if self.entries.is_empty() {
+            return Err("the plan has no entries".into());
+        }
+        if self.repeats == 0 {
+            return Err("repeats must be at least 1".into());
+        }
         let now = Instant::now();
         for e in &self.entries {
             match e {
@@ -125,10 +134,36 @@ impl Plan {
     }
 }
 
+/// Check and fault counts of an engine run, from its evidence.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Reliability {
+    pub gerbicz_passed: u64,
+    pub gerbicz_failed: u64,
+    pub jacobi_passed: u64,
+    pub jacobi_failed: u64,
+    pub jacobi_inconclusive: u64,
+    pub backend_faults: u64,
+    pub rollbacks: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Observation {
+    /// Display name of the entry (not unique: see `entry_index`).
     pub entry: String,
+    /// Position of the entry in the plan's `entries`: the stable identifier.
+    pub entry_index: usize,
     pub kind: String,
+    /// Engine runs: the workload.
+    pub test: Option<String>,
+    pub exponent: Option<u32>,
+    /// External runs: the exact argv that ran.
+    pub argv: Option<Vec<String>>,
+    /// What the result rests on: "engine checked run" for engine entries;
+    /// "external process timing; result not verified" for external ones,
+    /// whose exit status says nothing about the correctness of their output.
+    pub result_source: String,
+    /// Engine runs start from iteration 0 with checkpointing disabled.
+    pub start: String,
     /// Position in the executed sequence.
     pub sequence: usize,
     pub repeat: u32,
@@ -148,6 +183,11 @@ pub struct Observation {
     pub proof_stage: Option<ProofStage>,
     /// Engine PRP runs: the Gerbicz check step derived at the start.
     pub check_step: Option<u64>,
+    /// Engine runs: check outcomes, faults, and rollbacks.
+    pub reliability: Option<Reliability>,
+    /// Engine runs: backend diagnostics read once after the run (for example
+    /// the DWT maximum roundoff).
+    pub diagnostics: Vec<(String, String)>,
     pub exit_code: Option<i32>,
     /// External runs: files holding the captured standard output and error.
     pub stdout: Option<PathBuf>,
@@ -160,7 +200,13 @@ impl Observation {
     fn failed(kind: &str, error: String, wall_secs: f64) -> Observation {
         Observation {
             entry: String::new(),
+            entry_index: 0,
             kind: kind.into(),
+            test: None,
+            exponent: None,
+            argv: None,
+            result_source: String::new(),
+            start: String::new(),
             sequence: 0,
             repeat: 0,
             warmup: false,
@@ -173,6 +219,8 @@ impl Observation {
             backend: None,
             proof_stage: None,
             check_step: None,
+            reliability: None,
+            diagnostics: Vec::new(),
             exit_code: None,
             stdout: None,
             stderr: None,
@@ -185,7 +233,13 @@ impl Observation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchOutput {
     pub plan: Plan,
+    /// SHA3-256 of the plan as recorded in `plan` (compact JSON).
+    pub plan_sha3: String,
     pub seed_used: Option<u64>,
+    /// This invocation's directory: scratch space and external captures.
+    pub execution_dir: PathBuf,
+    /// Source build identity of the harness (see `build_identity`).
+    pub build: String,
     pub crate_version: String,
     pub os: String,
     pub arch: String,
@@ -297,6 +351,18 @@ fn engine_run(
         other => return Err(format!("unknown test {other}")),
     }
     .map_err(|e| e.to_string())?;
+    // Once, after the run: outside the arithmetic loop.
+    let diagnostics = be.diagnostics().unwrap_or_default();
+    let ev = &report.evidence;
+    let reliability = Reliability {
+        gerbicz_passed: ev.gerbicz_passed,
+        gerbicz_failed: ev.gerbicz_failed,
+        jacobi_passed: ev.jacobi_passed,
+        jacobi_failed: ev.jacobi_failed,
+        jacobi_inconclusive: ev.jacobi_inconclusive,
+        backend_faults: ev.backend_faults,
+        rollbacks: ev.rollbacks,
+    };
     let mut timings = report.timings.clone();
     timings.init += init;
     let stage = report.evidence.proof_stage;
@@ -316,6 +382,8 @@ fn engine_run(
         backend: report.evidence.backend,
         proof_stage: (test == "prp").then_some(stage),
         check_step: report.evidence.check_step,
+        reliability: Some(reliability),
+        diagnostics,
         ..Observation::failed("engine", String::new(), 0.0)
     })
 }
@@ -387,31 +455,64 @@ pub fn write_output(output: &Path, out: &BenchOutput) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", output.display()))
 }
 
-/// Run a plan, rewriting `output` after every observation. Each run gets a
-/// fresh scratch directory `<output>.work/run-N`, created exclusively (an
-/// existing path is a failed observation, never reused) and removed after the
-/// run; nothing this invocation did not create is deleted. External output
-/// goes to `<output>.N.stdout` and `<output>.N.stderr`. A stop request ends
-/// the plan after the current observation.
+/// A new directory `<output>.runs/<seconds>-<pid>-<n>`, created exclusively,
+/// owned by one invocation. Earlier invocations' directories are never
+/// touched, so a report's capture files stay as it references them.
+fn execution_dir(output: &Path) -> Result<PathBuf, String> {
+    let mut name = output.as_os_str().to_owned();
+    name.push(".runs");
+    let runs = PathBuf::from(name);
+    fs::create_dir_all(&runs).map_err(|e| format!("{}: {e}", runs.display()))?;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    for n in 0u32.. {
+        let dir = runs.join(format!("{secs}-{}-{n}", std::process::id()));
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", dir.display())),
+        }
+    }
+    unreachable!("u32 names exhausted")
+}
+
+/// Run a plan, rewriting `output` after every observation (an existing
+/// output file is replaced). The invocation owns a fresh directory
+/// `<output>.runs/<id>` (see `execution_dir`): each run gets a scratch
+/// directory `run-N` there, removed afterwards, and external output goes to
+/// `N.stdout` and `N.stderr` there and is kept. A stop request ends the plan
+/// after the current observation.
 pub fn run_plan(
     plan: &Plan,
     output: &Path,
     stop: Option<&AtomicBool>,
     mut progress: impl FnMut(&Observation),
 ) -> Result<BenchOutput, String> {
+    plan.validate()?;
     let (seq, seed_used) = schedule(plan);
     if let Some(dir) = output.parent().filter(|d| !d.as_os_str().is_empty()) {
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
-    let work = output.with_extension("work");
-    let created_work = match fs::create_dir(&work) {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-        Err(e) => return Err(format!("{}: {e}", work.display())),
-    };
+    let work = execution_dir(output)?;
+    let plan_json = serde_json::to_vec(plan).expect("plan serializes");
+    // The exact bytes `plan_sha3` hashes, kept beside the captures.
+    let manifest = work.join("plan.json");
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&manifest)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, &plan_json))
+        .map_err(|e| format!("{}: {e}", manifest.display()))?;
     let mut out = BenchOutput {
         plan: plan.clone(),
+        plan_sha3: crate::proof::sha3_256(&[&plan_json])
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
         seed_used,
+        execution_dir: work.clone(),
+        build: crate::build_identity().into(),
         crate_version: env!("CARGO_PKG_VERSION").into(),
         os: std::env::consts::OS.into(),
         arch: std::env::consts::ARCH.into(),
@@ -450,8 +551,8 @@ pub fn run_plan(
                         *timeout_secs,
                         stop,
                         (
-                            &output.with_extension(format!("{n}.stdout")),
-                            &output.with_extension(format!("{n}.stderr")),
+                            &work.join(format!("{n}.stdout")),
+                            &work.join(format!("{n}.stderr")),
                         ),
                     ),
                 };
@@ -462,6 +563,20 @@ pub fn run_plan(
         let mut obs =
             res.unwrap_or_else(|e| Observation::failed(kind, e, start.elapsed().as_secs_f64()));
         obs.entry = entry.name().to_string();
+        obs.entry_index = i;
+        match entry {
+            Entry::Engine { test, exponent, .. } => {
+                obs.test = Some(test.clone());
+                obs.exponent = Some(*exponent);
+                obs.result_source = "engine checked run".into();
+                obs.start = "clean, checkpointing disabled".into();
+            }
+            Entry::External { argv, .. } => {
+                obs.argv = Some(argv.clone());
+                obs.result_source = "external process timing; result not verified".into();
+                obs.start = "as the command decides".into();
+            }
+        }
         obs.sequence = n;
         obs.repeat = repeat;
         obs.warmup = warmup;
@@ -472,55 +587,146 @@ pub fn run_plan(
             break;
         }
     }
-    if created_work {
-        let _ = fs::remove_dir(&work);
-    }
     Ok(out)
 }
 
-/// One CSV row per observation; timings flattened.
+/// One CSV row per observation; timings and check counts flattened. Every
+/// row repeats the provenance of the run (plan name and hash, seed, build,
+/// platform, execution directory) and the entry's engine options; the exact
+/// plan bytes that `plan_sha3` hashes are in `<execution_dir>/plan.json`.
+/// `transform_plan` is the backend's arithmetic plan; `plan_name` and
+/// `plan_sha3` identify the workload plan.
 pub fn to_csv(out: &BenchOutput) -> String {
-    let mut s = String::from(
-        "entry,kind,sequence,repeat,warmup,status,error,wall_secs,init,iterations,checks,checkpoint_io,proof_generation,proof_verification,verdict,res64,backend,plan,proof_stage,check_step,exit_code,stdout,stderr,energy_joules,telemetry\n",
-    );
+    const COLUMNS: &[&str] = &[
+        "plan_name",
+        "plan_sha3",
+        "seed_used",
+        "build",
+        "os",
+        "arch",
+        "execution_dir",
+        "entry",
+        "entry_index",
+        "kind",
+        "test",
+        "exponent",
+        "options",
+        "argv",
+        "result_source",
+        "start",
+        "sequence",
+        "repeat",
+        "warmup",
+        "status",
+        "error",
+        "wall_secs",
+        "init",
+        "iterations",
+        "checks",
+        "checkpoint_io",
+        "proof_generation",
+        "proof_verification",
+        "verdict",
+        "res64",
+        "backend",
+        "backend_build",
+        "transform_plan",
+        "device",
+        "proof_stage",
+        "check_step",
+        "gerbicz_passed",
+        "gerbicz_failed",
+        "jacobi_passed",
+        "jacobi_failed",
+        "jacobi_inconclusive",
+        "backend_faults",
+        "rollbacks",
+        "diagnostics",
+        "exit_code",
+        "stdout",
+        "stderr",
+        "energy_joules",
+        "telemetry",
+    ];
     let q = |v: &str| format!("\"{}\"", v.replace('"', "\"\""));
+    let mut s = COLUMNS.join(",") + "\n";
     for o in &out.observations {
-        let t = o.timings.clone();
+        let t = o.timings.as_ref();
         let f = |x: Option<f64>| x.map(|v| format!("{v:.6}")).unwrap_or_default();
-        s += &format!(
-            "{},{},{},{},{},{},{},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+        let r = o.reliability.as_ref();
+        let c = |x: Option<u64>| x.map(|v| v.to_string()).unwrap_or_default();
+        let b = o.backend.as_ref();
+        let path = |p: &Option<PathBuf>| {
+            q(&p.as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default())
+        };
+        let row: Vec<String> = vec![
+            q(&out.plan.name),
+            out.plan_sha3.clone(),
+            out.seed_used.map(|v| v.to_string()).unwrap_or_default(),
+            q(&out.build),
+            out.os.clone(),
+            out.arch.clone(),
+            q(&out.execution_dir.display().to_string()),
             q(&o.entry),
-            o.kind,
-            o.sequence,
-            o.repeat,
-            o.warmup,
-            o.status,
+            o.entry_index.to_string(),
+            o.kind.clone(),
+            o.test.clone().unwrap_or_default(),
+            o.exponent.map(|v| v.to_string()).unwrap_or_default(),
+            q(&match out.plan.entries.get(o.entry_index) {
+                Some(Entry::Engine { options, .. }) => {
+                    serde_json::to_string(options).expect("options serialize")
+                }
+                _ => String::new(),
+            }),
+            q(&o.argv
+                .as_ref()
+                .map(|a| serde_json::to_string(a).expect("argv"))
+                .unwrap_or_default()),
+            q(&o.result_source),
+            q(&o.start),
+            o.sequence.to_string(),
+            o.repeat.to_string(),
+            o.warmup.to_string(),
+            o.status.clone(),
             q(o.error.as_deref().unwrap_or("")),
-            o.wall_secs,
-            f(t.as_ref().map(|t| t.init)),
-            f(t.as_ref().map(|t| t.iterations)),
-            f(t.as_ref().map(|t| t.checks)),
-            f(t.as_ref().map(|t| t.checkpoint_io)),
-            f(t.as_ref().map(|t| t.proof_generation)),
-            f(t.as_ref().map(|t| t.proof_verification)),
-            o.verdict.as_deref().unwrap_or(""),
-            o.res64.as_deref().unwrap_or(""),
-            o.backend.as_ref().map(|b| b.kind.as_str()).unwrap_or(""),
-            q(o.backend.as_ref().map(|b| b.plan.as_str()).unwrap_or("")),
-            o.proof_stage.map(|s| s.name()).unwrap_or(""),
-            o.check_step.map(|c| c.to_string()).unwrap_or_default(),
+            format!("{:.6}", o.wall_secs),
+            f(t.map(|t| t.init)),
+            f(t.map(|t| t.iterations)),
+            f(t.map(|t| t.checks)),
+            f(t.map(|t| t.checkpoint_io)),
+            f(t.map(|t| t.proof_generation)),
+            f(t.map(|t| t.proof_verification)),
+            o.verdict.clone().unwrap_or_default(),
+            o.res64.clone().unwrap_or_default(),
+            b.map(|b| b.kind.clone()).unwrap_or_default(),
+            q(b.map(|b| b.build.as_str()).unwrap_or("")),
+            q(b.map(|b| b.plan.as_str()).unwrap_or("")),
+            q(b.map(|b| b.device.as_str()).unwrap_or("")),
+            o.proof_stage.map(|s| s.name()).unwrap_or("").into(),
+            c(o.check_step),
+            c(r.map(|r| r.gerbicz_passed)),
+            c(r.map(|r| r.gerbicz_failed)),
+            c(r.map(|r| r.jacobi_passed)),
+            c(r.map(|r| r.jacobi_failed)),
+            c(r.map(|r| r.jacobi_inconclusive)),
+            c(r.map(|r| r.backend_faults)),
+            c(r.map(|r| r.rollbacks)),
+            q(&o.diagnostics
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(";")),
             o.exit_code.map(|c| c.to_string()).unwrap_or_default(),
-            q(&o.stdout
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default()),
-            q(&o.stderr
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default()),
+            path(&o.stdout),
+            path(&o.stderr),
             o.energy_joules.map(|e| e.to_string()).unwrap_or_default(),
-            o.telemetry
-        );
+            o.telemetry.clone(),
+        ];
+        debug_assert_eq!(row.len(), COLUMNS.len());
+        s += &row.join(",");
+        s.push('\n');
     }
     s
 }

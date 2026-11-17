@@ -204,6 +204,36 @@ impl Residue {
         b
     }
 
+    /// Check proof-format bytes without allocating: the length must be
+    /// (p - 1) / 8 + 1 and bits at or above p must be clear. Returns whether
+    /// the value is zero modulo N (all zero bits, or all p bits set).
+    pub fn proof_bytes_are_zero(p: u32, bytes: &[u8]) -> Result<bool, ResidueError> {
+        if p < 2 {
+            return Err(ResidueError::BadExponent(p));
+        }
+        let n = proof_byte_len(p);
+        if bytes.len() != n {
+            return Err(ResidueError::Length {
+                expected: n,
+                found: bytes.len(),
+            });
+        }
+        // Bits of p used by the last byte: 1..=8.
+        let top_bits = p - 8 * (n as u32 - 1);
+        let top_mask = if top_bits == 8 {
+            0xff
+        } else {
+            (1u8 << top_bits) - 1
+        };
+        let (last, low) = bytes.split_last().expect("n >= 1");
+        if last & !top_mask != 0 {
+            return Err(ResidueError::HighBits);
+        }
+        let zero = *last == 0 && low.iter().all(|&b| b == 0);
+        let all_ones = *last == top_mask && low.iter().all(|&b| b == 0xff);
+        Ok(zero || all_ones)
+    }
+
     /// Parse proof-format bytes. Bits at or above p are rejected. The value N
     /// is normalized to zero (it is the same element modulo N).
     pub fn from_proof_bytes(p: u32, bytes: &[u8]) -> Result<Residue, ResidueError> {
@@ -332,5 +362,21 @@ mod tests {
             assert_eq!(b.len(), proof_byte_len(p));
             assert_eq!(Residue::from_proof_bytes(p, &b).unwrap(), x);
         }
+    }
+
+    /// The borrowed check agrees with the allocating parser on every byte
+    /// string of the right length for small p, and on lengths and high bits.
+    #[test]
+    fn proof_bytes_check_matches_the_parser() {
+        for p in [2u32, 3, 5, 7, 8, 9, 13] {
+            let n = proof_byte_len(p);
+            for v in 0u32..(1 << (8 * n as u32)) {
+                let b = &v.to_le_bytes()[..n];
+                let parsed = Residue::from_proof_bytes(p, b).map(|x| x.is_zero());
+                assert_eq!(Residue::proof_bytes_are_zero(p, b), parsed, "p={p} v={v}");
+            }
+            assert!(Residue::proof_bytes_are_zero(p, &vec![0; n + 1]).is_err());
+        }
+        assert!(Residue::proof_bytes_are_zero(1, &[0]).is_err());
     }
 }

@@ -21,7 +21,8 @@
 //! Jacobi check. The iteration count and the configuration are trusted
 //! metadata that no local check can authenticate.
 //!
-//! Durability: the new file is written to `<path>.tmp` and fsynced; the
+//! Durability: the new file is written to a temporary file of its own,
+//! `<path>.tmp.<pid>.<n>`, created exclusively and fsynced; the
 //! existing `<path>` is renamed to `<path>.prev` only if it loads and passes
 //! its hash, and is otherwise removed so that a good `<path>.prev` is kept;
 //! the temporary file is renamed to `<path>`; the directory is fsynced. If
@@ -107,9 +108,17 @@ pub fn prev_path(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// A temporary name next to `path` that no other writer uses:
+/// `<path>.tmp.<pid>.<n>`, with n unique within this process.
 fn tmp_path(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let mut s = path.as_os_str().to_owned();
-    s.push(".tmp");
+    s.push(format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
     PathBuf::from(s)
 }
 
@@ -148,11 +157,25 @@ pub fn create_dir_all_durable(dir: &Path) -> std::io::Result<()> {
 /// does not, so a corrupt file never replaces a good `.prev`.
 pub fn write_atomic(path: &Path, bytes: &[u8], checkpoint_rotation: bool) -> std::io::Result<()> {
     let tmp = tmp_path(path);
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+    // Exclusive creation: the file is this writer's alone. On any failure
+    // only this writer's temporary file is removed.
+    let result = write_new(&tmp, bytes).and_then(|()| publish(path, &tmp, checkpoint_rotation));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
+    result
+}
+
+fn write_new(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
+fn publish(path: &Path, tmp: &Path, checkpoint_rotation: bool) -> std::io::Result<()> {
     if checkpoint_rotation && path.exists() {
         if Checkpoint::load_file(path).is_ok() {
             fs::rename(path, prev_path(path))?;
@@ -160,7 +183,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8], checkpoint_rotation: bool) -> std
             fs::remove_file(path)?;
         }
     }
-    fs::rename(&tmp, path)?;
+    fs::rename(tmp, path)?;
     sync_dir(path)
 }
 
