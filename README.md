@@ -31,7 +31,7 @@ Everything in this repository is Rust (plus WGSL and CUDA C kernel sources embed
 | CUDA arithmetic | implemented; never run on CUDA hardware |
 | Performance | harness only; no performance comparison has been measured |
 
-CI runs the CPU checks and only compiles the `gpu` and `cuda` features; GPU and CUDA tests are run by hand. Details, commands, and observed results: [docs/VALIDATION.md](docs/VALIDATION.md). Protocol and formats: [docs/PROTOCOL.md](docs/PROTOCOL.md). Benchmark method: [docs/BENCHMARK.md](docs/BENCHMARK.md).
+CI runs CPU tests, CUDA model and kernel host emulation, strict documentation checks, and feature compilation. GPU hardware tests are run by hand. Details, commands, and observed results: [docs/VALIDATION.md](docs/VALIDATION.md). Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Protocol and formats: [docs/PROTOCOL.md](docs/PROTOCOL.md). Benchmark method: [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
 ## Build
 
@@ -51,11 +51,16 @@ mersenne-forge doctor --json --exponent 44497
 mersenne-forge run --test ll --exponent 4423 --backend cpu
 mersenne-forge run --test prp --exponent 44497 --backend dwt --proof-power 8 --proof-dir work/proof --checkpoint-dir work/ckpt --budget 1h
 mersenne-forge resume --checkpoint work/ckpt/M44497-prp.ckpt --budget 1h
+mersenne-forge resume --checkpoint moved/ckpt/M44497-prp.ckpt --proof-dir moved/proof --budget 1h
 mersenne-forge verify --proof work/proof/44497-8.proof --backend cpu
 mersenne-forge bench --plan bench/cpu-smoke.json --output work/bench/cpu-smoke.json
 ```
 
 `--backend gpu` and `--backend cuda` require `--budget`; `--device N` selects the adapter index or CUDA ordinal. Add `--json` for machine-readable output (failures too, as a JSON object with `kind`, `message`, and `exit_code`). Exit codes: 0 success, 2 usage, 3 incomplete (budget or Ctrl-C, also during the proof stage; a checkpoint is written when a checkpoint directory was given), 4 unsupported, 5 execution failure (also a failed proof generation or write), 6 checkpoint or file error, 7 proof rejected (also a rejected self verification). `run` refuses to start over an existing checkpoint: continue with `resume`, or delete the checkpoint and its `.prev` to start over. A run or resume holds a lock on `<checkpoint>.lock`, so a second process on the same checkpoint is refused.
+
+PRP runs save a completed checkpoint before proof generation. If proof generation, writing, or verification fails or stops, `resume` validates that completed state and restarts the proof stage without repeating the final PRP check interval. Move the entire proof directory, including `M<p>.residues`, when relocating work; `resume --proof-dir` updates its location and checks all required saved residues. It preserves the original proof power and cannot add a proof schedule to a run that had none.
+
+Build identities include a SHA3-256 fingerprint of the implementation, manifest, and lockfile, including uncommitted source changes. Checkpoints require the same build identity. Finish existing runs with their original binary before upgrading; checkpoints written by older version-only builds are refused. Proof files remain portable across backends and builds.
 
 A PRP pass means probable prime. A proof accepted by `verify` below p = 2^17 has had its terminal residue recomputed directly. At or above that, acceptance means the file satisfies the version 2 proof equation, the relation the upstream verifier checks: that is sound against computation errors and against a prover who skipped the work, but not against a prover who knows a factor of M_p or elements of small order modulo M_p (the challenge is 64 bits), so a probable prime claim from a proof needs an independent test (see [docs/PROTOCOL.md](docs/PROTOCOL.md)). No proof establishes that M_p is prime. An LL zero residue satisfies the LL criterion for the arithmetic used. No local result is a discovery claim.
 

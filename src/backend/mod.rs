@@ -120,8 +120,8 @@ pub type BackendResult<T> = Result<T, BackendError>;
 pub struct BackendIdentity {
     /// "cpu", "dwt", "gpu", or "cuda".
     pub kind: String,
-    /// Build identity: crate version plus, for native backends, the pinned
-    /// upstream revision and the kernel source hash.
+    /// Crate version and source fingerprint; GPU backends also record their
+    /// kernel source hash and, for CUDA, compiler and driver details.
     pub build: String,
     /// Arithmetic plan: for example "bigint" or the FFT spec in use.
     pub plan: String,

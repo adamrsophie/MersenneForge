@@ -176,8 +176,8 @@ Only `export`, `equal`, and `sync` read data back.
 ## Identity and device selection
 
 * `kind = "gpu"`, `plan = "ntt-gf-m31sq n=<len>"`,
-  `device = "<adapter name> (<api>)"`, `build` contains the crate version and
-  the SHA3-256 of the embedded WGSL.
+  `device = "<adapter name> (<api>)"`, `build` contains the crate version,
+  the implementation source fingerprint, and the SHA3-256 of the embedded WGSL.
 * `probe()` enumerates Metal, Vulkan, and DX12 adapters. Enumeration is not
   validation. `GpuOptions { device: None }` uses the first adapter that is not
   a software (`Cpu` type) adapter; a software adapter is used only when

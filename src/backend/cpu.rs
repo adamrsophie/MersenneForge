@@ -127,7 +127,7 @@ impl Backend for CpuBackend {
     fn identity(&self) -> BackendIdentity {
         BackendIdentity {
             kind: "cpu".into(),
-            build: format!("mersenne-forge {}", env!("CARGO_PKG_VERSION")),
+            build: crate::build_identity().into(),
             plan: PLAN.into(),
             device: String::new(),
         }

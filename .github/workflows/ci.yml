@@ -32,6 +32,10 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Format
         run: cargo fmt --check
+      - name: Public documentation for every feature
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps --features gpu,cuda
       - name: Compile the gpu feature (no GPU needed, tests not run)
         run: cargo check --locked --features gpu --all-targets
       - name: Compile the cuda feature (no CUDA needed, hardware tests not run)

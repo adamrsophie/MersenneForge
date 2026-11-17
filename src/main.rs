@@ -132,6 +132,9 @@ enum Cmd {
     Resume {
         #[arg(long)]
         checkpoint: PathBuf,
+        /// Relocated proof directory, including the saved M<p>.residues directory.
+        #[arg(long)]
+        proof_dir: Option<PathBuf>,
         #[arg(long)]
         budget: Option<String>,
         #[arg(long)]
@@ -467,6 +470,7 @@ fn resume_from(
     be: &mut Box<dyn mersenne_forge::backend::Backend>,
     ck: &Checkpoint,
     path: &Path,
+    proof_dir: Option<&Path>,
     ctl: &mut Control,
 ) -> Result<Result<RunReport, ProtocolError>, Failure> {
     let m = &ck.meta;
@@ -474,6 +478,22 @@ fn resume_from(
     if m.protocol == prp::PROTOCOL {
         let mut cfg: PrpConfig = serde_json::from_value(m.config.clone()).map_err(bad)?;
         cfg.checkpoint = Some(path.to_path_buf());
+        if let Some(dir) = proof_dir {
+            if cfg.proof_dir.is_none() {
+                return Err(fail(
+                    2,
+                    "--proof-dir requires a checkpoint with a proof schedule",
+                ));
+            }
+            let residues = proof::ProofStore::residue_dir(dir, m.exponent);
+            if !residues.is_dir() {
+                return Err(fail(
+                    EXIT_STATE,
+                    format!("saved proof residues not found: {}", residues.display()),
+                ));
+            }
+            cfg.proof_dir = Some(dir.to_path_buf());
+        }
         Ok(prp::run_prp(
             be,
             m.exponent,
@@ -483,6 +503,9 @@ fn resume_from(
             ctl,
         ))
     } else if m.protocol == ll::PROTOCOL {
+        if proof_dir.is_some() {
+            return Err(fail(2, "--proof-dir is only supported for PRP checkpoints"));
+        }
         let mut cfg: LlConfig = serde_json::from_value(m.config.clone()).map_err(bad)?;
         cfg.checkpoint = Some(path.to_path_buf());
         Ok(ll::run_ll(
@@ -505,6 +528,7 @@ fn cmd_resume(
     path: &Path,
     budget: Option<String>,
     device: Option<u32>,
+    proof_dir: Option<PathBuf>,
     as_json: bool,
 ) -> Result<u8, Failure> {
     let _lock = lock_checkpoint(path)?;
@@ -524,7 +548,7 @@ fn cmd_resume(
         ..Control::default()
     };
     let mut fallback_note = None;
-    let mut result = resume_from(&mut be, &ck, path, &mut ctl)?;
+    let mut result = resume_from(&mut be, &ck, path, proof_dir.as_deref(), &mut ctl)?;
     // A primary that loads but fails the resume validation (its on-load check
     // or a missing proof residue) falls back to `.prev`. An identity or
     // configuration mismatch does not: `.prev` belongs to the same run.
@@ -552,16 +576,20 @@ fn cmd_resume(
             ));
             ck = pck;
             used = prev;
-            result = resume_from(&mut be, &ck, path, &mut ctl)?;
+            result = resume_from(&mut be, &ck, path, proof_dir.as_deref(), &mut ctl)?;
         }
     }
     let mut report = result.map_err(protocol_failure)?;
     if let Some(n) = fallback_note {
         report.evidence.notes.insert(0, n);
     }
-    let requested =
-        json!({ "checkpoint": path, "loaded_from": used, "budget": budget, "device": device });
-    let out = json!({ "command": "resume", "requested": requested, "loaded_from": used, "resumed_at": ck.meta.k, "effective": ck.meta.config, "report": report });
+    let requested = json!({ "checkpoint": path, "loaded_from": used, "budget": budget, "device": device, "proof_dir": proof_dir });
+    let mut effective = ck.meta.config.clone();
+    effective["checkpoint"] = json!(path);
+    if let Some(dir) = proof_dir {
+        effective["proof_dir"] = json!(dir);
+    }
+    let out = json!({ "command": "resume", "requested": requested, "loaded_from": used, "resumed_at": ck.meta.k, "effective": effective, "report": report });
     if !as_json {
         println!("resumed from {} at iteration {}", used.display(), ck.meta.k);
     }
@@ -770,6 +798,7 @@ fn cmd_doctor(exponent: Option<u32>, as_json: bool) -> Result<u8, Failure> {
     let out = json!({
         "name": "mersenne-forge",
         "version": env!("CARGO_PKG_VERSION"),
+        "build": mersenne_forge::build_identity(),
         "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
@@ -778,7 +807,7 @@ fn cmd_doctor(exponent: Option<u32>, as_json: bool) -> Result<u8, Failure> {
         "requirements": {
             "memory": "per backend with --exponent: resident registers (PRP 4, LL 2, proof generation power + 2) plus fixed scratch",
             "proof_disk_bytes": "2^power * ((p - 1) / 8 + 1) for the proof residues, plus the proof file",
-            "checkpoint_bytes": "about 2 * p / 8 plus metadata",
+            "checkpoint_bytes": "up to 3 * 4 * ceil(p / 32) plus metadata per file; rotation keeps a previous file",
         },
         "notes": [
             "listing a device is not validation of its arithmetic",
@@ -796,6 +825,7 @@ fn cmd_doctor(exponent: Option<u32>, as_json: bool) -> Result<u8, Failure> {
             env!("CARGO_PKG_VERSION"),
             out["profile"].as_str().unwrap_or("")
         );
+        println!("build: {}", mersenne_forge::build_identity());
         for b in out["backends"].as_array().into_iter().flatten() {
             let range = match b["supported_exponents"].as_array() {
                 Some(r) => format!("exponents {}..={}", r[0], r[1]),
@@ -929,8 +959,9 @@ fn main() -> ExitCode {
             checkpoint,
             budget,
             device,
+            proof_dir,
             json,
-        } => cmd_resume(&checkpoint, budget, device, json),
+        } => cmd_resume(&checkpoint, budget, device, proof_dir, json),
         Cmd::Verify {
             proof,
             backend,

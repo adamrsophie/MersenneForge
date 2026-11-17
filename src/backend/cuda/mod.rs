@@ -390,8 +390,8 @@ impl CudaBackend {
             .map_err(|e| driver_err("upload twiddles", e))?;
         drop(host_tw);
         let build = format!(
-            "mersenne-forge {}; cuda kernels sha3-256 {}; nvrtc {} options [{}]; driver {}; no kernel cache",
-            env!("CARGO_PKG_VERSION"),
+            "{}; cuda kernels sha3-256 {}; nvrtc {} options [{}]; driver {}; no kernel cache",
+            crate::build_identity(),
             kernel_source_hash(),
             nvrtc_version(),
             options.join(" "),

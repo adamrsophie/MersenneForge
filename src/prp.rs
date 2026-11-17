@@ -119,6 +119,8 @@ struct Spec<'h> {
     rule: StepRule,
     max_batch: u64,
     proof: Option<&'h ProofStore>,
+    /// Terminal residue from a completed checkpoint, checked again on load.
+    completed: Option<&'h Residue>,
 }
 
 #[derive(Default)]
@@ -230,7 +232,12 @@ impl<'b, B: Backend> Engine<'b, B> {
     fn load(&mut self, st: &VerifiedState, spec: &Spec) -> Result<bool, BackendError> {
         self.be.import(self.c, &st.c_old)?;
         self.be.import(self.x, &st.x)?;
-        let (ok, _) = self.check(spec)?;
+        let (mut ok, _) = self.check(spec)?;
+        if let Some(final_x) = spec.completed {
+            self.be.import(self.t, final_x)?;
+            self.square_batched(self.t, st.k - spec.kend, spec.max_batch)?;
+            ok &= !final_x.is_zero() && self.be.equal(self.t, self.x)?;
+        }
         self.k = st.k;
         self.skip_update = true;
         self.early = st.k + 2 * spec.block;
@@ -253,7 +260,7 @@ impl<'b, B: Backend> Engine<'b, B> {
                 self.be.mul(self.c, self.x)?;
             }
         }
-        let mut next = round_up(k + 1, b).min(k + spec.max_batch);
+        let mut next = round_up(k + 1, b).min(k.saturating_add(spec.max_batch));
         if k < spec.kend {
             next = next.min(spec.kend);
         }
@@ -342,7 +349,8 @@ impl<'b, B: Backend> Engine<'b, B> {
     }
 }
 
-type OnVerified<'f> = &'f mut dyn FnMut(&VerifiedState, u32) -> Result<(), ProtocolError>;
+type OnVerified<'f> =
+    &'f mut dyn FnMut(&VerifiedState, u32, Option<&Residue>) -> Result<(), ProtocolError>;
 
 /// The checked squaring run with x_0 = A, up to roundUp(n, B).
 #[allow(clippy::too_many_arguments)]
@@ -411,6 +419,16 @@ fn drive<B: Backend>(
             Err(e) => return Err(e.into()),
         }
     }
+    if let Some(final_x) = spec.completed {
+        if let Some(f) = on_verified.as_mut() {
+            let sw = Stopwatch::start();
+            f(&verified, cnt.n_errors, Some(final_x))?;
+            cnt.t_ckpt += sw.secs();
+        }
+        return Ok(End::Done {
+            final_x: final_x.clone(),
+        });
+    }
     let mut n_seq = 0u32;
     let mut last_failed: Option<Residue> = None;
 
@@ -428,17 +446,18 @@ fn drive<B: Backend>(
                 n_seq = 0;
                 cnt.passed += 1;
                 verified = state;
-                if verified.k >= round_up(spec.kend, spec.block) {
-                    let final_x = eng
-                        .final_x
+                let final_x = (verified.k >= round_up(spec.kend, spec.block)).then(|| {
+                    eng.final_x
                         .clone()
-                        .expect("the final residue was recorded at k = n");
-                    return Ok(End::Done { final_x });
-                }
+                        .expect("the final residue was recorded at k = n")
+                });
                 if let Some(f) = on_verified.as_mut() {
                     let sw = Stopwatch::start();
-                    f(&verified, cnt.n_errors)?;
+                    f(&verified, cnt.n_errors, final_x.as_ref())?;
                     cnt.t_ckpt += sw.secs();
+                }
+                if let Some(final_x) = final_x {
+                    return Ok(End::Done { final_x });
                 }
                 if stop {
                     return Ok(End::Stopped { state: verified });
@@ -544,6 +563,12 @@ pub fn checked_power<B: Backend>(
             "checked power needs a block of at least 2 and a positive check step and batch".into(),
         ));
     }
+    // Leave room for the final rounded boundary and the early on-load check.
+    if n > u64::MAX - 3 * u64::from(cfg.block) {
+        return Err(ProtocolError::Config(
+            "squaring count leaves no room for check boundaries".into(),
+        ));
+    }
     if a.is_zero() {
         // Every power of zero is zero, and the Gerbicz check cannot cover a
         // zero value: refuse instead of returning an unchecked result.
@@ -567,6 +592,7 @@ pub fn checked_power<B: Backend>(
         },
         max_batch: cfg.max_batch,
         proof: None,
+        completed: None,
     };
     let from = VerifiedState {
         k: 0,
@@ -719,10 +745,16 @@ pub fn run_prp<B: Backend>(
         ),
         Some(ck) => {
             let m = &ck.meta;
+            let completed = m.state == "completed";
             if m.protocol != PROTOCOL
                 || m.exponent != p
-                || ck.residues.len() != 2
-                || m.k >= u64::from(p)
+                || ck.residues.len() != if completed { 3 } else { 2 }
+                || ck.residues.iter().any(|r| r.exponent() != p)
+                || if completed {
+                    m.k != round_up(u64::from(p), u64::from(cfg.block_size))
+                } else {
+                    m.k >= u64::from(p)
+                }
                 || m.k % u64::from(cfg.block_size) != 0
             {
                 return Err(CheckpointError::Mismatch(format!(
@@ -738,12 +770,19 @@ pub fn run_prp<B: Backend>(
                 ))
                 .into());
             }
-            if without_checkpoint(&m.config) != without_checkpoint(&config_json) {
+            let mut stored_config = m.config.clone();
+            if cfg.proof_dir.is_some() && stored_config["proof_dir"].is_string() {
+                stored_config["proof_dir"] = config_json["proof_dir"].clone();
+            }
+            if without_checkpoint(&stored_config) != without_checkpoint(&config_json) {
                 return Err(CheckpointError::Mismatch("run configuration differs".into()).into());
             }
             // The remaining metadata has one valid value for a PRP state.
             let through = spec_proof_through(store.as_ref(), m.k);
-            if m.state != "verified" || m.verified_k != m.k || m.proof_durable_through != through {
+            if (!completed && m.state != "verified")
+                || m.verified_k != m.k
+                || m.proof_durable_through != through
+            {
                 return Err(CheckpointError::Mismatch(format!(
                     "inconsistent metadata: state {:?}, verified_k {}, proof_durable_through {:?} at k = {}",
                     m.state, m.verified_k, m.proof_durable_through, m.k
@@ -768,22 +807,37 @@ pub fn run_prp<B: Backend>(
         rule: step_rule(p, cfg),
         max_batch: cfg.max_batch,
         proof: store.as_ref(),
+        completed: resume
+            .filter(|ck| ck.meta.state == "completed")
+            .map(|ck| &ck.residues[2]),
     };
     evidence.check_step = Some(spec.rule.effective(spec.block, 0));
     let start = Stopwatch::start();
     let identity = be.identity();
     let ckpt_path = cfg.checkpoint.clone();
-    let mut save = |st: &VerifiedState, n_errors: u32| -> Result<(), ProtocolError> {
+    let mut save = |st: &VerifiedState,
+                    n_errors: u32,
+                    final_x: Option<&Residue>|
+     -> Result<(), ProtocolError> {
         let Some(path) = &ckpt_path else {
             return Ok(());
         };
+        let mut residues = vec![st.c_old.clone(), st.x.clone()];
+        if let Some(x) = final_x {
+            residues.push(x.clone());
+        }
         let ck = Checkpoint {
             meta: CheckpointMeta {
                 format_version: FORMAT_VERSION,
                 protocol: PROTOCOL.into(),
                 exponent: p,
                 k: st.k,
-                state: "verified".into(),
+                state: if final_x.is_some() {
+                    "completed"
+                } else {
+                    "verified"
+                }
+                .into(),
                 verified_k: st.k,
                 n_errors,
                 proof_durable_through: spec_proof_through(store.as_ref(), st.k),
@@ -793,7 +847,7 @@ pub fn run_prp<B: Backend>(
                 elapsed_secs: elapsed_before + start.secs(),
                 crate_version: env!("CARGO_PKG_VERSION").into(),
             },
-            residues: vec![st.c_old.clone(), st.x.clone()],
+            residues,
         };
         ck.save(path)?;
         Ok(())
@@ -889,10 +943,10 @@ pub fn run_prp<B: Backend>(
             }
         }
         if evidence.proof_stage == ProofStage::Interrupted {
-            evidence.notes.push(
-                "the proof stage was stopped; a resume from the checkpoint redoes the last check interval and the proof"
-                    .into(),
-            );
+            evidence.notes.push(match existing_checkpoint(cfg.checkpoint.as_deref()) {
+                Some(path) => format!("the proof stage was stopped; restart it with `mersenne-forge resume --checkpoint {}`", path.display()),
+                None => "the proof stage was stopped; no checkpoint was written".into(),
+            });
         }
     }
     evidence.notes.push(

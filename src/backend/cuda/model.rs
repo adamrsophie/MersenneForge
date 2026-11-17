@@ -10,7 +10,7 @@
 //! produced by [`Plan::square_launches`] and [`Plan::mul_launches`] is the one
 //! the CUDA host submits, and [`execute`] runs it on the model kernels.
 //!
-//! Arithmetic: q = 2^61 - 1, field GF(q^2) = GF(q)[i] / (i^2 + 1) (valid since
+//! Arithmetic: q = 2^61 - 1, field `GF(q^2) = GF(q)[i] / (i^2 + 1)` (valid since
 //! q = 3 mod 4). The norm-1 subgroup has order q + 1 = 2^61, so every
 //! power-of-two root of unity used here lies in it and its inverse is its
 //! conjugate. 2 has order 61 modulo q, so the n-th root of 2 is 2^k with

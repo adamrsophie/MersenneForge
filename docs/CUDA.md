@@ -233,7 +233,7 @@ the upgrade halves residue and scratch memory.
   there is no `unsafe impl Send` or `Sync`.
 * Identity: `kind = "cuda"`, `plan = "ntt-gf-m61sq n=<n>"`,
   `device = "<name> (CUDA <ordinal>, cc <major.minor>)"`, and `build` lists the
-  crate version, the SHA3-256 of the kernel source, the NVRTC version and
+  crate version, the implementation source fingerprint, the SHA3-256 of the kernel source, the NVRTC version and
   options, and the driver version.
 * Process-global state: the CUDA driver keeps one primary context per device
   per process, and `cudarc` keeps the loaded libraries and symbols in

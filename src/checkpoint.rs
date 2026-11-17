@@ -78,8 +78,9 @@ pub struct CheckpointMeta {
     pub exponent: u32,
     /// Iteration of the stored state.
     pub k: u64,
-    /// "verified" (PRP: passed a Gerbicz check; LL: a provisional residue at
-    /// k plus the last Jacobi verified residue at verified_k).
+    /// "verified" or "completed" (PRP: passed a Gerbicz check), or
+    /// "provisional" (LL: residue at k plus the last Jacobi verified residue
+    /// at verified_k). A completed PRP state also stores the terminal x_p.
     pub state: String,
     pub verified_k: u64,
     pub n_errors: u32,

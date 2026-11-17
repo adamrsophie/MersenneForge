@@ -608,8 +608,8 @@ impl Backend for GpuBackend {
         BackendIdentity {
             kind: "gpu".into(),
             build: format!(
-                "mersenne-forge {} wgsl-sha3-256 {}",
-                env!("CARGO_PKG_VERSION"),
+                "{} wgsl-sha3-256 {}",
+                crate::build_identity(),
                 kernel_source_hash()
             ),
             plan: plan_name(self.plan.n),

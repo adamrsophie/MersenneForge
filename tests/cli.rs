@@ -33,6 +33,7 @@ fn doctor_reports_backends() {
     let o = cli(&["doctor", "--json"]);
     assert_eq!(o.status.code(), Some(0));
     let v = json(&o);
+    assert_eq!(v["build"], mersenne_forge::build_identity());
     let kinds: Vec<&str> = v["backends"]
         .as_array()
         .unwrap()
@@ -594,6 +595,7 @@ fn resume_falls_back_when_the_primary_fails_its_on_load_check() {
 fn an_unwritable_proof_file_exits_5_and_keeps_the_result() {
     let dir = tempfile::tempdir().unwrap();
     let pf = dir.path().join("proof");
+    let ckpt_dir = dir.path().join("ckpt");
     std::fs::create_dir_all(pf.join("1279-4.proof")).unwrap();
     let o = cli(&[
         "run",
@@ -607,12 +609,26 @@ fn an_unwritable_proof_file_exits_5_and_keeps_the_result() {
         s(&pf),
         "--proof-power",
         "4",
+        "--checkpoint-dir",
+        s(&ckpt_dir),
         "--json",
     ]);
     assert_eq!(o.status.code(), Some(5));
     let v = json(&o);
     assert_eq!(v["report"]["result"]["verdict"], "probable_prime");
     assert_eq!(v["report"]["evidence"]["proof_stage"], "failed");
+    let ckpt = ckpt_dir.join("M1279-prp.ckpt");
+    assert_eq!(
+        Checkpoint::load_file(&ckpt).unwrap().meta.state,
+        "completed"
+    );
+    std::fs::remove_dir(pf.join("1279-4.proof")).unwrap();
+    let resumed = cli(&["resume", "--checkpoint", s(&ckpt), "--json"]);
+    assert_eq!(resumed.status.code(), Some(0));
+    let resumed = json(&resumed);
+    assert_eq!(resumed["report"]["result"], v["report"]["result"]);
+    assert_eq!(resumed["report"]["timings"]["iterations"], 0.0);
+    assert_eq!(resumed["report"]["evidence"]["proof_stage"], "verified");
 }
 
 #[test]
@@ -688,4 +704,99 @@ fn a_killed_run_resumes_to_the_uninterrupted_result() {
         std::fs::read(pf.join("44497-6.proof")).unwrap(),
         std::fs::read(base_pf.join("44497-6.proof")).unwrap()
     );
+}
+
+#[test]
+fn resume_uses_relocated_checkpoints_and_proof_residues() {
+    for completed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original");
+        let moved = dir.path().join("moved");
+        let cfg = common::prp_cfg(&original, Some(4));
+        let mut ctl = Control {
+            halt_at: (!completed).then_some(1000),
+            ..Control::default()
+        };
+        common::prp_run(&mut CpuBackend::new(1279).unwrap(), 1279, &cfg, &mut ctl).unwrap();
+        std::fs::rename(&original, &moved).unwrap();
+        let ckpt = moved.join("ckpt/prp.ckpt");
+        let proof_dir = moved.join("proof");
+        let before = std::fs::read(&ckpt).unwrap();
+        let missing = dir.path().join("missing");
+        let o = cli(&[
+            "resume",
+            "--checkpoint",
+            s(&ckpt),
+            "--proof-dir",
+            s(&missing),
+            "--json",
+        ]);
+        assert_eq!(o.status.code(), Some(6));
+        assert_eq!(std::fs::read(&ckpt).unwrap(), before);
+        assert!(!missing.exists());
+        let o = cli(&[
+            "resume",
+            "--checkpoint",
+            s(&ckpt),
+            "--proof-dir",
+            s(&proof_dir),
+            "--json",
+        ]);
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&o.stdout)
+        );
+        let v = json(&o);
+        assert_eq!(
+            v["report"]["result"]["res64"],
+            common::oracle_prp_res64(1279)
+        );
+        assert_eq!(v["report"]["evidence"]["proof_stage"], "verified");
+        assert_eq!(v["effective"]["proof_dir"], s(&proof_dir));
+        assert_eq!(v["effective"]["checkpoint"], s(&ckpt));
+        if completed {
+            assert_eq!(v["resumed_at"], 1280);
+            assert_eq!(v["report"]["timings"]["iterations"], 0.0);
+        }
+        assert!(!original.exists(), "resume recreated the old paths");
+        let ck = Checkpoint::load_file(&ckpt).unwrap();
+        assert_eq!(ck.meta.config["proof_dir"], s(&proof_dir));
+        // The new directory is durable configuration, so no override is needed again.
+        let before = std::fs::read(proof_dir.join("1279-4.proof")).unwrap();
+        let o = cli(&["resume", "--checkpoint", s(&ckpt), "--json"]);
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&o.stdout)
+        );
+        assert_eq!(json(&o)["report"]["timings"]["iterations"], 0.0);
+        assert_eq!(
+            std::fs::read(proof_dir.join("1279-4.proof")).unwrap(),
+            before
+        );
+    }
+}
+
+#[test]
+fn resume_refuses_to_add_a_proof_schedule() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = library_checkpoint(dir.path());
+    let before = std::fs::read(&path).unwrap();
+    let o = cli(&[
+        "resume",
+        "--checkpoint",
+        s(&path),
+        "--proof-dir",
+        s(&dir.path().join("proof")),
+        "--json",
+    ]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(json(&o)["message"]
+        .as_str()
+        .unwrap()
+        .contains("proof schedule"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
 }

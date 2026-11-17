@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use mersenne_forge::backend::cpu::CpuBackend;
 use mersenne_forge::backend::{Backend, BackendIdentity, BackendResult, Reg};
+use mersenne_forge::checkpoint::Checkpoint;
 use mersenne_forge::proof::{ProofSchedule, ProofStore};
 use mersenne_forge::residue::Residue;
 use mersenne_forge::run::{Control, ProcessState, ProofStage, RunReport, Verdict};
@@ -144,19 +145,26 @@ impl Backend for StopAfterEngine {
 #[test]
 fn a_stop_during_the_proof_stage_interrupts_it() {
     let dir = tempfile::tempdir().unwrap();
+    let cfg = prp_cfg(dir.path(), Some(5));
     let mut ctl = Control {
         stop: Some(&STOP),
         ..Control::default()
     };
-    let r = prp_run(
-        &mut StopAfterEngine(cpu()),
-        PRIME_P,
-        &prp_cfg(dir.path(), Some(5)),
-        &mut ctl,
-    )
-    .unwrap();
+    let r = prp_run(&mut StopAfterEngine(cpu()), PRIME_P, &cfg, &mut ctl).unwrap();
     assert_result_kept(&r);
     assert_eq!(r.evidence.proof_stage, ProofStage::Interrupted);
     assert!(r.evidence.proof.is_none());
-    assert!(r.evidence.notes.iter().any(|n| n.contains("redoes")));
+    let ck = Checkpoint::load_file(cfg.checkpoint.as_ref().unwrap()).unwrap();
+    assert_eq!(ck.meta.state, "completed");
+    assert_eq!(ck.meta.k, 1280);
+    assert_eq!(
+        ck.residues[2],
+        mersenne_forge::oracle::prp(PRIME_P).terminal
+    );
+
+    let resumed = prp_resume(&mut cpu(), PRIME_P, &cfg, &mut Control::default()).unwrap();
+    assert_result_kept(&resumed);
+    assert_eq!(resumed.evidence.proof_stage, ProofStage::Verified);
+    assert_eq!(resumed.evidence.gerbicz_passed, 0);
+    assert_eq!(resumed.timings.iterations, 0.0);
 }

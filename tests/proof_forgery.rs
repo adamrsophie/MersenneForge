@@ -206,4 +206,14 @@ fn checked_power_validates_its_input() {
     }
     let x = checked_power(&mut be, &three, 20, &cfg, &mut Control::default()).unwrap();
     assert_eq!(x.residue, mersenne_forge::oracle::square_n(&three, 20));
+    assert!(matches!(
+        checked_power(&mut be, &three, u64::MAX, &cfg, &mut Control::default()),
+        Err(ProtocolError::Config(_))
+    ));
+    let wide = CheckedPowerConfig {
+        max_batch: u64::MAX,
+        ..cfg
+    };
+    let x = checked_power(&mut be, &three, 20, &wide, &mut Control::default()).unwrap();
+    assert_eq!(x.residue, mersenne_forge::oracle::square_n(&three, 20));
 }

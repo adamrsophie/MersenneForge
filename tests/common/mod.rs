@@ -115,6 +115,18 @@ pub fn prp_prime_and_composite_with_proofs<B: Backend>(mk: impl Fn(u32) -> B) {
             "p = {p} is below the recompute cutoff"
         );
         assert_eq!(r.evidence.proof_stage, ProofStage::Verified);
+        let bytes = std::fs::read(proof_path(&r)).unwrap();
+        let resumed = prp_resume(
+            &mut be,
+            p,
+            &prp_cfg(dir.path(), Some(5)),
+            &mut Control::default(),
+        )
+        .unwrap();
+        assert_prp_correct(&resumed, p);
+        assert_eq!(resumed.evidence.gerbicz_passed, 0);
+        assert_eq!(resumed.timings.iterations, 0.0);
+        assert_eq!(std::fs::read(proof_path(&resumed)).unwrap(), bytes);
     }
 }
 

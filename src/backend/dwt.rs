@@ -9,7 +9,7 @@
 //!
 //! 1. Canonical [`Residue`]: little-endian `u32` limbs, `0 <= x < N`,
 //!    `N = 2^p - 1`. The only form that crosses the [`Backend`] trait.
-//! 2. [`BalancedWords`]: the resident form. For a transform length `n`, word
+//! 2. `BalancedWords`: the resident form. For a transform length `n`, word
 //!    `i` starts at bit `b_i = ceil(p*i/n)` and has width
 //!    `w_i = b_{i+1} - b_i`, which is `floor(p/n)` or `ceil(p/n)`. The value
 //!    is `sum(d_i * 2^b_i) mod N` with balanced digits
@@ -469,7 +469,7 @@ impl Backend for DwtBackend {
     fn identity(&self) -> BackendIdentity {
         BackendIdentity {
             kind: "dwt".into(),
-            build: format!("mersenne-forge {}", env!("CARGO_PKG_VERSION")),
+            build: crate::build_identity().into(),
             plan: plan_name(self.plan.n),
             device: String::new(),
         }

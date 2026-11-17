@@ -394,3 +394,68 @@ fn nested_directories_are_created() {
     assert!(deep.is_dir());
     create_dir_all_durable(&deep).unwrap();
 }
+
+#[test]
+fn completed_prp_states_validate_metadata_and_all_residues() {
+    for (p, block) in [(3, 3), (11, 16), (1279, 16)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = prp_cfg(dir.path(), None);
+        cfg.block_size = block;
+        cfg.check_step = Some(u64::from(block) * 4);
+        cfg.max_batch = u64::MAX;
+        let mut be = CpuBackend::new(p).unwrap();
+        let original = common::prp_run(&mut be, p, &cfg, &mut Control::default()).unwrap();
+        let ck = Checkpoint::load_file(cfg.checkpoint.as_ref().unwrap()).unwrap();
+        assert_eq!(ck.meta.state, "completed");
+        assert_eq!(ck.residues.len(), 3);
+        assert_eq!(ck.residues[2], mersenne_forge::oracle::prp(p).terminal);
+        let resumed = common::prp_resume(&mut be, p, &cfg, &mut Control::default()).unwrap();
+        assert_eq!(resumed.result, original.result);
+        assert_eq!(resumed.timings.iterations, 0.0);
+
+        for index in 0..3 {
+            let mut damaged = ck.clone();
+            damaged.residues[index] = damaged.residues[index].with_bit_flipped(1);
+            let err = run_prp(
+                &mut be,
+                p,
+                &cfg,
+                serde_json::json!({}),
+                Some(&damaged),
+                &mut Control::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, ProtocolError::CheckpointRejected { .. }),
+                "p={p}, residue {index}: {err}"
+            );
+        }
+        let forgeries: [fn(&mut Checkpoint); 6] = [
+            |c| c.meta.state = "verified".into(),
+            |c| c.meta.k += 16,
+            |c| c.meta.verified_k = 0,
+            |c| c.meta.proof_durable_through = Some(1),
+            |c| {
+                c.residues.pop();
+            },
+            |c| c.residues[2] = mersenne_forge::residue::Residue::from_u64(5, 1),
+        ];
+        for forge in forgeries {
+            let mut damaged = ck.clone();
+            forge(&mut damaged);
+            let err = run_prp(
+                &mut be,
+                p,
+                &cfg,
+                serde_json::json!({}),
+                Some(&damaged),
+                &mut Control::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, ProtocolError::Checkpoint(CheckpointError::Mismatch(_))),
+                "{err}"
+            );
+        }
+    }
+}
