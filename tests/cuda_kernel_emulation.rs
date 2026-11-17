@@ -109,6 +109,12 @@ int main() {
             std::cout << "ok\n" << std::flush;
         } else if (cmd == "Q") {
             return 0;
+        } else if (cmd == "E") {
+            // Harness self-test: answer, then exit with the given status.
+            int status = 0;
+            std::cin >> status;
+            std::cout << "ok\n" << std::flush;
+            return status;
         } else {
             std::fprintf(stderr, "unknown command %s\n", cmd.c_str());
             return 2;
@@ -197,6 +203,7 @@ struct Emu {
     child: Child,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
+    finished: bool,
 }
 
 impl Emu {
@@ -213,7 +220,21 @@ impl Emu {
             child,
             input,
             output,
+            finished: false,
         }
+    }
+
+    /// Stop the driver and require a successful exit. A sanitizer report at
+    /// shutdown (for example a leak) or any nonzero status fails the test.
+    fn finish(mut self) {
+        self.finished = true;
+        writeln!(self.input, "Q").unwrap();
+        self.input.flush().unwrap();
+        let status = self.child.wait().expect("wait for the emulation driver");
+        assert!(
+            status.success(),
+            "emulation driver exited with {status} after its last response (details on stderr)"
+        );
     }
 
     fn line(&mut self) -> String {
@@ -273,11 +294,20 @@ impl Emu {
     }
 }
 
+/// Cleanup for paths that do not reach `finish`. While unwinding it only
+/// reaps the child; otherwise a failed exit still fails the test.
 impl Drop for Emu {
     fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
         let _ = writeln!(self.input, "Q");
         let _ = self.input.flush();
-        let _ = self.child.wait();
+        let status = self.child.wait();
+        if !std::thread::panicking() {
+            let status = status.expect("wait for the emulation driver");
+            assert!(status.success(), "emulation driver exited with {status}");
+        }
     }
 }
 
@@ -358,6 +388,7 @@ fn every_kernel_matches_the_model_word_for_word() {
         for b in ALL_BUFS {
             assert_eq!(emu.get(b), m.get_mut(b).clone(), "p={} {b:?}", plan.p);
         }
+        emu.finish();
     }
 }
 
@@ -377,6 +408,7 @@ fn worst_case_words_match_the_model() {
             m.x = vec![(sign * wb) as u64; plan.n as usize];
             emu.set(Buf::X, &m.x);
             lockstep(&plan, &mut emu, &mut m, &plan.mul_launches());
+            emu.finish();
         }
     }
 }
@@ -402,6 +434,7 @@ fn thread_order_and_block_size_do_not_change_results() {
             emu.launch(&l, block, reverse);
         }
         results.push(emu.get(Buf::X));
+        emu.finish();
     }
     assert!(results.windows(2).all(|w| w[0] == w[1]));
 }
@@ -449,6 +482,7 @@ fn emulated_operations_match_bigint() {
                 .from_words(&emu.get(Buf::X))
                 .expect("words within the proven bound");
             assert_eq!(got.to_biguint(), want, "p={p}");
+            emu.finish();
         }
     }
 }
@@ -478,5 +512,29 @@ fn emulated_complete_lucas_lehmer_runs() {
         }
         let r = plan.from_words(&emu.get(Buf::X)).unwrap();
         assert_eq!(r.is_zero(), prime, "M{p}");
+        emu.finish();
     }
+}
+
+/// The harness itself: a driver that answers correctly and then exits with a
+/// failure status makes the enclosing test fail, through `finish` and
+/// through `Drop`.
+#[test]
+fn a_failed_driver_exit_fails_the_test() {
+    for explicit in [true, false] {
+        let r = std::panic::catch_unwind(|| {
+            let mut emu = Emu::new();
+            writeln!(emu.input, "E 86").unwrap();
+            emu.input.flush().unwrap();
+            assert_eq!(emu.line().trim(), "ok");
+            if explicit {
+                emu.finish();
+            }
+        });
+        let msg = r.expect_err("a nonzero driver exit must fail");
+        let msg = msg.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(msg.contains("exit status: 86"), "{msg}");
+    }
+    // A clean exit passes.
+    Emu::new().finish();
 }
