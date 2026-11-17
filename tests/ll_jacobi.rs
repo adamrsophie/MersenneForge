@@ -61,3 +61,46 @@ fn jacobi_catches_about_half_of_bit_flips() {
         "detected {detected} of 64, missed {missed}"
     );
 }
+
+/// Batch sizes up to `u64::MAX` are accepted and must stop at the next log or
+/// final boundary instead of overflowing past it.
+#[test]
+fn huge_batch_sizes_stop_at_the_boundaries() {
+    use mersenne_forge::run::Verdict;
+    for p in [7u32, 11, 13] {
+        let reference = oracle::ll(p).terminal;
+        for max_batch in [u64::MAX, u64::MAX - 1, u64::MAX / 2, 1 << 63, 3] {
+            for log_step in [1, 2, u64::MAX] {
+                let cfg = LlConfig {
+                    log_step,
+                    jacobi: JacobiCadence::EveryLog,
+                    checkpoint: None,
+                    max_batch,
+                };
+                let mut be = CpuBackend::new(p).unwrap();
+                let r = run_ll(
+                    &mut be,
+                    p,
+                    &cfg,
+                    serde_json::json!({}),
+                    None,
+                    &mut Control::default(),
+                )
+                .unwrap();
+                let res = r.result.unwrap();
+                assert_eq!(res.res2048, reference.res2048_hex(), "p={p}");
+                let want = if p == 11 {
+                    Verdict::Composite
+                } else {
+                    Verdict::Prime
+                };
+                assert_eq!(res.verdict, want, "p={p}");
+            }
+        }
+    }
+    let bad = LlConfig {
+        max_batch: 0,
+        ..LlConfig::default()
+    };
+    assert!(mersenne_forge::ll::validate(7, &bad).is_err());
+}

@@ -211,7 +211,7 @@ pub fn run_ll<B: Backend>(
         let outcome = loop {
             let mut next = round_up(k + 1, cfg.log_step)
                 .min(kend)
-                .min(k + cfg.max_batch);
+                .min(k.saturating_add(cfg.max_batch));
             if let Some(h) = ctl.halt_at.filter(|&h| h > k) {
                 next = next.min(h);
             }
