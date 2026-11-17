@@ -1099,3 +1099,88 @@ fn resume_refuses_a_held_proof_store_without_touching_the_checkpoint() {
     );
     assert_eq!(json(&o)["report"]["evidence"]["proof_stage"], "verified");
 }
+
+/// RFC 4180 records: quoted fields may hold commas, quotes ("" inside), CR,
+/// and LF. Panics on a quote in an unquoted field.
+fn parse_csv(text: &str) -> Vec<Vec<String>> {
+    let (mut records, mut record, mut field) = (Vec::new(), Vec::new(), String::new());
+    let (mut quoted, mut was_quoted) = (false, false);
+    let mut it = text.chars().peekable();
+    while let Some(c) = it.next() {
+        if quoted {
+            match c {
+                '"' if it.peek() == Some(&'"') => {
+                    field.push('"');
+                    it.next();
+                }
+                '"' => quoted = false,
+                _ => field.push(c),
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                assert!(field.is_empty() && !was_quoted, "stray quote");
+                quoted = true;
+                was_quoted = true;
+            }
+            ',' => {
+                record.push(std::mem::take(&mut field));
+                was_quoted = false;
+            }
+            '\n' => {
+                record.push(std::mem::take(&mut field));
+                records.push(std::mem::take(&mut record));
+                was_quoted = false;
+            }
+            _ => {
+                assert!(!was_quoted, "text after a closing quote");
+                field.push(c);
+            }
+        }
+    }
+    assert!(
+        !quoted && field.is_empty() && record.is_empty(),
+        "unterminated record"
+    );
+    records
+}
+
+/// Arbitrary text in a plan (here an invalid test name and an argv) cannot
+/// break the CSV: one record per observation, every record full width, and a
+/// failed observation followed by a valid one keeps both.
+#[test]
+fn bench_csv_quotes_every_text_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let nasty = "ll,bogus\r\n\"quoted\"\nend";
+    let plan = serde_json::json!({"name": "csv, \"edge\"\ncases", "order": "sequential", "repeats": 1, "entries": [
+        {"kind": "engine", "name": "bad,name", "test": nasty, "exponent": 89, "backend": "cpu"},
+        {"kind": "engine", "name": "good", "test": "ll", "exponent": 89, "backend": "cpu"},
+        {"kind": "external", "name": "echo", "argv": ["echo", "a,b\n\"c\""]}]});
+    let out = dir.path().join("r.csv");
+    let o = bench(&plan, &out);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let records = parse_csv(&std::fs::read_to_string(&out).unwrap());
+    let header = &records[0];
+    let col = |name: &str| header.iter().position(|h| h == name).unwrap();
+    assert_eq!(records.len(), 4, "header and three observations");
+    for r in &records[1..] {
+        assert_eq!(r.len(), header.len());
+        assert_eq!(r[col("plan_name")], "csv, \"edge\"\ncases");
+    }
+    let (bad, good, ext) = (&records[1], &records[2], &records[3]);
+    assert_eq!(bad[col("entry")], "bad,name");
+    assert_eq!(bad[col("test")], nasty);
+    assert_eq!(bad[col("status")], "failed");
+    assert_eq!(bad[col("entry_index")], "0");
+    assert_eq!(good[col("status")], "completed");
+    assert_eq!(good[col("verdict")], "Prime");
+    assert_eq!(good[col("entry_index")], "1");
+    assert_eq!(ext[col("argv")], r#"["echo","a,b\n\"c\""]"#);
+    assert_eq!(ext[col("status")], "completed");
+}

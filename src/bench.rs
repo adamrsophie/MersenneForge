@@ -648,7 +648,6 @@ pub fn to_csv(out: &BenchOutput) -> String {
         "energy_joules",
         "telemetry",
     ];
-    let q = |v: &str| format!("\"{}\"", v.replace('"', "\"\""));
     let mut s = COLUMNS.join(",") + "\n";
     for o in &out.observations {
         let t = o.timings.as_ref();
@@ -657,40 +656,44 @@ pub fn to_csv(out: &BenchOutput) -> String {
         let c = |x: Option<u64>| x.map(|v| v.to_string()).unwrap_or_default();
         let b = o.backend.as_ref();
         let path = |p: &Option<PathBuf>| {
-            q(&p.as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default())
+            String::from(
+                &p.as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+            )
         };
         let row: Vec<String> = vec![
-            q(&out.plan.name),
+            String::from(&out.plan.name),
             out.plan_sha3.clone(),
             out.seed_used.map(|v| v.to_string()).unwrap_or_default(),
-            q(&out.build),
+            String::from(&out.build),
             out.os.clone(),
             out.arch.clone(),
-            q(&out.execution_dir.display().to_string()),
-            q(&o.entry),
+            String::from(&out.execution_dir.display().to_string()),
+            String::from(&o.entry),
             o.entry_index.to_string(),
             o.kind.clone(),
             o.test.clone().unwrap_or_default(),
             o.exponent.map(|v| v.to_string()).unwrap_or_default(),
-            q(&match out.plan.entries.get(o.entry_index) {
+            String::from(&match out.plan.entries.get(o.entry_index) {
                 Some(Entry::Engine { options, .. }) => {
                     serde_json::to_string(options).expect("options serialize")
                 }
                 _ => String::new(),
             }),
-            q(&o.argv
-                .as_ref()
-                .map(|a| serde_json::to_string(a).expect("argv"))
-                .unwrap_or_default()),
-            q(&o.result_source),
-            q(&o.start),
+            String::from(
+                &o.argv
+                    .as_ref()
+                    .map(|a| serde_json::to_string(a).expect("argv"))
+                    .unwrap_or_default(),
+            ),
+            String::from(&o.result_source),
+            String::from(&o.start),
             o.sequence.to_string(),
             o.repeat.to_string(),
             o.warmup.to_string(),
             o.status.clone(),
-            q(o.error.as_deref().unwrap_or("")),
+            String::from(o.error.as_deref().unwrap_or("")),
             format!("{:.6}", o.wall_secs),
             f(t.map(|t| t.init)),
             f(t.map(|t| t.iterations)),
@@ -701,9 +704,9 @@ pub fn to_csv(out: &BenchOutput) -> String {
             o.verdict.clone().unwrap_or_default(),
             o.res64.clone().unwrap_or_default(),
             b.map(|b| b.kind.clone()).unwrap_or_default(),
-            q(b.map(|b| b.build.as_str()).unwrap_or("")),
-            q(b.map(|b| b.plan.as_str()).unwrap_or("")),
-            q(b.map(|b| b.device.as_str()).unwrap_or("")),
+            String::from(b.map(|b| b.build.as_str()).unwrap_or("")),
+            String::from(b.map(|b| b.plan.as_str()).unwrap_or("")),
+            String::from(b.map(|b| b.device.as_str()).unwrap_or("")),
             o.proof_stage.map(|s| s.name()).unwrap_or("").into(),
             c(o.check_step),
             c(r.map(|r| r.gerbicz_passed)),
@@ -713,11 +716,13 @@ pub fn to_csv(out: &BenchOutput) -> String {
             c(r.map(|r| r.jacobi_inconclusive)),
             c(r.map(|r| r.backend_faults)),
             c(r.map(|r| r.rollbacks)),
-            q(&o.diagnostics
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join(";")),
+            String::from(
+                &o.diagnostics
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(";"),
+            ),
             o.exit_code.map(|c| c.to_string()).unwrap_or_default(),
             path(&o.stdout),
             path(&o.stderr),
@@ -725,7 +730,13 @@ pub fn to_csv(out: &BenchOutput) -> String {
             o.telemetry.clone(),
         ];
         debug_assert_eq!(row.len(), COLUMNS.len());
-        s += &row.join(",");
+        // Every field is quoted (RFC 4180), so commas, quotes, CR, and
+        // newlines in any value stay inside their field.
+        let quoted: Vec<String> = row
+            .iter()
+            .map(|v| format!("\"{}\"", v.replace('"', "\"\"")))
+            .collect();
+        s += &quoted.join(",");
         s.push('\n');
     }
     s

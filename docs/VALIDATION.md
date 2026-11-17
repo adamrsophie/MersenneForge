@@ -2,6 +2,28 @@
 
 Historical results below used Apple M2 (macOS 27.2, arm64), Rust 1.100.0 stable. The completion checks dated 2026-11-16 used the same hardware with macOS 27.2.1. No NVIDIA, AMD, or Intel GPU was available. Nothing here was run on CUDA hardware.
 
+## Temporary file ownership and CSV quoting (2026-11-17)
+
+Implementation source SHA3-256: `2283ef92ecfac447ef2a74d6fca7f43b11e8c6b8209b47911633aa0ee060d87f`; debug executable SHA-256 `c5e77bd5bface421bcc432b3d5f098de6d931ce871598438a6b9200b44a77131` (Apple M2, macOS 27.2.1, Rust 1.100.0).
+
+| Problem | Change | Regression test |
+|---|---|---|
+| When the generated temporary name already existed, `write_atomic` failed and then deleted that file, which it never owned | The writer removes only a file it created; an existing name is left untouched and another name is tried | `existing_temporary_names_are_skipped_and_kept` (fails on the previous code), `a_failed_publication_removes_only_its_own_temporary_file` |
+| A test name or other text with a comma, quote, CR, or newline broke the CSV row that recorded its failure | Every CSV field is quoted, quotes doubled | `bench_csv_quotes_every_text_field`: a strict RFC 4180 parse gives one full width record per observation; the failed entry, a following valid entry, and an external argv keep their values (the previous code produced 6 records for 3 observations) |
+
+| Command | Observed result |
+|---|---|
+| `cargo test --locked` | 122 passed, 0 failed, 5 ignored by default |
+| `cargo clippy --locked --all-targets -- -D warnings`, also with `--features gpu`, `--features cuda`, `--features gpu,cuda` | passed |
+| `cargo fmt --check`; `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --features gpu,cuda`; `cargo +1.89 check --locked --all-targets --features gpu,cuda` | passed |
+| `cargo test --locked --features gpu --lib --test gpu_backend --test protocol_gpu -- --test-threads=1` | 58 passed, 0 failed, 1 ignored; real Apple M2 through Metal |
+| `cargo test --locked --features cuda --lib backend::cuda` | 19 passed; CPU model and host code only |
+| `cargo test --locked --features cuda --test cuda_kernel_emulation` | 6 passed under AddressSanitizer and UndefinedBehaviorSanitizer; CPU emulation, not CUDA hardware; LeakSanitizer unsupported on this host |
+| `cargo test --locked --test reference -- --ignored`; upstream fixture test as below | 1 passed each |
+| Independent Python big-integer sweep against the debug CLI | 688 of 688 agree (172 prime exponents up to 1024, LL and PRP, `cpu` and `dwt`) |
+
+Still open: no CUDA kernel has run on NVIDIA hardware; no upstream verifier has checked a proof generated here; no Vulkan or discrete GPU run; no performance comparison or energy measurement.
+
 ## Storage, proof reading, and benchmark checks (2026-11-17)
 
 Implementation source SHA3-256: `6e50fefa7278c56f6e78146fb1ac2b30986c82c6c22de8b81d01b9cefbe8c4ca` (Apple M2, macOS 27.2.1, Rust 1.100.0, Apple clang 21.0.0). Checkpoints from earlier builds are refused, as intended. These regression tests were also run against the previous code and failed there: `concurrent_atomic_writers_never_share_a_temporary_file`, `a_held_proof_directory_refuses_a_second_writer`, `huge_batch_sizes_stop_at_the_boundaries`, `proof_allocation` (SIGABRT), and `dwt_allocation`. A driver forced to exit 86 after its last correct response passed the previous emulation harness and now fails `thread_order_and_block_size_do_not_change_results`. Rerunning the earlier benchmark scenarios (two entries named `candidate` at p = 127 and 521; `report.json` then `report.csv`; an empty plan) on the new build gave distinct CSV rows with exponent, seed, options, and build, an unchanged first capture, and exit 2 with no output file. The other tests listed cover new behavior.
