@@ -44,10 +44,12 @@ fn upstream_line_forms() {
         "PRP=1,3,4423,-1", // base 3
         "PRP=4425",        // composite
         "Test=4423x",
-        "PRPDC=1,2,1279,-1,75,0,2,1",          // base 2
-        "PRP=1,2,1279,-1,75,0,3,5",            // residue type 5
-        "PRP=1,2,23,-1,75,0,3,5,\"47\"",       // known factors
-        "PRP=2",                               // base 3 needs p >= 3
+        "PRPDC=1,2,1279,-1,75,0,2,1",    // base 2
+        "PRP=1,2,1279,-1,75,0,3,5",      // residue type 5
+        "PRP=1,2,23,-1,75,0,3,5,\"47\"", // known factors
+        "PRP=2",                         // base 3 needs p >= 3
+        "PRP=+127",                      // signed exponent
+        "Test=127,=x",                   // second '='
         "garbage",
     ] {
         assert!(parse_line(bad).is_err(), "{bad}");
@@ -188,7 +190,9 @@ fn an_interrupted_assignment_resumes_in_the_next_session() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     assert!(
-        ckpts.iter().any(|n| n.starts_with("M21701-prp-") && n.ends_with(".ckpt")),
+        ckpts
+            .iter()
+            .any(|n| n.starts_with("M21701-prp-") && n.ends_with(".ckpt")),
         "{ckpts:?}"
     );
     assert!(results(dir.path()).is_empty());
@@ -217,7 +221,10 @@ fn an_unrunnable_assignment_does_not_block_the_queue() {
     let o = work(dir.path(), &[]);
     assert_eq!(o.status.code(), Some(6));
     assert!(String::from_utf8_lossy(&o.stderr).contains("asks for P-1"));
-    assert_eq!(std::fs::read_to_string(&todo).unwrap(), "PRP=1,2,1279,-1,60,1\n");
+    assert_eq!(
+        std::fs::read_to_string(&todo).unwrap(),
+        "PRP=1,2,1279,-1,60,1\n"
+    );
     assert_eq!(results(dir.path())[0]["exponent"], 127);
 }
 
@@ -242,13 +249,31 @@ fn a_double_check_without_an_id_still_runs() {
 fn work_refuses_paths_that_would_lose_work() {
     let dir = tempfile::tempdir().unwrap();
     let o = Command::new(env!("CARGO_BIN_EXE_mersenne-forge"))
-        .args(["work", "--worktodo", "w.txt", "--results", "w.txt", "--checkpoint-dir", "c"])
+        .args([
+            "work",
+            "--worktodo",
+            "w.txt",
+            "--results",
+            "w.txt",
+            "--checkpoint-dir",
+            "c",
+        ])
         .current_dir(dir.path())
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(2));
     let o = Command::new(env!("CARGO_BIN_EXE_mersenne-forge"))
-        .args(["work", "--worktodo", "w.txt", "--results", "r.txt", "--checkpoint-dir", "c", "--proof-power", "2"])
+        .args([
+            "work",
+            "--worktodo",
+            "w.txt",
+            "--results",
+            "r.txt",
+            "--checkpoint-dir",
+            "c",
+            "--proof-power",
+            "2",
+        ])
         .current_dir(dir.path())
         .output()
         .unwrap();

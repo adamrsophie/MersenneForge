@@ -269,7 +269,11 @@ impl ProofWriter {
     /// Queue one point; blocks while `depth` points are already waiting.
     pub fn submit(&self, k: u64, x: Residue) -> Result<(), (u64, String)> {
         self.first_error()?;
-        self.state.0.lock().unwrap_or_else(|e| e.into_inner()).pending += 1;
+        self.state
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending += 1;
         let sent = self.tx.as_ref().expect("open until drop").send((k, x));
         if sent.is_err() {
             return Err((k, "the proof writer thread stopped".into()));

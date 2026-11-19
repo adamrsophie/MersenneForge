@@ -193,15 +193,17 @@ pub struct PowerRecord {
 /// The host's power policy where it can be read without privileges: the
 /// Linux CPU frequency governor, or the macOS low power mode setting.
 fn power_policy() -> String {
-    if let Ok(g) =
-        std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+    if let Ok(g) = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
     {
         return format!("cpufreq governor {}", g.trim());
     }
     if cfg!(target_os = "macos") {
         if let Ok(o) = std::process::Command::new("pmset").arg("-g").output() {
             let text = String::from_utf8_lossy(&o.stdout);
-            if let Some(l) = text.lines().find(|l| l.trim_start().starts_with("lowpowermode")) {
+            if let Some(l) = text
+                .lines()
+                .find(|l| l.trim_start().starts_with("lowpowermode"))
+            {
                 return l.split_whitespace().collect::<Vec<_>>().join(" ");
             }
         }
@@ -318,11 +320,32 @@ fn read_watts(argv: &[String], limit: Duration) -> Option<f64> {
 
 /// The first number in `text`, including signed exponents (1.2e+03).
 fn parse_watts(text: &str) -> Option<f64> {
+    // Numbers, with the text that follows each. A number followed by a "W"
+    // unit wins; otherwise the text must hold exactly one number, so a
+    // label such as "GPU0" is never read as the value.
     let num = |c: char| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E');
-    text.split(|c: char| !num(c))
-        .filter(|t| t.chars().any(|c| c.is_ascii_digit()))
-        .find_map(|t| t.trim_start_matches('+').parse::<f64>().ok())
-        .filter(|w| w.is_finite() && *w >= 0.0)
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(|c: char| c.is_ascii_digit() || c == '.') {
+        let tail = &rest[start..];
+        let len = tail.find(|c: char| !num(c)).unwrap_or(tail.len());
+        let (tok, after) = tail.split_at(len);
+        let before = rest[..start].chars().next_back();
+        let labeled = before.is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+        let sign = if before == Some('-') { -1.0 } else { 1.0 };
+        if let Ok(v) = tok.parse::<f64>().map(|v| sign * v) {
+            if !labeled {
+                found.push((v, after.trim_start().starts_with('W')));
+            }
+        }
+        rest = after;
+    }
+    let pick = match found.iter().find(|(_, unit)| *unit) {
+        Some(&(v, _)) => Some(v),
+        None if found.len() == 1 => Some(found[0].0),
+        None => None,
+    };
+    pick.filter(|w| w.is_finite() && *w >= 0.0)
 }
 
 /// A sampler running on its own thread while a workload runs.
@@ -647,6 +670,10 @@ mod tests {
         assert_eq!(parse_watts("5e-1"), Some(0.5));
         assert_eq!(parse_watts("-3 W"), None);
         assert_eq!(parse_watts("none"), None);
+        assert_eq!(parse_watts("GPU0: 35 W"), Some(35.0));
+        assert_eq!(parse_watts("GPU0: 35"), Some(35.0));
+        assert_eq!(parse_watts("35 W (limit 300 W)"), Some(35.0));
+        assert_eq!(parse_watts("35 then 300"), None);
     }
 
     #[test]

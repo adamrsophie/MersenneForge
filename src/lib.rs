@@ -13,6 +13,7 @@ pub mod evidence;
 pub mod exponent;
 pub mod ll;
 pub mod oracle;
+pub mod primenet;
 pub mod proof;
 pub mod prp;
 pub mod residue;
@@ -62,6 +63,7 @@ const BUILD_SOURCES: &[(&str, &[u8])] = &[
     ("src/main.rs", include_bytes!("main.rs")),
     ("src/oracle.rs", include_bytes!("oracle.rs")),
     ("src/proof.rs", include_bytes!("proof.rs")),
+    ("src/primenet.rs", include_bytes!("primenet.rs")),
     ("src/prp.rs", include_bytes!("prp.rs")),
     ("src/residue.rs", include_bytes!("residue.rs")),
     ("src/run.rs", include_bytes!("run.rs")),

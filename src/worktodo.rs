@@ -80,6 +80,9 @@ pub fn parse_line(raw: &str) -> Result<Option<Assignment>, String> {
     let (kind, rest) = line
         .split_once('=')
         .ok_or_else(|| format!("not an assignment: {line:?}"))?;
+    if rest.contains('=') {
+        return Err(format!("more than one '=': {line:?}"));
+    }
     let kind = match kind {
         "PRP" | "PRPDC" => WorkKind::Prp,
         "Test" | "DoubleCheck" => WorkKind::Ll,
@@ -135,7 +138,9 @@ pub fn parse_line(raw: &str) -> Result<Option<Assignment>, String> {
     }
     let p: u32 = field
         .parse()
-        .map_err(|_| format!("bad exponent {field:?}: {line:?}"))?;
+        .ok()
+        .filter(|_| field.bytes().all(|b| b.is_ascii_digit()))
+        .ok_or_else(|| format!("bad exponent {field:?}: {line:?}"))?;
     crate::exponent::validate(p).map_err(|e| format!("{e}: {line:?}"))?;
     if kind == WorkKind::Prp && p < 3 {
         return refuse("base 3 PRP needs p >= 3");

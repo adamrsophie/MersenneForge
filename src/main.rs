@@ -198,6 +198,32 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         device: u32,
     },
+    /// Exchange with PrimeNet through its manual web forms: send unsent
+    /// result lines, top up the worktodo file, and upload proof files.
+    /// Untested against the server. The password is read from a file.
+    Primenet {
+        #[arg(long)]
+        user: String,
+        #[arg(long)]
+        password_file: PathBuf,
+        #[arg(long, default_value = "worktodo.txt")]
+        worktodo: PathBuf,
+        #[arg(long, default_value = "results.txt")]
+        results: PathBuf,
+        /// Upload the `.proof` files found here.
+        #[arg(long)]
+        proof_dir: Option<PathBuf>,
+        /// Work type to fetch (PRP, PRP_DC, LL_DC, ... or a number); none
+        /// fetches nothing.
+        #[arg(long)]
+        worktype: Option<String>,
+        /// Runnable lines to keep in the worktodo file.
+        #[arg(long, default_value_t = 2)]
+        ahead: usize,
+        /// Holds the session cookies and the sent and refused logs.
+        #[arg(long, default_value = "primenet")]
+        state_dir: PathBuf,
+    },
     /// Check that a reported factor divides 2^p - 1. Exit 0 when it does.
     CheckFactor {
         #[arg(long)]
@@ -1094,6 +1120,11 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
                 w.results.display()
             );
             commit_result(w, &a, None)?;
+            // Its checkpoints must not be adopted by a later line.
+            let ck = assignment_checkpoint(&w.checkpoint_dir, &a);
+            for f in [prev_path(&ck), ck] {
+                let _ = std::fs::remove_file(f);
+            }
             continue;
         }
         if a.wants_pm1() {
@@ -1238,19 +1269,49 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
         if let Some(n) = note {
             eprintln!("M{p}: {n}");
         }
-        let report = result.map_err(protocol_failure)?;
-        let code = exit_for(&report);
-        let Some(r) = report.result.as_ref().filter(|_| code == 0) else {
-            println!(
-                "M{p}: not completed ({}); the assignment stays, and the next session resumes it",
+        // A protocol error (mismatched or unreadable state, a missing proof
+        // point, a failed check) belongs to this assignment only.
+        let report = match result {
+            Ok(r) => r,
+            Err(e) => {
+                leave(&a, &e.to_string(), &mut skipped);
+                continue;
+            }
+        };
+        let r = match (&report.process, report.result.as_ref()) {
+            (ProcessState::Completed, Some(r))
+                if report.evidence.proof_stage != ProofStage::Interrupted =>
+            {
+                r
+            }
+            (ProcessState::Incomplete { reason, .. }, _) => {
+                println!("M{p}: not completed ({reason}); the assignment stays, and the next session resumes it");
+                return Ok(EXIT_INCOMPLETE);
+            }
+            _ => {
+                println!(
+                    "M{p}: not completed (stopped during the proof stage); the assignment stays"
+                );
+                return Ok(EXIT_INCOMPLETE);
+            }
+        };
+        // A proof that failed or was rejected is not reported; the result is,
+        // as upstream does.
+        let published = matches!(
+            report.evidence.proof_stage,
+            ProofStage::Verified | ProofStage::Generated
+        );
+        if !published && report.evidence.proof_stage != ProofStage::NotRequested {
+            eprintln!(
+                "M{p}: proof stage {}; reporting the result without a proof",
                 report.evidence.proof_stage.name()
             );
-            return Ok(if code == 0 { EXIT_INCOMPLETE } else { code });
-        };
+        }
         let proof_info = report
             .evidence
             .proof
             .as_ref()
+            .filter(|_| published)
             .map(|e| -> Result<wt::ProofInfo, Failure> {
                 Ok(wt::ProofInfo {
                     power: e.power,
@@ -1293,6 +1354,55 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
         done += 1;
         println!("M{p}: {:?} res64 {}", r.verdict, r.res64);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_primenet(
+    user: &str,
+    password_file: &Path,
+    worktodo: &Path,
+    results: &Path,
+    proof_dir: Option<PathBuf>,
+    worktype: Option<&str>,
+    ahead: usize,
+    state_dir: &Path,
+) -> Result<u8, Failure> {
+    use mersenne_forge::primenet as pn;
+    let code = worktype
+        .map(|w| pn::worktype_code(w).ok_or_else(|| fail(2, format!("unknown work type {w:?}"))))
+        .transpose()?;
+    let password = std::fs::read_to_string(password_file)
+        .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", password_file.display())))?;
+    let session = pn::Session::login(state_dir, user, password.trim_end_matches(['\r', '\n']))
+        .map_err(|e| fail(EXIT_EXECUTION, e))?;
+    let x = pn::Exchange {
+        results: results.to_path_buf(),
+        sent: state_dir.join("sent.txt"),
+        refused: state_dir.join("refused.txt"),
+        proof_dir,
+    };
+    let mut report = pn::exchange(&session, user, &x).map_err(|e| fail(EXIT_EXECUTION, e))?;
+    // The worktodo file is shared with `work`: fetch over the network
+    // first, then append each line under its lock.
+    if let Some(code) = code {
+        for _ in pn::runnable_lines(worktodo)..ahead {
+            let line = session
+                .fetch_assignment(code)
+                .map_err(|e| fail(EXIT_EXECUTION, e))?;
+            let _g = lck(worktodo)?;
+            pn::append_line(worktodo, &line).map_err(|e| fail(EXIT_STATE, e))?;
+            report.fetched.push(line);
+        }
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).expect("serializable")
+    );
+    Ok(if report.refused + report.upload_failed.len() > 0 {
+        EXIT_EXECUTION
+    } else {
+        0
+    })
 }
 
 fn cmd_bench(plan: &Path, output: &Path) -> Result<u8, Failure> {
@@ -1537,7 +1647,8 @@ fn main() -> ExitCode {
         | Cmd::BenchRender { .. }
         | Cmd::BenchAnalyze { .. }
         | Cmd::Work { .. }
-        | Cmd::Power { .. } => false,
+        | Cmd::Power { .. }
+        | Cmd::Primenet { .. } => false,
     };
     let _ = ctrlc::set_handler(|| {
         if STOP.swap(true, Ordering::SeqCst) {
@@ -1615,14 +1726,31 @@ fn main() -> ExitCode {
             proof_dir,
             proof_power,
         }),
-        Cmd::Power { source, device } => {
-            mersenne_forge::evidence::sample_power(&source, device)
-                .map(|w| {
-                    println!("{w:.3} W");
-                    0
-                })
-                .map_err(|e| fail(EXIT_UNSUPPORTED, e))
-        }
+        Cmd::Primenet {
+            user,
+            password_file,
+            worktodo,
+            results,
+            proof_dir,
+            worktype,
+            ahead,
+            state_dir,
+        } => cmd_primenet(
+            &user,
+            &password_file,
+            &worktodo,
+            &results,
+            proof_dir,
+            worktype.as_deref(),
+            ahead,
+            &state_dir,
+        ),
+        Cmd::Power { source, device } => mersenne_forge::evidence::sample_power(&source, device)
+            .map(|w| {
+                println!("{w:.3} W");
+                0
+            })
+            .map_err(|e| fail(EXIT_UNSUPPORTED, e)),
         Cmd::CheckFactor {
             exponent,
             factor,
