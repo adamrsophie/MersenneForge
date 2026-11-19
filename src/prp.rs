@@ -177,6 +177,8 @@ struct Engine<'b, B: Backend> {
     early: u64,
     step: u64,
     final_x: Option<Residue>,
+    /// x at k = n - 1, to show the terminal value is its square.
+    pre_final: Option<Residue>,
 }
 
 fn apply_fault<B: Backend>(be: &mut B, r: Reg, kind: FaultKind, ll: bool) -> Result<(), StepErr> {
@@ -243,6 +245,7 @@ impl<'b, B: Backend> Engine<'b, B> {
         self.skip_update = true;
         self.early = st.k + 2 * spec.block;
         self.final_x = None;
+        self.pre_final = None;
         Ok(ok && !st.x.is_zero())
     }
 
@@ -264,6 +267,13 @@ impl<'b, B: Backend> Engine<'b, B> {
         let mut next = round_up(k + 1, b).min(k.saturating_add(spec.max_batch));
         if k < spec.kend {
             next = next.min(spec.kend);
+        }
+        // Stop one squaring short of the terminal too: see the k = n check.
+        if k + 1 < spec.kend {
+            next = next.min(spec.kend - 1);
+        }
+        if k + 1 == spec.kend {
+            self.pre_final = Some(self.be.export(self.x)?);
         }
         if let Some(pt) = spec.proof.and_then(|s| s.schedule.next_after(k)) {
             next = next.min(pt);
@@ -300,6 +310,24 @@ impl<'b, B: Backend> Engine<'b, B> {
             if !self.be.equal(self.t, self.x)? {
                 return Err(StepErr::Fault(format!(
                     "the exported terminal residue at {k} differs from the resident value"
+                )));
+            }
+            // The Gerbicz check at the next block boundary covers only the
+            // squares of x_n, so x_n and -x_n would both pass it. -x_n is not
+            // a square modulo M_p (M_p = 3 mod 4), so require x_n to be the
+            // square of the exported x_(n-1).
+            let Some(y) = self.pre_final.take() else {
+                return Err(StepErr::Fault(format!(
+                    "x at {} was not recorded before the terminal residue",
+                    k - 1
+                )));
+            };
+            self.be.import(self.t, &y)?;
+            self.be.square(self.t, 1)?;
+            if !self.be.equal(self.t, self.x)? {
+                return Err(StepErr::Fault(format!(
+                    "the terminal residue at {k} is not the square of x at {}",
+                    k - 1
                 )));
             }
             self.final_x = Some(v);
@@ -381,6 +409,7 @@ fn run_engine<B: Backend>(
             early: 0,
             step: spec.rule.effective(spec.block, n_errors),
             final_x: None,
+            pre_final: None,
         };
         drive(&mut eng, from, n_errors, spec, ctl, on_verified, cnt)
     })
@@ -877,6 +906,7 @@ pub fn run_prp<B: Backend>(
     evidence.gerbicz_failed = cnt.failed;
     evidence.backend_faults = cnt.faults;
     evidence.rollbacks = cnt.rollbacks;
+    evidence.errors_total = u64::from(cnt.n_errors);
 
     let final_x = match end {
         End::Halted { k } => {
@@ -904,9 +934,18 @@ pub fn run_prp<B: Backend>(
     let result = final_result(p, &final_x);
     if let Some(store) = &store {
         let sw = Stopwatch::start();
+        let dir = cfg.proof_dir.as_deref().expect("store implies dir");
+        // The proof is written to a staging name, read back from disk, and
+        // published under its final name only after its terminal residue
+        // equals this run's and (when requested) it verifies. A proof that
+        // fails never replaces an earlier file of the same name.
         let generated = proof::generate(be, store, ctl).and_then(|pr| {
-            let path = pr.write(cfg.proof_dir.as_deref().expect("store implies dir"))?;
-            Ok((pr, path))
+            let staged = dir.join(format!("{}.staged", pr.file_name()));
+            crate::checkpoint::write_atomic(&staged, &pr.to_bytes(), false).map_err(|e| {
+                ProtocolError::Proof(proof::ProofError::Io(format!("{}: {e}", staged.display())))
+            })?;
+            let on_disk = proof::Proof::read(&staged, Some(p)).map_err(ProtocolError::Proof)?;
+            Ok((on_disk, staged))
         });
         timings.proof_generation = sw.secs();
         match generated {
@@ -917,19 +956,21 @@ pub fn run_prp<B: Backend>(
                 };
                 evidence.notes.push(format!("proof generation failed: {e}"));
             }
-            Ok((pr, path)) => {
+            Ok((pr, staged)) => {
                 let hashes = pr.hashes().iter().map(|h| format!("{h:016x}")).collect();
-                let (stage, self_verification) = if cfg.verify_proof {
+                let same_terminal = pr.b == final_x.to_proof_bytes();
+                let (stage, self_verification) = if !same_terminal {
+                    (
+                        ProofStage::Rejected,
+                        "rejected: the proof's terminal residue differs from the run's".into(),
+                    )
+                } else if cfg.verify_proof {
                     let sw = Stopwatch::start();
                     let v = proof::verify(be, &pr, ctl);
                     timings.proof_verification = sw.secs();
                     match v {
-                        Ok(v) if v.probable_prime == (result.verdict == Verdict::ProbablePrime) => {
-                            (ProofStage::Verified, "accepted".into())
-                        }
-                        Ok(_) | Err(ProtocolError::Proof(_)) => {
-                            (ProofStage::Rejected, "rejected".into())
-                        }
+                        Ok(_) => (ProofStage::Verified, "accepted".into()),
+                        Err(ProtocolError::Proof(_)) => (ProofStage::Rejected, "rejected".into()),
                         Err(e @ ProtocolError::Interrupted { .. }) => {
                             (ProofStage::Interrupted, format!("not completed: {e}"))
                         }
@@ -938,13 +979,42 @@ pub fn run_prp<B: Backend>(
                 } else {
                     (ProofStage::Generated, "not run".into())
                 };
-                evidence.proof_stage = stage;
-                evidence.proof = Some(ProofEvidence {
-                    path,
-                    power: pr.power(),
-                    self_verification,
-                    hashes,
-                });
+                let final_path = dir.join(pr.file_name());
+                if matches!(stage, ProofStage::Verified | ProofStage::Generated) {
+                    match std::fs::rename(&staged, &final_path)
+                        .and_then(|()| crate::checkpoint::sync_dir(&final_path))
+                    {
+                        Ok(()) => {
+                            evidence.proof_stage = stage;
+                            evidence.proof = Some(ProofEvidence {
+                                path: final_path,
+                                power: pr.power(),
+                                self_verification,
+                                hashes,
+                            });
+                        }
+                        Err(e) => {
+                            evidence.proof_stage = ProofStage::Failed;
+                            evidence.notes.push(format!(
+                                "the proof could not be published at {}: {e}; it stays at {}",
+                                final_path.display(),
+                                staged.display()
+                            ));
+                        }
+                    }
+                } else {
+                    evidence.notes.push(format!(
+                        "the proof was not published; the staged file {} is kept for inspection",
+                        staged.display()
+                    ));
+                    evidence.proof_stage = stage;
+                    evidence.proof = Some(ProofEvidence {
+                        path: staged,
+                        power: pr.power(),
+                        self_verification,
+                        hashes,
+                    });
+                }
             }
         }
         if evidence.proof_stage == ProofStage::Interrupted {

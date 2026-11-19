@@ -124,13 +124,24 @@ fn tmp_path(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Fsync the directory that contains `path`.
-fn sync_dir(path: &Path) -> std::io::Result<()> {
-    let dir = path
-        .parent()
-        .filter(|d| !d.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    fs::File::open(dir)?.sync_all()
+/// Fsync the directory that contains `path`, so a new or renamed entry in
+/// it is durable. Windows has no portable directory fsync (opening a
+/// directory needs a special flag); there renames are already journaled by
+/// NTFS, so this is a no-op.
+pub fn sync_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 /// `create_dir_all`, then fsync the parent of every directory it created,
@@ -164,11 +175,12 @@ pub fn write_atomic(path: &Path, bytes: &[u8], checkpoint_rotation: bool) -> std
     let (tmp, mut f) = (0..1000)
         .find_map(|_| {
             let tmp = tmp_path(path);
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)
-            {
+            let mut o = fs::OpenOptions::new();
+            o.write(true).create_new(true);
+            // Readable by the owner only until it takes the target's mode.
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+            match o.open(&tmp) {
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
                 r => Some(r.map(|f| (tmp, f))),
             }
@@ -179,9 +191,25 @@ pub fn write_atomic(path: &Path, bytes: &[u8], checkpoint_rotation: bool) -> std
                 format!("{}: no free temporary name", path.display()),
             ))
         })?;
-    // From here the file is ours: on any failure it is removed.
+    // From here the file is ours: on any failure it is removed. A file that
+    // replaces another keeps the other's permissions.
+    let keep_mode = fs::metadata(path).map(|m| m.permissions());
     let result = f
         .write_all(bytes)
+        .and_then(|()| match keep_mode {
+            Ok(perm) => f.set_permissions(perm),
+            Err(_) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    // A new file gets the usual mode under the umask.
+                    let umask = current_umask();
+                    f.set_permissions(fs::Permissions::from_mode(0o666 & !umask))
+                }
+                #[cfg(not(unix))]
+                Ok(())
+            }
+        })
         .and_then(|()| f.sync_all())
         .and_then(|()| publish(path, &tmp, checkpoint_rotation));
     drop(f);
@@ -191,12 +219,44 @@ pub fn write_atomic(path: &Path, bytes: &[u8], checkpoint_rotation: bool) -> std
     result
 }
 
+/// The process umask, read without changing it for longer than a moment.
+#[cfg(unix)]
+fn current_umask() -> u32 {
+    // There is no portable way to read the umask without setting it; the
+    // value is restored at once. Reading it from a fresh file avoids that.
+    let dir = std::env::temp_dir();
+    for n in 0..100u32 {
+        let probe = dir.join(format!(".mf-umask.{}.{n}", std::process::id()));
+        if let Ok(f) = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = f
+                .metadata()
+                .map(|m| m.permissions().mode())
+                .unwrap_or(0o644);
+            let _ = fs::remove_file(&probe);
+            return !mode & 0o666;
+        }
+    }
+    0o022
+}
+
 fn publish(path: &Path, tmp: &Path, checkpoint_rotation: bool) -> std::io::Result<()> {
     if checkpoint_rotation && path.exists() {
-        if Checkpoint::load_file(path).is_ok() {
-            fs::rename(path, prev_path(path))?;
-        } else {
-            fs::remove_file(path)?;
+        match Checkpoint::load_file(path) {
+            Ok(_) => fs::rename(path, prev_path(path))?,
+            // Proven damage: the file cannot be anyone's state.
+            Err(CheckpointError::Corrupt(_)) => fs::remove_file(path)?,
+            // A newer format or a file this process cannot read now may still
+            // be good: keep it under another name instead of deleting it.
+            Err(_) => {
+                let mut aside = path.as_os_str().to_owned();
+                aside.push(".unloadable");
+                fs::rename(path, aside)?;
+            }
         }
     }
     fs::rename(tmp, path)?;
@@ -273,7 +333,12 @@ impl Checkpoint {
         rest.try_reserve_exact(rest_len).map_err(|e| {
             CheckpointError::Io(format!("{}: cannot allocate: {e}", path.display()))
         })?;
-        f.read_to_end(&mut rest).map_err(io)?;
+        // Never more than one byte past the expected length, so a file that
+        // grows while it is read costs no more memory than the check allows.
+        (&mut f)
+            .take(rest_len as u64 + 1)
+            .read_to_end(&mut rest)
+            .map_err(io)?;
         if rest.len() != rest_len {
             return Err(corrupt("file changed while it was read"));
         }
@@ -302,11 +367,16 @@ impl Checkpoint {
         Ok(Checkpoint { meta, residues })
     }
 
-    /// Load `path`, falling back to `path.prev` when `path` is missing or
-    /// corrupt. Returns the checkpoint and the file actually used.
+    /// Load `path`, falling back to `path.prev` only when `path` is missing
+    /// or proven corrupt. Any other failure (a newer format, a read error)
+    /// is returned, so an older `.prev` never silently replaces a primary
+    /// that may still be good. Returns the checkpoint and the file used.
     pub fn load_latest(path: &Path) -> Result<(Checkpoint, PathBuf), CheckpointError> {
         match Checkpoint::load_file(path) {
             Ok(c) => Ok((c, path.to_path_buf())),
+            Err(first) if path.exists() && !matches!(first, CheckpointError::Corrupt(_)) => {
+                Err(first)
+            }
             Err(first) => {
                 let prev = prev_path(path);
                 match Checkpoint::load_file(&prev) {

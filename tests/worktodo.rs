@@ -27,6 +27,11 @@ fn upstream_line_forms() {
     assert_eq!(ok("PRP=118063003").aid, None);
     assert_eq!(ok("PRPDC=N/A,1,2,4423,-1,60,0").exponent, 4423);
     assert_eq!(ok("Test=,4423").exponent, 4423);
+    assert_eq!(ok("Test=1,2,4423,-1").exponent, 4423);
+    let a = ok("PRP=1,2,4423,-1,60,1.3");
+    assert_eq!((a.tf_bits, a.tests_saved), (Some(60.0), Some(1.3)));
+    assert!(a.wants_pm1());
+    assert!(!ok("PRP=1,2,4423,-1,60,0,3,1").wants_pm1());
     for skip in ["", "   ", "# comment"] {
         assert_eq!(parse_line(skip).unwrap(), None);
     }
@@ -39,6 +44,10 @@ fn upstream_line_forms() {
         "PRP=1,3,4423,-1", // base 3
         "PRP=4425",        // composite
         "Test=4423x",
+        "PRPDC=1,2,1279,-1,75,0,2,1",          // base 2
+        "PRP=1,2,1279,-1,75,0,3,5",            // residue type 5
+        "PRP=1,2,23,-1,75,0,3,5,\"47\"",       // known factors
+        "PRP=2",                               // base 3 needs p >= 3
         "garbage",
     ] {
         assert!(parse_line(bad).is_err(), "{bad}");
@@ -174,7 +183,14 @@ fn an_interrupted_assignment_resumes_in_the_next_session() {
         "{}",
         String::from_utf8_lossy(&o.stdout)
     );
-    assert!(dir.path().join("ckpt").join("M21701-prp.ckpt").exists());
+    let ckpts: Vec<String> = std::fs::read_dir(dir.path().join("ckpt"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        ckpts.iter().any(|n| n.starts_with("M21701-prp-") && n.ends_with(".ckpt")),
+        "{ckpts:?}"
+    );
     assert!(results(dir.path()).is_empty());
     let o = work(dir.path(), &[]);
     assert_eq!(
@@ -191,34 +207,52 @@ fn an_interrupted_assignment_resumes_in_the_next_session() {
     );
 }
 
-/// A checkpoint `work` did not write (here from `run`) is not adopted; the
-/// assignment stays and later assignments still run.
+/// An assignment this program must not run as given (here a PRP line that
+/// asks for P-1 first) stays in place, and later assignments still run.
 #[test]
-fn a_foreign_checkpoint_does_not_block_the_queue() {
+fn an_unrunnable_assignment_does_not_block_the_queue() {
     let dir = tempfile::tempdir().unwrap();
-    let ckpt = dir.path().join("ckpt");
-    let o = Command::new(env!("CARGO_BIN_EXE_mersenne-forge"))
-        .args([
-            "run",
-            "--test",
-            "ll",
-            "--exponent",
-            "21701",
-            "--budget",
-            "1s",
-        ])
-        .arg("--checkpoint-dir")
-        .arg(&ckpt)
-        .output()
-        .unwrap();
-    assert_eq!(o.status.code(), Some(3));
     let todo = dir.path().join("worktodo.txt");
-    std::fs::write(&todo, "Test=21701\nTest=127\n").unwrap();
+    std::fs::write(&todo, "PRP=1,2,1279,-1,60,1\nTest=127\n").unwrap();
     let o = work(dir.path(), &[]);
     assert_eq!(o.status.code(), Some(6));
-    assert!(String::from_utf8_lossy(&o.stderr).contains("was not written by `work`"));
-    assert_eq!(std::fs::read_to_string(&todo).unwrap(), "Test=21701\n");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("asks for P-1"));
+    assert_eq!(std::fs::read_to_string(&todo).unwrap(), "PRP=1,2,1279,-1,60,1\n");
     assert_eq!(results(dir.path())[0]["exponent"], 127);
+}
+
+/// Without an assignment ID, a second test of the same exponent is new work:
+/// only the completion journal marks a line done.
+#[test]
+fn a_double_check_without_an_id_still_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let todo = dir.path().join("worktodo.txt");
+    std::fs::write(&todo, "Test=127\n").unwrap();
+    assert_eq!(work(dir.path(), &[]).status.code(), Some(0));
+    std::fs::write(&todo, "DoubleCheck=127\n").unwrap();
+    assert_eq!(work(dir.path(), &[]).status.code(), Some(0));
+    assert_eq!(results(dir.path()).len(), 2);
+    // The same line again is recognized from the journal and not rerun.
+    std::fs::write(&todo, "DoubleCheck=127\n").unwrap();
+    assert_eq!(work(dir.path(), &[]).status.code(), Some(0));
+    assert_eq!(results(dir.path()).len(), 2);
+}
+
+#[test]
+fn work_refuses_paths_that_would_lose_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_mersenne-forge"))
+        .args(["work", "--worktodo", "w.txt", "--results", "w.txt", "--checkpoint-dir", "c"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    let o = Command::new(env!("CARGO_BIN_EXE_mersenne-forge"))
+        .args(["work", "--worktodo", "w.txt", "--results", "r.txt", "--checkpoint-dir", "c", "--proof-power", "2"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
 }
 
 #[test]

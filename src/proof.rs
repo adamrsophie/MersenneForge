@@ -22,8 +22,9 @@ use sha3::{Digest, Sha3_256};
 
 use crate::backend::{Backend, Reg};
 use crate::prp::{checked_power, CheckedPowerConfig};
-use crate::residue::{proof_byte_len, Residue};
+use crate::residue::{modulus, proof_byte_len, Residue};
 use crate::run::{with_regs, Control, ProtocolError};
+use num_bigint::BigUint;
 
 /// Largest proof power upstream accepts.
 pub const MAX_POWER: u32 = 13;
@@ -545,6 +546,18 @@ impl Proof {
         Residue::from_proof_bytes(self.p, &self.b).is_ok_and(|b| b == Residue::from_u64(self.p, 9))
     }
 
+    /// True when B is 9 or M_p - 9. The proof equation accepts B and -B
+    /// alike, and for these two values the sign decides the claim: one is
+    /// the probable prime residue, the other a composite one. Only a direct
+    /// recomputation of the terminal residue settles it.
+    pub fn sign_decides_claim(&self) -> bool {
+        Residue::from_proof_bytes(self.p, &self.b).is_ok_and(|b| {
+            let nine = BigUint::from(9u32);
+            let v = b.to_biguint();
+            v == nine || v + &nine == modulus(self.p)
+        })
+    }
+
     /// The hash chain exponents h_1..h_P.
     pub fn hashes(&self) -> Vec<u64> {
         let mut h = sha3_256(&[&self.b]);
@@ -699,6 +712,11 @@ pub fn verify_equation<B: Backend>(
         be.import(b, &res(&proof.b)?)?;
         let mut span = u64::from(p);
         for (i, mid) in proof.middles.iter().enumerate() {
+            // Each fold is up to 64 squarings per residue: honor a stop
+            // request or budget between folds.
+            if ctl.stop_requested() {
+                return Err(ProtocolError::Interrupted { k: i as u64 });
+            }
             be.import(m, &res(mid)?)?;
             let h = hashes[i];
             if span % 2 == 1 {

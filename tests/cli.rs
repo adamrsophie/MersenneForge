@@ -109,7 +109,7 @@ fn json_failures_are_json_objects() {
     assert_eq!(json(&o)["kind"], "usage");
     let o = cli(&["verify", "--proof", "/nonexistent/x.proof", "--json"]);
     assert_eq!(o.status.code(), Some(6));
-    assert_eq!(json(&o)["status"], "rejected");
+    assert_eq!(json(&o)["status"], "error");
 }
 
 #[test]

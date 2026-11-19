@@ -190,18 +190,49 @@ pub struct PowerRecord {
     pub span_secs: f64,
 }
 
-fn read_watts(argv: &[String]) -> Option<f64> {
-    let o = std::process::Command::new(&argv[0])
+/// One power reading: run the sensor command for at most `limit`, read at
+/// most 4 KiB of its output, and take the first number in it. A sensor that
+/// hangs, fails, or prints no finite nonnegative number gives None.
+fn read_watts(argv: &[String], limit: Duration) -> Option<f64> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(&argv[0])
         .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
+        .spawn()
         .ok()?;
-    if !o.status.success() {
+    let mut out = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = (&mut out).take(4096).read_to_end(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let text = reader.join().ok()?;
+    if !status?.success() {
         return None;
     }
-    String::from_utf8_lossy(&o.stdout)
-        .split(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == 'e' || c == 'E'))
-        .find_map(|t| t.parse::<f64>().ok())
+    parse_watts(&String::from_utf8_lossy(&text))
+}
+
+/// The first number in `text`, including signed exponents (1.2e+03).
+fn parse_watts(text: &str) -> Option<f64> {
+    let num = |c: char| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E');
+    text.split(|c: char| !num(c))
+        .filter(|t| t.chars().any(|c| c.is_ascii_digit()))
+        .find_map(|t| t.trim_start_matches('+').parse::<f64>().ok())
         .filter(|w| w.is_finite() && *w >= 0.0)
 }
 
@@ -223,16 +254,24 @@ impl Sampler {
         let handle = std::thread::spawn(move || {
             let t0 = Instant::now();
             let mut v = Vec::new();
+            // A reading may take at most ten intervals, and at least 1 s.
+            let limit = (every * 10).max(Duration::from_secs(1));
             let sample = |v: &mut Vec<PowerSample>| {
                 v.push(PowerSample {
                     t_secs: t0.elapsed().as_secs_f64(),
-                    watts: read_watts(&argv),
+                    watts: read_watts(&argv, limit),
                 })
             };
             'outer: loop {
+                if flag.load(Ordering::SeqCst) {
+                    break;
+                }
                 sample(&mut v);
+                // The next tick after now: ticks missed by a slow sensor are
+                // skipped, not queued.
+                let ticks = (t0.elapsed().as_nanos() / every.as_nanos().max(1)) as u32 + 1;
+                let next = t0 + every * ticks;
                 // Wait in short steps so a finished workload is not delayed.
-                let next = t0 + every.mul_f64(v.len() as f64);
                 while Instant::now() < next {
                     if flag.load(Ordering::SeqCst) {
                         break 'outer;
@@ -325,6 +364,13 @@ pub fn analyze(
     if baseline == candidate {
         return Err("baseline and candidate are the same entry".into());
     }
+    if out.schema_version > crate::bench::SCHEMA_VERSION {
+        return Err(format!(
+            "schema version {} is newer than this build reads ({})",
+            out.schema_version,
+            crate::bench::SCHEMA_VERSION
+        ));
+    }
     let measured = |i: usize| -> Vec<&Observation> {
         out.observations
             .iter()
@@ -332,6 +378,15 @@ pub fn analyze(
             .collect()
     };
     let (base, cand) = (measured(baseline), measured(candidate));
+    for (what, v) in [("baseline", &base), ("candidate", &cand)] {
+        let mut seen = std::collections::HashSet::new();
+        if let Some(o) = v.iter().find(|o| !seen.insert(o.repeat)) {
+            return Err(format!(
+                "the {what} has more than one measured observation for repeat {}",
+                o.repeat
+            ));
+        }
+    }
     let cost = |v: &[&Observation]| {
         let not_done: Vec<_> = v
             .iter()
@@ -347,20 +402,47 @@ pub fn analyze(
     };
     let mut ratios = Vec::new();
     let mut pairs = Vec::new();
+    let mut disagreements = 0usize;
     for b in &base {
         let Some(c) = cand.iter().find(|c| c.repeat == b.repeat) else {
             continue;
         };
-        let usable = b.status == "completed" && c.status == "completed";
+        // A pair compares the same work: the same test and exponent where
+        // both record them, the same result where both have one, and for
+        // energy the same sensor scope.
+        let both = |x: &Option<String>, y: &Option<String>| match (x, y) {
+            (Some(x), Some(y)) => x == y,
+            _ => true,
+        };
+        let same_work = both(&b.test, &c.test)
+            && match (b.exponent, c.exponent) {
+                (Some(x), Some(y)) => x == y,
+                _ => true,
+            };
+        let same_result = both(&b.verdict, &c.verdict) && both(&b.res64, &c.res64);
+        let same_scope = metric != "energy_joules"
+            || matches!((&b.power, &c.power), (Some(x), Some(y)) if x.scope == y.scope);
+        let excluded = if b.status != "completed" || c.status != "completed" {
+            Some("not both completed")
+        } else if !same_work {
+            Some("different workloads")
+        } else if !same_result {
+            disagreements += 1;
+            Some("results disagree")
+        } else if !same_scope {
+            Some("different power scopes")
+        } else {
+            None
+        };
         let (vb, vc) = (metric_value(b, metric), metric_value(c, metric));
-        let ratio = match (usable, vb, vc) {
-            (true, Some(x), Some(y)) if x > 0.0 => Some(y / x),
+        let ratio = match (excluded, vb, vc) {
+            (None, Some(x), Some(y)) if x > 0.0 => Some(y / x),
             _ => None,
         };
         if let Some(r) = ratio {
             ratios.push(r);
         }
-        pairs.push(serde_json::json!({"repeat": b.repeat, "baseline": vb, "candidate": vc, "ratio": ratio}));
+        pairs.push(serde_json::json!({"repeat": b.repeat, "baseline": vb, "candidate": vc, "ratio": ratio, "excluded": excluded}));
     }
     let median = |v: &mut Vec<f64>| -> Option<f64> {
         if v.is_empty() {
@@ -400,6 +482,7 @@ pub fn analyze(
         "candidate": {"index": candidate, "name": name(candidate), "cost": cost(&cand)},
         "pairs": pairs,
         "usable_pairs": ratios.len(),
+        "result_disagreements": disagreements,
         "median_ratio": median(&mut sorted),
         "bootstrap": {"interval_95": interval, "resamples": resamples, "seed": seed},
         "note": if ratios.len() < 5 {
@@ -466,6 +549,15 @@ mod tests {
             integrate(&spec(), vec![s(0.0, Some(5.0))]).energy_joules,
             None
         );
+    }
+
+    #[test]
+    fn power_readings_parse_signed_exponents() {
+        assert_eq!(parse_watts("1.2e+03 W"), Some(1200.0));
+        assert_eq!(parse_watts("power: 12.5 W"), Some(12.5));
+        assert_eq!(parse_watts("5e-1"), Some(0.5));
+        assert_eq!(parse_watts("-3 W"), None);
+        assert_eq!(parse_watts("none"), None);
     }
 
     #[test]

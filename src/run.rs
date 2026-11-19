@@ -298,6 +298,10 @@ pub struct Evidence {
     pub backend_faults: u64,
     /// Rollbacks to the last verified state.
     pub rollbacks: u64,
+    /// Failed checks and backend faults over the whole run, earlier sessions
+    /// (from the checkpoint) included. Result lines report this count.
+    #[serde(default)]
+    pub errors_total: u64,
     pub proof: Option<ProofEvidence>,
     /// PRP: what happened to the requested proof, separately from the result.
     pub proof_stage: ProofStage,

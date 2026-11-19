@@ -23,7 +23,7 @@ pub enum WorkKind {
 }
 
 /// One runnable assignment line.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Assignment {
     pub kind: WorkKind,
     pub exponent: u32,
@@ -31,19 +31,51 @@ pub struct Assignment {
     pub aid: Option<String>,
     /// The line as written, without its line ending.
     pub line: String,
+    /// PRP: trial factoring depth in bits, when the line gives it.
+    #[serde(default)]
+    pub tf_bits: Option<f64>,
+    /// PRP: primality tests a factor would save. Above 0, the assigner
+    /// wants P-1 before the test, as upstream decides from these fields.
+    #[serde(default)]
+    pub tests_saved: Option<f64>,
 }
+
+impl Assignment {
+    /// True when the line asks for P-1 factoring before the PRP test.
+    pub fn wants_pm1(&self) -> bool {
+        self.kind == WorkKind::Prp && self.tests_saved.is_some_and(|t| t > 0.0)
+    }
+
+    /// The result `worktype` this assignment produces.
+    pub fn worktype(&self) -> &'static str {
+        match self.kind {
+            WorkKind::Prp => "PRP-3",
+            WorkKind::Ll => "LL",
+        }
+    }
+}
+
+/// Longest assignment line accepted; longer lines are refused, so a stored
+/// assignment always fits checkpoint metadata.
+pub const MAX_LINE: usize = 1024;
 
 /// Parse one worktodo line. `Ok(None)` for blank lines and `#` comments;
 /// `Err` for anything this program cannot run, which stays in the file.
 ///
-/// Accepted, as upstream: `PRP=` and `PRPDC=` with `[AID,]1,2,p,-1,...` or a
-/// bare `[AID,]p`; `Test=` and `DoubleCheck=` with `[AID,]p,...`. An empty
-/// or `N/A` first field is skipped. Other forms (k*2^n+c, P-1, CERT) and
-/// composite exponents are refused rather than run as something else.
+/// Accepted, as upstream: `PRP=` and `PRPDC=` with
+/// `[AID,]1,2,p,-1[,tf_bits,tests_saved[,base,residue_type]]` or a bare
+/// `[AID,]p`; `Test=` and `DoubleCheck=` with `[AID,]1,2,p,-1[,...]` or
+/// `[AID,]p[,...]`. An empty or `N/A` first field is skipped. Refused and
+/// left in place: other number forms (k*2^n+c), PRP bases other than 3,
+/// residue types other than 1, lines with known factors (cofactor tests),
+/// P-1 and CERT lines, composite exponents, and PRP of M2.
 pub fn parse_line(raw: &str) -> Result<Option<Assignment>, String> {
     let line = raw.trim_end_matches(['\r', '\n']);
     if line.trim().is_empty() || line.starts_with('#') {
         return Ok(None);
+    }
+    if line.len() > MAX_LINE {
+        return Err(format!("line longer than {MAX_LINE} bytes"));
     }
     let (kind, rest) = line
         .split_once('=')
@@ -53,7 +85,7 @@ pub fn parse_line(raw: &str) -> Result<Option<Assignment>, String> {
         "Test" | "DoubleCheck" => WorkKind::Ll,
         other => return Err(format!("unsupported work type {other:?}: {line:?}")),
     };
-    let mut parts: Vec<&str> = rest.split(',').collect();
+    let mut parts: Vec<&str> = rest.split(',').map(str::trim).collect();
     if parts.first().is_some_and(|f| f.is_empty() || *f == "N/A") {
         parts.remove(0);
     }
@@ -64,52 +96,165 @@ pub fn parse_line(raw: &str) -> Result<Option<Assignment>, String> {
     {
         aid = Some(parts.remove(0).to_string());
     }
+    let refuse = |why: &str| Err(format!("{why}: {line:?}"));
     let mersenne = parts.len() >= 4 && parts[0] == "1" && parts[1] == "2" && parts[3] == "-1";
     let field = match kind {
-        WorkKind::Prp if mersenne => parts[2],
+        _ if mersenne => parts[2],
         WorkKind::Prp if parts.len() == 1 => parts[0],
-        WorkKind::Ll if !parts.is_empty() => parts[0],
-        _ => return Err(format!("not a Mersenne PRP line: {line:?}")),
+        WorkKind::Ll if !parts.is_empty() && !parts[0].contains('.') => parts[0],
+        _ => return refuse("not a Mersenne number line"),
     };
+    let (mut tf_bits, mut tests_saved) = (None, None);
+    if kind == WorkKind::Prp && mersenne {
+        let num = |i: usize| -> Result<Option<f64>, String> {
+            parts
+                .get(i)
+                .map(|t| {
+                    t.parse::<f64>()
+                        .ok()
+                        .filter(|x| x.is_finite() && *x >= 0.0)
+                        .ok_or_else(|| format!("bad field {t:?}: {line:?}"))
+                })
+                .transpose()
+        };
+        tf_bits = num(4)?;
+        tests_saved = num(5)?;
+        if let Some(b) = parts.get(6) {
+            if *b != "3" {
+                return refuse("only PRP base 3 is supported");
+            }
+        }
+        if let Some(t) = parts.get(7) {
+            if *t != "1" {
+                return refuse("only PRP residue type 1 is supported");
+            }
+        }
+        if parts.len() > 8 {
+            return refuse("PRP of a cofactor (known factors) is not supported");
+        }
+    }
     let p: u32 = field
         .parse()
         .map_err(|_| format!("bad exponent {field:?}: {line:?}"))?;
     crate::exponent::validate(p).map_err(|e| format!("{e}: {line:?}"))?;
+    if kind == WorkKind::Prp && p < 3 {
+        return refuse("base 3 PRP needs p >= 3");
+    }
     Ok(Some(Assignment {
         kind,
         exponent: p,
         aid,
         line: line.to_string(),
+        tf_bits,
+        tests_saved,
     }))
+}
+
+/// PrimeNet's numeric code for this platform, as upstream writes `port`.
+pub fn port_code() -> u32 {
+    let wide = cfg!(target_pointer_width = "64");
+    match std::env::consts::OS {
+        "windows" => {
+            if wide {
+                4
+            } else {
+                1
+            }
+        }
+        "linux" => {
+            if wide {
+                8
+            } else {
+                2
+            }
+        }
+        "macos" => {
+            if wide {
+                10
+            } else {
+                9
+            }
+        }
+        "freebsd" => {
+            if wide {
+                12
+            } else {
+                6
+            }
+        }
+        _ => 0,
+    }
 }
 
 /// MD5 (RFC 1321), used only because the result format names the proof file
 /// by its MD5. Not used for integrity anywhere in this program.
-pub fn md5(data: &[u8]) -> [u8; 16] {
-    const S: [u32; 64] = [
-        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
-        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
-        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
-    ];
-    let k: Vec<u32> = (0..64)
-        .map(|i| ((i as f64 + 1.0).sin().abs() * 4_294_967_296.0) as u32)
-        .collect();
-    let mut st: [u32; 4] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
-    let mut msg = data.to_vec();
-    let bits = (data.len() as u64).wrapping_mul(8);
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
+pub struct Md5 {
+    st: [u32; 4],
+    buf: Vec<u8>,
+    len: u64,
+}
+
+impl Default for Md5 {
+    fn default() -> Md5 {
+        Md5 {
+            st: [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476],
+            buf: Vec::with_capacity(64),
+            len: 0,
+        }
     }
-    msg.extend_from_slice(&bits.to_le_bytes());
-    for chunk in msg.as_chunks::<64>().0 {
+}
+
+impl Md5 {
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.len = self.len.wrapping_add(data.len() as u64);
+        if !self.buf.is_empty() {
+            let take = (64 - self.buf.len()).min(data.len());
+            self.buf.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if self.buf.len() == 64 {
+                let block: [u8; 64] = self.buf[..].try_into().expect("64");
+                self.block(&block);
+                self.buf.clear();
+            }
+        }
+        let (blocks, rest) = data.as_chunks::<64>();
+        for b in blocks {
+            self.block(b);
+        }
+        self.buf.extend_from_slice(rest);
+    }
+
+    pub fn finish(mut self) -> [u8; 16] {
+        let bits = self.len.wrapping_mul(8);
+        let mut tail = vec![0x80u8];
+        while (self.buf.len() + tail.len()) % 64 != 56 {
+            tail.push(0);
+        }
+        tail.extend_from_slice(&bits.to_le_bytes());
+        let len = self.len;
+        self.update(&tail);
+        self.len = len;
+        debug_assert!(self.buf.is_empty());
+        let mut out = [0u8; 16];
+        for (i, w) in self.st.iter().enumerate() {
+            out[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        out
+    }
+
+    fn block(&mut self, chunk: &[u8; 64]) {
+        const S: [u32; 64] = [
+            7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20,
+            5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+            6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+        ];
         let m: Vec<u32> = chunk
             .as_chunks::<4>()
             .0
             .iter()
             .map(|w| u32::from_le_bytes(*w))
             .collect();
-        let [mut a, mut b, mut c, mut d] = st;
+        let [mut a, mut b, mut c, mut d] = self.st;
         for i in 0..64 {
             let (f, g) = match i / 16 {
                 0 => ((b & c) | (!b & d), i),
@@ -117,32 +262,45 @@ pub fn md5(data: &[u8]) -> [u8; 16] {
                 2 => (b ^ c ^ d, (3 * i + 5) % 16),
                 _ => (c ^ (b | !d), (7 * i) % 16),
             };
+            let k = ((i as f64 + 1.0).sin().abs() * 4_294_967_296.0) as u32;
             let t = d;
             d = c;
             c = b;
             b = b.wrapping_add(
                 a.wrapping_add(f)
-                    .wrapping_add(k[i])
+                    .wrapping_add(k)
                     .wrapping_add(m[g])
                     .rotate_left(S[i]),
             );
             a = t;
         }
-        for (s, v) in st.iter_mut().zip([a, b, c, d]) {
+        for (s, v) in self.st.iter_mut().zip([a, b, c, d]) {
             *s = s.wrapping_add(v);
         }
     }
-    let mut out = [0u8; 16];
-    for (i, w) in st.iter().enumerate() {
-        out[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
-    }
-    out
 }
 
-/// Lowercase hex MD5 of a file, as upstream writes it.
+/// MD5 of a byte string.
+pub fn md5(data: &[u8]) -> [u8; 16] {
+    let mut h = Md5::default();
+    h.update(data);
+    h.finish()
+}
+
+/// Lowercase hex MD5 of a file, as upstream writes it, read in 64 KiB pieces.
 pub fn file_md5(path: &std::path::Path) -> std::io::Result<String> {
-    let b = std::fs::read(path)?;
-    Ok(md5(&b).iter().map(|x| format!("{x:02x}")).collect())
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut h = Md5::default();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(h.finish().iter().map(|x| format!("{x:02x}")).collect())
 }
 
 /// UTC "YYYY-MM-DD HH:MM:SS" for seconds since 1970 (proleptic Gregorian).
@@ -177,7 +335,10 @@ pub struct ProofInfo {
 /// file, with this program's name. Fields upstream writes that this program
 /// has no counterpart for (`fft-type`, `fft-length`, `user`, `uid`) are
 /// left out rather than invented. LL lines keep upstream's `shift-count` 0
-/// and `error-code` "00000000".
+/// and `error-code` "00000000". `program.port` is PrimeNet's numeric
+/// platform code, as upstream writes it; the backend is a separate
+/// `program.backend` field. Error counts cover the whole run, earlier
+/// sessions included.
 pub fn result_line(
     a: &Assignment,
     r: &MathResult,
@@ -200,7 +361,7 @@ pub fn result_line(
             put("res64", r.res64.clone().into());
             put("res2048", r.res2048.clone().into());
             put("residue-type", 1.into());
-            put("errors", serde_json::json!({"gerbicz": ev.gerbicz_failed}));
+            put("errors", serde_json::json!({"gerbicz": ev.errors_total}));
             if let Some(pr) = proof {
                 // Upstream writes version 1 here for its version 2 files.
                 put(
@@ -214,8 +375,8 @@ pub fn result_line(
             put("res64", r.res64.clone().into());
             put("shift-count", 0.into());
             put("error-code", "00000000".into());
-            if ev.jacobi_failed > 0 {
-                put("errors", serde_json::json!({"jacobi": ev.jacobi_failed}));
+            if ev.errors_total > 0 {
+                put("errors", serde_json::json!({"jacobi": ev.errors_total}));
             }
         }
     }
@@ -224,7 +385,8 @@ pub fn result_line(
         serde_json::json!({
             "name": "mersenne-forge",
             "version": env!("CARGO_PKG_VERSION"),
-            "port": backend,
+            "port": port_code(),
+            "backend": backend,
             "os": {"os": std::env::consts::OS, "architecture": std::env::consts::ARCH},
         }),
     );
@@ -257,11 +419,15 @@ pub fn free_bytes(dir: &std::path::Path) -> Option<u64> {
     kib.checked_mul(1024)
 }
 
-/// Disk bytes a PRP proof at `power` needs at its peak: the proof points
-/// plus the proof file (power + 1 residues and a short header).
+/// Disk bytes a PRP proof at `power` needs at its peak: 2^power proof point
+/// files (their exact encoded size, each rounded up to a 4 KiB allocation
+/// unit), the staged proof file (power + 1 residues and a header), and room
+/// for one temporary copy of the largest file being replaced.
 pub fn proof_disk_need(p: u32, power: u32) -> u64 {
-    let residue = crate::residue::proof_byte_len(p) as u64;
-    crate::proof::disk_usage_bytes(p, power) + residue * (u64::from(power) + 1) + 4096
+    let block = |n: u64| n.div_ceil(4096) * 4096;
+    let point = block(16 + 4 + 8 + 4 * crate::residue::limb_count(p) as u64 + 32);
+    let proof = block(200 + crate::residue::proof_byte_len(p) as u64 * (u64::from(power) + 1));
+    (1u64 << power) * point + proof + proof.max(point)
 }
 
 /// Why a reported factor was accepted or refused.

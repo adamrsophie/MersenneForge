@@ -162,6 +162,7 @@ pub fn run_ll<B: Backend>(
     let config_json = serde_json::to_value(cfg).expect("config serializes");
     let kend = u64::from(p) - 2;
     let s0 = Residue::from_u64(p, 4);
+    let prior_errors = resume.map_or(0, |ck| u64::from(ck.meta.n_errors));
     let (mut k, start_s, mut verified, elapsed_before) = match resume {
         None => (0, s0.clone(), (0u64, s0), 0.0),
         Some(ck) => {
@@ -253,7 +254,23 @@ pub fn run_ll<B: Backend>(
                             failed = Some(None);
                         }
                         Err(e) => return Err(e.into()),
-                        Ok(v) if k == kend && !same_as_resident(be, &v, s, spare)? => {
+                        // Every export that can become a rollback anchor, a
+                        // checkpoint, or the result must equal the resident
+                        // value: a copy damaged in transfer could otherwise
+                        // pass the Jacobi check and be saved as verified.
+                        Ok(v) if !same_as_resident(be, &v, s, spare)? => {
+                            ev.backend_faults += 1;
+                            failed = Some(None);
+                        }
+                        // A zero terminal residue claims M_p prime. A fault
+                        // that zeroes the register right at the end passes
+                        // the Jacobi check ((-2 | M_p) = -1), so replay the
+                        // last interval from the anchor and require zero.
+                        Ok(v)
+                            if k == kend
+                                && v.is_zero()
+                                && !replay_is_zero(be, spare, &verified, kend, cfg.max_batch)? =>
+                        {
                             ev.backend_faults += 1;
                             failed = Some(None);
                         }
@@ -322,6 +339,7 @@ pub fn run_ll<B: Backend>(
             }
             let v = data.expect("a log step without failure has data");
             if k == kend {
+                ev.errors_total = prior_errors + ev.jacobi_failed + ev.backend_faults;
                 let prime = v.is_zero();
                 ev.notes.push(
                     "the Jacobi check catches about half of all errors; it is not a Gerbicz check"
@@ -363,7 +381,7 @@ pub fn run_ll<B: Backend>(
                             "provisional".into()
                         },
                         verified_k: verified.0,
-                        n_errors: (ev.jacobi_failed + ev.backend_faults) as u32,
+                        n_errors: (prior_errors + ev.jacobi_failed + ev.backend_faults) as u32,
                         proof_durable_through: None,
                         backend: be.identity(),
                         config: config_json.clone(),
@@ -384,6 +402,7 @@ pub fn run_ll<B: Backend>(
                 };
             }
         };
+        ev.errors_total = prior_errors + ev.jacobi_failed + ev.backend_faults;
         Ok(RunReport {
             process: outcome,
             result: None,
@@ -397,6 +416,32 @@ pub fn run_ll<B: Backend>(
 /// into `spare` and compared there). The final residue is reported from the
 /// host copy, so it must be the value the checks covered. A detected fault
 /// counts as a mismatch.
+/// Recompute s_kend from the anchor in `spare` and report whether it is 0.
+fn replay_is_zero<B: Backend>(
+    be: &mut B,
+    spare: crate::backend::Reg,
+    anchor: &(u64, Residue),
+    kend: u64,
+    max_batch: u64,
+) -> Result<bool, ProtocolError> {
+    let run = |be: &mut B| -> Result<Residue, BackendError> {
+        be.import(spare, &anchor.1)?;
+        let mut k = anchor.0;
+        while k < kend {
+            let n = (kend - k).min(max_batch.max(1));
+            be.ll_step(spare, n)?;
+            k += n;
+        }
+        be.sync()?;
+        be.export(spare)
+    };
+    match run(be) {
+        Ok(r) => Ok(r.is_zero()),
+        Err(BackendError::Fault(_)) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn same_as_resident<B: Backend>(
     be: &mut B,
     v: &Residue,

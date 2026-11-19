@@ -28,7 +28,10 @@ use mersenne_forge::run::{Control, ProofStage};
 /// proof as verified and exits successfully. Upstream logs
 /// `proof '<file>' verified` or `... failed`, and a failed proof ends the run
 /// with an error.
-fn upstream_accepts(verifier: &str, proof: &Path, dir: &Path) -> bool {
+/// Some(true) accepted, Some(false) explicitly rejected (normal exit with a
+/// nonzero code), None for anything else (a signal, or exit 0 without the
+/// acceptance text), which is neither.
+fn upstream_verdict(verifier: &str, proof: &Path, dir: &Path) -> Option<bool> {
     let out = Command::new(verifier)
         .arg("-verify")
         .arg(proof)
@@ -41,7 +44,11 @@ fn upstream_accepts(verifier: &str, proof: &Path, dir: &Path) -> bool {
         String::from_utf8_lossy(&out.stderr)
     );
     println!("{text}");
-    out.status.success() && text.contains("' verified")
+    match (out.status.code(), text.contains("' verified")) {
+        (Some(0), true) => Some(true),
+        (Some(c), false) if c != 0 => Some(false),
+        _ => None,
+    }
 }
 
 #[test]
@@ -72,7 +79,7 @@ fn upstream_verifier_accepts_our_proof() {
     let proof = r.evidence.proof.unwrap().path;
 
     assert!(
-        upstream_accepts(&verifier, &proof, dir.path()),
+        upstream_verdict(&verifier, &proof, dir.path()) == Some(true),
         "the upstream verifier did not accept {}",
         proof.display()
     );
@@ -85,7 +92,7 @@ fn upstream_verifier_accepts_our_proof() {
     ));
     std::fs::write(&bad, &bytes).unwrap();
     assert!(
-        !upstream_accepts(&verifier, &bad, dir.path()),
-        "the upstream verifier accepted a corrupted proof"
+        upstream_verdict(&verifier, &bad, dir.path()) == Some(false),
+        "the upstream verifier did not explicitly reject a corrupted proof"
     );
 }

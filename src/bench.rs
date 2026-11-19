@@ -83,8 +83,14 @@ pub struct ExternalVerification {
     pub altered_stdout: PathBuf,
     pub altered_stderr: PathBuf,
     pub secs: f64,
+    /// How the run on the altered copy ended: "rejected" (exited normally
+    /// with a nonzero code and without the acceptance text), "accepted",
+    /// "timeout", "stopped", "signal", or "unrecognized" (exit 0 without
+    /// the acceptance text).
+    #[serde(default)]
+    pub altered_outcome: String,
     /// "verified" only when the proof was accepted and the altered copy
-    /// rejected; otherwise "failed".
+    /// explicitly rejected; otherwise "failed".
     pub status: String,
 }
 
@@ -190,6 +196,13 @@ impl Plan {
                             ))
                         }
                     };
+                    if test == "ll"
+                        && (options.proof_power.is_some() || options.verify_proof.is_some())
+                    {
+                        return Err(format!(
+                            "{name}: LL has no proof; proof options apply to PRP"
+                        ));
+                    }
                     let proof = test == "prp" && options.proof_power.is_some();
                     if production && test == "prp" && !proof {
                         return Err(format!("{name}: production PRP entries need proof_power"));
@@ -536,8 +549,21 @@ fn engine_run(
 }
 
 /// Run the external verifier on `proof`, then on an altered copy of it.
-/// One verifier invocation: argv, exit code, accepted, stdout and stderr paths.
-type VerifierRun = (Vec<String>, Option<i32>, bool, PathBuf, PathBuf);
+/// One verifier invocation: argv, exit code, outcome, stdout and stderr paths.
+type VerifierRun = (Vec<String>, Option<i32>, &'static str, PathBuf, PathBuf);
+
+/// The program `name` names: itself when it contains a path separator,
+/// otherwise the first executable file of that name on PATH, as the
+/// process spawner would find it.
+pub fn resolve_program(name: &str) -> Option<PathBuf> {
+    let p = Path::new(name);
+    if p.components().count() > 1 {
+        return Some(p.to_path_buf());
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|d| d.join(name))
+        .find(|c| c.is_file())
+}
 
 fn verify_externally(
     v: &ExternalVerifier,
@@ -557,12 +583,16 @@ fn verify_externally(
         .ok_or("proof file is too short")?;
     bytes[at] ^= 1;
     fs::write(&altered, &bytes).map_err(|e| format!("{}: {e}", altered.display()))?;
+    // Resolve the program once, so the file hashed is the file run.
+    let program = resolve_program(&v.argv[0])
+        .ok_or_else(|| format!("verifier program {:?} not found", v.argv[0]))?;
     let run = |file: &Path, tag: &str| -> Result<VerifierRun, String> {
-        let argv: Vec<String> = v
+        let mut argv: Vec<String> = v
             .argv
             .iter()
             .map(|a| a.replace("{proof}", &file.display().to_string()))
             .collect();
+        argv[0] = program.display().to_string();
         let (out, err) = (
             captures.with_extension(format!("{tag}.stdout")),
             captures.with_extension(format!("{tag}.stderr")),
@@ -570,21 +600,34 @@ fn verify_externally(
         let obs = external_run(&argv, None, v.timeout_secs, stop, (&out, &err))?;
         let text = fs::read_to_string(&out).unwrap_or_default()
             + &fs::read_to_string(&err).unwrap_or_default();
-        let accepted = obs.status == "completed" && text.contains(&v.accept_text);
-        Ok((argv, obs.exit_code, accepted, out, err))
+        let says_accepted = text.contains(&v.accept_text);
+        let outcome = match (obs.status.as_str(), obs.exit_code, obs.error.as_deref()) {
+            ("completed", _, _) if says_accepted => "accepted",
+            ("completed", _, _) => "unrecognized",
+            (_, None, Some("timeout")) => "timeout",
+            (_, None, Some("stop requested")) => "stopped",
+            (_, None, _) => "signal",
+            (_, Some(_), _) if says_accepted => "accepted",
+            (_, Some(_), _) => "rejected",
+        };
+        Ok((argv, obs.exit_code, outcome, out, err))
     };
-    let (argv, exit_code, accepted, stdout, stderr) = run(proof, "verify")?;
-    let (_, altered_exit_code, altered_accepted, altered_stdout, altered_stderr) =
+    let (argv, exit_code, outcome, stdout, stderr) = run(proof, "verify")?;
+    let accepted = outcome == "accepted" && exit_code == Some(0);
+    let (_, altered_exit_code, altered_outcome, altered_stdout, altered_stderr) =
         run(&altered, "verify-altered")?;
-    let ok = accepted && !altered_accepted;
+    // A timeout, crash, or unrecognized output on the altered copy is not a
+    // rejection: only an explicit refusal counts.
+    let altered_rejected = altered_outcome == "rejected";
+    let ok = accepted && altered_rejected;
     Ok(ExternalVerification {
-        verifier_sha3: crate::evidence::file_sha3(Path::new(&v.argv[0]))
-            .unwrap_or_else(|_| "unknown".into()),
+        verifier_sha3: crate::evidence::file_sha3(&program).unwrap_or_else(|_| "unknown".into()),
         argv,
         exit_code,
         accepted,
         altered_exit_code,
-        altered_rejected: !altered_accepted,
+        altered_rejected,
+        altered_outcome: altered_outcome.into(),
         stdout,
         stderr,
         altered_stdout,
@@ -648,9 +691,11 @@ fn external_run(
     let deadline = timeout
         .map(|t| deadline_after(start, "timeout_secs", t))
         .transpose()?;
+    // The child leads its own process group, so a timeout or stop request
+    // ends the whole tree it started, not only the direct child.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = cmd.spawn().map_err(|e| format!("{prog}: {e}"))?;
-    // Only the direct child is killed on a timeout or stop request; its own
-    // descendants are not tracked.
     let mut stopped = false;
     let status = loop {
         if let Some(s) = child.try_wait().map_err(|e| e.to_string())? {
@@ -658,8 +703,7 @@ fn external_run(
         }
         stopped = stop.is_some_and(|s| s.load(Ordering::SeqCst));
         if stopped || deadline.is_some_and(|d| Instant::now() >= d) {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_tree(&mut child);
             break None;
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -680,6 +724,22 @@ fn external_run(
         stderr: Some(capture.1.to_path_buf()),
         ..Observation::failed("external", String::new(), 0.0)
     })
+}
+
+/// Kill a child started as a process group leader and its whole group, then
+/// reap the child.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // `kill -KILL -<pgid>` signals every process in the group.
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &format!("-{}", child.id())])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Render a recorded JSON output again, as JSON or CSV by the extension of
@@ -784,7 +844,10 @@ pub fn run_plan(
         };
         let dir = work.join(format!("run-{n}"));
         let start = Instant::now();
-        let sampler = plan.telemetry.as_ref().map(crate::evidence::Sampler::start);
+        // Power is sampled over the workload only: it stops before retention
+        // and external verification, the same window as `wall_secs`.
+        let mut sampler = plan.telemetry.as_ref().map(crate::evidence::Sampler::start);
+        let mut power: Option<crate::evidence::PowerRecord> = None;
         let res = match fs::create_dir(&dir) {
             Err(e) => Err(format!(
                 "cannot create the scratch directory {}: {e}",
@@ -800,6 +863,7 @@ pub fn run_plan(
                         ..
                     } => engine_run(test, *exponent, backend, options, &dir, stop).map(
                         |(mut obs, proof, report)| {
+                            power = sampler.take().map(|s| s.finish());
                             let adir = work.join("artifacts").join(n.to_string());
                             let keep = options.retain == Some(true);
                             let after = || -> Result<(), String> {
@@ -873,10 +937,12 @@ pub fn run_plan(
                 r
             }
         };
+        if let Some(s) = sampler.take() {
+            power = Some(s.finish());
+        }
         let mut obs =
             res.unwrap_or_else(|e| Observation::failed(kind, e, start.elapsed().as_secs_f64()));
-        if let (Some(s), Some(t)) = (sampler, &plan.telemetry) {
-            let rec = s.finish();
+        if let (Some(rec), Some(t)) = (power, &plan.telemetry) {
             obs.energy_joules = rec.energy_joules;
             obs.telemetry = format!(
                 "{} ({} power, sampled every {} ms)",

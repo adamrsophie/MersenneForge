@@ -333,7 +333,13 @@ fn open(
     p: u32,
     device: Option<u32>,
 ) -> Result<Box<dyn mersenne_forge::backend::Backend>, Failure> {
-    select::open(kind, p, device).map_err(|e| fail(EXIT_UNSUPPORTED, e.to_string()))
+    select::open(kind, p, device).map_err(|e| {
+        let code = match e {
+            mersenne_forge::backend::BackendError::Unsupported(_) => EXIT_UNSUPPORTED,
+            _ => EXIT_EXECUTION,
+        };
+        fail(code, e.to_string())
+    })
 }
 
 fn print_report(report: &RunReport, out: &serde_json::Value, as_json: bool) {
@@ -344,6 +350,9 @@ fn print_report(report: &RunReport, out: &serde_json::Value, as_json: bool) {
     match (&report.process, &report.result) {
         (ProcessState::Completed, Some(r)) => {
             let what = match r.verdict {
+                mersenne_forge::run::Verdict::Prime if r.special_case.is_some() => {
+                    "prime (decided directly; p = 2)"
+                }
                 mersenne_forge::run::Verdict::Prime => "prime (LL criterion satisfied)",
                 mersenne_forge::run::Verdict::ProbablePrime => "probable prime (base 3)",
                 mersenne_forge::run::Verdict::Composite => "composite",
@@ -588,53 +597,25 @@ fn cmd_resume(
     as_json: bool,
 ) -> Result<u8, Failure> {
     let _lock = lock_checkpoint(path)?;
-    let (mut ck, mut used) =
-        Checkpoint::load_latest(path).map_err(|e| fail(EXIT_STATE, e.to_string()))?;
-    let kind = BackendKind::parse(&ck.meta.backend.kind).ok_or_else(|| {
+    let (first, _) = Checkpoint::load_latest(path).map_err(|e| fail(EXIT_STATE, e.to_string()))?;
+    let kind = BackendKind::parse(&first.meta.backend.kind).ok_or_else(|| {
         fail(
             EXIT_UNSUPPORTED,
-            format!("unknown backend {:?} in checkpoint", ck.meta.backend.kind),
+            format!(
+                "unknown backend {:?} in checkpoint",
+                first.meta.backend.kind
+            ),
         )
     })?;
     let deadline = deadline(&budget, kind)?;
-    let mut be = open(kind, ck.meta.exponent, device)?;
+    let mut be = open(kind, first.meta.exponent, device)?;
     let mut ctl = Control {
         stop: Some(&STOP),
         deadline,
         ..Control::default()
     };
-    let mut fallback_note = None;
-    let mut result = resume_from(&mut be, &ck, path, proof_dir.as_deref(), &mut ctl)?;
-    // A primary that loads but fails the resume validation (its on-load check
-    // or a missing proof residue) falls back to `.prev`. An identity or
-    // configuration mismatch does not: `.prev` belongs to the same run.
-    if used == path
-        && matches!(
-            result,
-            Err(ProtocolError::CheckpointRejected { .. }
-                | ProtocolError::ProofResidueMissing { .. })
-        )
-    {
-        let prev = prev_path(path);
-        if let Ok(pck) = Checkpoint::load_file(&prev) {
-            // Move the rejected primary aside, so the next save cannot rotate
-            // it over the good `.prev`; it is kept for inspection.
-            let mut aside = path.as_os_str().to_owned();
-            aside.push(".rejected");
-            std::fs::rename(path, &aside)
-                .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", path.display())))?;
-            let why = result.err().map(|e| e.to_string()).unwrap_or_default();
-            fallback_note = Some(format!(
-                "{} was not usable ({why}); it was moved to {} and the run resumed from {}",
-                path.display(),
-                PathBuf::from(&aside).display(),
-                prev.display()
-            ));
-            ck = pck;
-            used = prev;
-            result = resume_from(&mut be, &ck, path, proof_dir.as_deref(), &mut ctl)?;
-        }
-    }
+    let (result, ck, used, fallback_note) =
+        resume_with_fallback(&mut be, path, proof_dir.as_deref(), &mut ctl)?;
     let mut report = result.map_err(protocol_failure)?;
     if let Some(n) = fallback_note {
         report.evidence.notes.insert(0, n);
@@ -681,12 +662,14 @@ fn cmd_verify(
     let proof = match Proof::read(path, exponent) {
         Ok(pr) => pr,
         Err(e) => {
-            let code = match e {
-                ProofError::Io(_) => EXIT_STATE,
-                _ => EXIT_REJECTED,
+            // A file that cannot be read was not checked: that is a file
+            // error, not a rejection.
+            let (status, code) = match e {
+                ProofError::Io(_) => ("error", EXIT_STATE),
+                _ => ("rejected", EXIT_REJECTED),
             };
             return Ok(emit(
-                "rejected",
+                status,
                 json!({ "error": format!("{e:?}"), "message": e.to_string() }),
                 code,
             ));
@@ -701,7 +684,9 @@ fn cmd_verify(
     let start = Instant::now();
     match proof::verify(&mut be, &proof, &mut ctl) {
         Ok(v) => {
-            let claim = if v.probable_prime {
+            let claim = if !v.terminal_recomputed && proof.sign_decides_claim() {
+                "undetermined"
+            } else if v.probable_prime {
                 "probable prime"
             } else {
                 "composite"
@@ -729,7 +714,12 @@ fn cmd_verify(
 
 /// What an accepted proof establishes, for the `verify` output.
 fn verify_message(p: u32, claim: &str, recomputed: bool) -> String {
-    if recomputed {
+    if claim == "undetermined" {
+        format!(
+            "M{p}: the file satisfies the version 2 proof equation, but that equation also holds with the terminal residue negated, \
+             and here the sign decides between probable prime and composite. Recompute the terminal residue to decide"
+        )
+    } else if recomputed {
         format!(
             "M{p} {claim}: the terminal residue was recomputed directly and matches the proof; this verifies the PRP computation, not deterministic primality"
         )
@@ -754,10 +744,56 @@ struct WorkArgs {
     proof_power: Option<u32>,
 }
 
-/// Append one line to the results file and make it durable before the
-/// assignment is removed: a crash in between leaves a result already in the
-/// outbox, which the next session recognizes instead of running again.
-fn append_result(path: &Path, line: &str) -> Result<(), Failure> {
+/// An exclusive lock in the convention AutoPrimeNet uses for the files it
+/// shares with a worker: `<file>.lck`, created exclusively and removed when
+/// done. Waits up to 60 s for another holder. (Interoperation with
+/// AutoPrimeNet itself has not been tested.)
+struct LckGuard(PathBuf);
+
+impl Drop for LckGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn lck(path: &Path) -> Result<LckGuard, Failure> {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lck");
+    let l = PathBuf::from(name);
+    for _ in 0..600 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&l)
+        {
+            Ok(_) => return Ok(LckGuard(l)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::thread::sleep(Duration::from_millis(100))
+            }
+            Err(e) => return Err(fail(EXIT_STATE, format!("{}: {e}", l.display()))),
+        }
+    }
+    Err(fail(
+        EXIT_STATE,
+        format!(
+            "{} has been held for 60 s; if no other program is using it, delete it",
+            l.display()
+        ),
+    ))
+}
+
+/// The completion journal next to the results file: one assignment line per
+/// line, written after its result and before the assignment is removed.
+fn journal_path(results: &Path) -> PathBuf {
+    let mut n = results.as_os_str().to_owned();
+    n.push(".done");
+    PathBuf::from(n)
+}
+
+/// Append `line` plus a newline to `path` and make it durable: a fragment a
+/// crash left at the end is moved to `<path>.torn` first, so every line
+/// stays whole, then the file and its directory entry are synced.
+fn append_durable(path: &Path, line: &str) -> Result<(), Failure> {
     use std::io::Write;
     let state = |e: std::io::Error| fail(EXIT_STATE, format!("{}: {e}", path.display()));
     if let Some(d) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -765,40 +801,61 @@ fn append_result(path: &Path, line: &str) -> Result<(), Failure> {
     }
     let mut f = std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)
         .map_err(state)?;
-    // A line torn by a crash is closed first, so the new line stays whole.
-    let torn = std::fs::read(path)
-        .map_err(state)?
-        .last()
-        .is_some_and(|&c| c != b'\n');
-    let sep = if torn { "\n" } else { "" };
-    f.write_all(format!("{sep}{line}\n").as_bytes())
-        .map_err(state)?;
-    f.sync_all().map_err(state)
+    let bytes = std::fs::read(path).map_err(state)?;
+    if bytes.last().is_some_and(|&c| c != b'\n') {
+        let cut = bytes.iter().rposition(|&c| c == b'\n').map_or(0, |i| i + 1);
+        let mut torn = path.as_os_str().to_owned();
+        torn.push(".torn");
+        let mut t = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(PathBuf::from(&torn))
+            .map_err(state)?;
+        t.write_all(&bytes[cut..]).map_err(state)?;
+        t.write_all(b"\n").map_err(state)?;
+        t.sync_all().map_err(state)?;
+        f.set_len(cut as u64).map_err(state)?;
+    }
+    f.write_all(format!("{line}\n").as_bytes()).map_err(state)?;
+    f.sync_all().map_err(state)?;
+    mersenne_forge::checkpoint::sync_dir(path).map_err(state)
 }
 
-/// True when the results file already holds a result for this assignment
-/// (same AID, or without an AID the same exponent and work type).
+/// True when this assignment is already complete: its line is in the
+/// completion journal, or (for an assignment with an ID) the results file
+/// holds a final result with the same ID, exponent, and work type. A
+/// matching result without a journal entry is the window between the two
+/// writes of a crashed session. Without an ID, only the journal counts, so
+/// a deliberate second test of the same exponent still runs.
 fn already_reported(results: &Path, a: &mersenne_forge::worktodo::Assignment) -> bool {
-    let wt = match a.kind {
-        mersenne_forge::worktodo::WorkKind::Prp => "PRP-3",
-        mersenne_forge::worktodo::WorkKind::Ll => "LL",
+    let journal = std::fs::read_to_string(journal_path(results)).unwrap_or_default();
+    if journal.lines().any(|l| l == a.line) {
+        return true;
+    }
+    let Some(aid) = &a.aid else {
+        return false;
     };
     std::fs::read_to_string(results)
         .unwrap_or_default()
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .any(|v| match &a.aid {
-            Some(aid) => v["aid"] == aid.as_str(),
-            None => v["exponent"] == a.exponent && v["worktype"] == wt && v["aid"].is_null(),
+        .any(|v| {
+            v["aid"] == aid.as_str()
+                && v["exponent"] == a.exponent
+                && v["worktype"] == a.worktype()
+                && matches!(v["status"].as_str(), Some("P" | "C"))
         })
 }
 
-/// Remove the first line equal to `line` from the worktodo file, atomically.
+/// Remove the first line equal to `line` from the worktodo file, atomically,
+/// under its `.lck` lock so a program adding lines does not lose them.
 fn remove_line(worktodo: &Path, line: &str) -> Result<(), Failure> {
     let state = |e: std::io::Error| fail(EXIT_STATE, format!("{}: {e}", worktodo.display()));
+    let _l = lck(worktodo)?;
     let text = std::fs::read_to_string(worktodo).map_err(state)?;
     let mut done = false;
     let kept: String = text
@@ -812,8 +869,175 @@ fn remove_line(worktodo: &Path, line: &str) -> Result<(), Failure> {
     mersenne_forge::checkpoint::write_atomic(worktodo, kept.as_bytes(), false).map_err(state)
 }
 
+/// Record a finished assignment: result line, then journal, then removal,
+/// each durable before the next, under the results file's lock so two
+/// queues sharing one results file cannot both report the same work.
+fn commit_result(
+    w: &WorkArgs,
+    a: &mersenne_forge::worktodo::Assignment,
+    line: Option<&str>,
+) -> Result<(), Failure> {
+    {
+        let _l = lck(&w.results)?;
+        if let Some(line) = line {
+            if !already_reported(&w.results, a) {
+                append_durable(&w.results, line)?;
+            }
+        } else {
+            // Recovery: the result is already in the file; make it durable
+            // before the assignment goes.
+            if let Ok(f) = std::fs::File::open(&w.results) {
+                let _ = f.sync_all();
+            }
+            let _ = mersenne_forge::checkpoint::sync_dir(&w.results);
+        }
+        let journal = journal_path(&w.results);
+        let logged = std::fs::read_to_string(&journal)
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l == a.line);
+        if !logged {
+            append_durable(&journal, &a.line)?;
+        }
+    }
+    remove_line(&w.worktodo, &a.line)
+}
+
+/// Checkpoint file of one assignment: the ID when there is one, otherwise a
+/// hash of the line, so two assignments for one exponent never share state.
+fn assignment_checkpoint(dir: &Path, a: &mersenne_forge::worktodo::Assignment) -> PathBuf {
+    use mersenne_forge::worktodo::WorkKind;
+    use sha3::Digest;
+    let key = match &a.aid {
+        Some(aid) => aid.to_ascii_lowercase(),
+        None => sha3::Sha3_256::digest(a.line.as_bytes())[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    };
+    let test = match a.kind {
+        WorkKind::Prp => "prp",
+        WorkKind::Ll => "ll",
+    };
+    dir.join(format!("M{}-{test}-{key}.ckpt", a.exponent))
+}
+
+/// Delete the proof points of a finished run while holding the store's
+/// lock, removing only point files; anything else in the directory stays.
+fn remove_proof_points(residues: &Path) -> Result<(), String> {
+    let lock_path = residues.join(".lock");
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("{}: {e}", lock_path.display()))?;
+    match f.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(format!("{} is in use by another run", residues.display()))
+        }
+        Err(std::fs::TryLockError::Error(e)) => return Err(e.to_string()),
+    }
+    let entries =
+        std::fs::read_dir(residues).map_err(|e| format!("{}: {e}", residues.display()))?;
+    let mut others = 0usize;
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.parse::<u64>().is_ok() {
+            std::fs::remove_file(e.path()).map_err(|x| format!("{}: {x}", e.path().display()))?;
+        } else if name != ".lock" {
+            others += 1;
+        }
+    }
+    if others == 0 {
+        let _ = std::fs::remove_file(&lock_path);
+        let _ = std::fs::remove_dir(residues);
+    }
+    drop(f);
+    Ok(())
+}
+
+/// Resume from a checkpoint, falling back to `.prev` when the primary loads
+/// but fails its resume validation (its on-load check or a missing proof
+/// residue). The rejected primary is moved aside. Returns the run, the
+/// checkpoint used, its file, and a note when the fallback was taken.
+type Resumed = (
+    Result<RunReport, ProtocolError>,
+    Checkpoint,
+    PathBuf,
+    Option<String>,
+);
+
+fn resume_with_fallback(
+    be: &mut Box<dyn mersenne_forge::backend::Backend>,
+    path: &Path,
+    proof_dir: Option<&Path>,
+    ctl: &mut Control,
+) -> Result<Resumed, Failure> {
+    let (mut ck, mut used) =
+        Checkpoint::load_latest(path).map_err(|e| fail(EXIT_STATE, e.to_string()))?;
+    let mut note = None;
+    let mut result = resume_from(be, &ck, path, proof_dir, ctl)?;
+    if used == path
+        && matches!(
+            result,
+            Err(ProtocolError::CheckpointRejected { .. }
+                | ProtocolError::ProofResidueMissing { .. })
+        )
+    {
+        let prev = prev_path(path);
+        if let Ok(pck) = Checkpoint::load_file(&prev) {
+            let mut aside = path.as_os_str().to_owned();
+            aside.push(".rejected");
+            std::fs::rename(path, &aside)
+                .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", path.display())))?;
+            let why = result.err().map(|e| e.to_string()).unwrap_or_default();
+            note = Some(format!(
+                "{} was not usable ({why}); it was moved to {} and the run resumed from {}",
+                path.display(),
+                PathBuf::from(&aside).display(),
+                prev.display()
+            ));
+            ck = pck;
+            used = prev;
+            result = resume_from(be, &ck, path, proof_dir, ctl)?;
+        }
+    }
+    Ok((result, ck, used, note))
+}
+
+/// Refuse argument combinations that would lose work: a proof power without
+/// a proof directory, and a results file that is the worktodo file or lies
+/// inside the checkpoint or proof directory (cleanup would delete it).
+fn check_work_paths(w: &WorkArgs) -> Result<(), Failure> {
+    if w.proof_power.is_some() && w.proof_dir.is_none() {
+        return Err(fail(2, "--proof-power needs --proof-dir"));
+    }
+    let abs = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    let (results, todo) = (abs(&w.results), abs(&w.worktodo));
+    if results == todo {
+        return Err(fail(2, "--results and --worktodo name the same file"));
+    }
+    for (what, dir) in [
+        ("--checkpoint-dir", Some(&w.checkpoint_dir)),
+        ("--proof-dir", w.proof_dir.as_ref()),
+    ] {
+        if let Some(d) = dir {
+            let d = abs(d);
+            if results.starts_with(&d) || todo.starts_with(&d) {
+                return Err(fail(
+                    2,
+                    format!("the results and worktodo files must lie outside {what}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
     use mersenne_forge::worktodo::{self as wt, WorkKind};
+    check_work_paths(w)?;
     let deadline = deadline(&w.budget, w.kind)?;
     // One worker per worktodo file.
     let _lock = lock_checkpoint(&w.worktodo)?;
@@ -821,9 +1045,13 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
     // Assignments this session could not start, and messages already shown.
     let mut skipped = std::collections::HashSet::new();
     let mut warned = std::collections::HashSet::new();
+    let leave = |a: &wt::Assignment, why: &str, skipped: &mut std::collections::HashSet<String>| {
+        eprintln!("left in place: M{}: {why}", a.exponent);
+        skipped.insert(a.line.clone());
+    };
     loop {
-        if STOP.load(Ordering::SeqCst) {
-            println!("stopped after {done} assignments");
+        if STOP.load(Ordering::SeqCst) || deadline.is_some_and(|d| Instant::now() >= d) {
+            println!("stopped after {done} assignments (stop requested or budget used)");
             return Ok(EXIT_INCOMPLETE);
         }
         let text = std::fs::read_to_string(&w.worktodo)
@@ -856,7 +1084,15 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
                 a.exponent,
                 w.results.display()
             );
-            remove_line(&w.worktodo, &a.line)?;
+            commit_result(w, &a, None)?;
+            continue;
+        }
+        if a.wants_pm1() {
+            leave(
+                &a,
+                "the line asks for P-1 before the test (tests_saved > 0); run it with `pm1` or set tests_saved to 0",
+                &mut skipped,
+            );
             continue;
         }
         let p = a.exponent;
@@ -864,10 +1100,7 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
             WorkKind::Prp => w.proof_dir.clone(),
             WorkKind::Ll => None,
         };
-        let ckpt = w.checkpoint_dir.join(match a.kind {
-            WorkKind::Prp => format!("M{p}-prp.ckpt"),
-            WorkKind::Ll => format!("M{p}-ll.ckpt"),
-        });
+        let ckpt = assignment_checkpoint(&w.checkpoint_dir, &a);
         let prp_cfg = PrpConfig {
             block_size: 1000,
             check_step: None,
@@ -886,27 +1119,46 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
         // place and moves on to the next one.
         let started = (|| -> Result<_, Failure> {
             let lock = lock_checkpoint(&ckpt)?;
-            let ck = if ckpt.exists() || prev_path(&ckpt).exists() {
+            let resumed = ckpt.exists() || prev_path(&ckpt).exists();
+            if resumed {
                 let (ck, _) =
                     Checkpoint::load_latest(&ckpt).map_err(|e| fail(EXIT_STATE, e.to_string()))?;
-                if ck.meta.requested.get("assignment").is_none() {
+                if ck.meta.requested.get("assignment") != Some(&json!(a)) {
                     return Err(fail(
                         EXIT_STATE,
                         format!(
-                            "{} was not written by `work`; finish it with `resume` or delete it",
+                            "{} belongs to another assignment; finish it with `resume` or delete it",
                             ckpt.display()
                         ),
                     ));
                 }
-                Some(ck)
-            } else {
-                None
-            };
-            if let (Some(dir), None, WorkKind::Prp) = (&proof_dir, &ck, a.kind) {
+                // Resume on the backend the run started on.
+                let kind = BackendKind::parse(&ck.meta.backend.kind).ok_or_else(|| {
+                    fail(
+                        EXIT_UNSUPPORTED,
+                        format!("unknown backend {:?} in checkpoint", ck.meta.backend.kind),
+                    )
+                })?;
+                let be = open(kind, p, w.device)?;
+                return Ok((lock, true, be));
+            }
+            if let (Some(dir), WorkKind::Prp) = (&proof_dir, a.kind) {
                 let eff = prp::effective_config(p, &prp_cfg).map_err(protocol_failure)?;
                 let power = eff.proof_power.unwrap_or(0);
                 create_dir_all_durable(dir)
                     .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", dir.display())))?;
+                // An earlier proof of this exponent and power may not have
+                // been uploaded yet; never overwrite it.
+                let existing = dir.join(format!("{p}-{power}.proof"));
+                if existing.exists() {
+                    return Err(fail(
+                        EXIT_STATE,
+                        format!(
+                            "{} exists; upload or move it before this assignment runs",
+                            existing.display()
+                        ),
+                    ));
+                }
                 let need = wt::proof_disk_need(p, power);
                 match wt::free_bytes(dir) {
                     Some(free) if free < need => {
@@ -925,26 +1177,31 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
                 }
             }
             let be = open(w.kind, p, w.device)?;
-            Ok((lock, ck, be))
+            Ok((lock, false, be))
         })();
-        let (ck_lock, ck, mut be) = match started {
+        let (ck_lock, resumed, mut be) = match started {
             Ok(x) => x,
             Err(f) => {
-                eprintln!("left in place: M{p}: {}", f.message);
-                skipped.insert(a.line.clone());
+                leave(&a, &f.message, &mut skipped);
                 continue;
             }
         };
-        let result = match &ck {
-            Some(ck) => match resume_from(&mut be, ck, &ckpt, None, &mut ctl) {
-                Ok(r) => r,
-                Err(f) => {
-                    eprintln!("left in place: M{p}: {}", f.message);
-                    skipped.insert(a.line.clone());
+        let (result, note) = if resumed {
+            match resume_with_fallback(&mut be, &ckpt, None, &mut ctl) {
+                // A resumed run that cannot continue (another build, a
+                // configuration mismatch) is this assignment's problem only.
+                Ok((Err(e), ..)) if !matches!(e, ProtocolError::Interrupted { .. }) => {
+                    leave(&a, &e.to_string(), &mut skipped);
                     continue;
                 }
-            },
-            None => match a.kind {
+                Ok((r, _, _, note)) => (r, note),
+                Err(f) => {
+                    leave(&a, &f.message, &mut skipped);
+                    continue;
+                }
+            }
+        } else {
+            let r = match a.kind {
                 WorkKind::Prp => prp::run_prp(
                     &mut be,
                     p,
@@ -966,8 +1223,12 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
                     None,
                     &mut ctl,
                 ),
-            },
+            };
+            (r, None)
         };
+        if let Some(n) = note {
+            eprintln!("M{p}: {n}");
+        }
         let report = result.map_err(protocol_failure)?;
         let code = exit_for(&report);
         let Some(r) = report.result.as_ref().filter(|_| code == 0) else {
@@ -997,19 +1258,26 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
             r,
             &report,
             proof_info.as_ref(),
-            w.kind.name(),
+            be.identity().kind.as_str(),
             &wt::utc_timestamp(now),
         );
-        append_result(&w.results, &line.to_string())?;
-        remove_line(&w.worktodo, &a.line)?;
+        commit_result(w, &a, Some(&line.to_string()))?;
         // The result is durable: the checkpoints and, after a verified proof,
-        // the proof points are no longer needed. The proof file is kept.
+        // the proof points are no longer needed. The proof file is kept. The
+        // points are found from the proof the run actually wrote.
         for f in [ckpt.clone(), prev_path(&ckpt)] {
             let _ = std::fs::remove_file(f);
         }
         if report.evidence.proof_stage == ProofStage::Verified {
-            if let Some(dir) = &proof_dir {
-                let _ = std::fs::remove_dir_all(proof::ProofStore::residue_dir(dir, p));
+            if let Some(dir) = report
+                .evidence
+                .proof
+                .as_ref()
+                .and_then(|e| e.path.parent().map(Path::to_path_buf))
+            {
+                if let Err(e) = remove_proof_points(&proof::ProofStore::residue_dir(&dir, p)) {
+                    eprintln!("M{p}: proof points kept: {e}");
+                }
             }
         }
         drop(ck_lock);
@@ -1227,10 +1495,22 @@ fn emit_failure(f: &Failure, as_json: bool) {
 }
 
 fn main() -> ExitCode {
+    // Paths are written into JSON reports, which hold only UTF-8; refuse
+    // other arguments up front instead of failing halfway through a run.
+    let json = std::env::args_os().any(|a| a == "--json");
+    if let Some(bad) = std::env::args_os().find(|a| a.to_str().is_none()) {
+        emit_failure(
+            &fail(
+                2,
+                format!("arguments must be valid UTF-8: {}", bad.to_string_lossy()),
+            ),
+            json,
+        );
+        return ExitCode::from(2);
+    }
     let cli = match Cli::try_parse() {
         Ok(c) => c,
         Err(e) => {
-            let json = std::env::args().any(|a| a == "--json");
             if !json || !e.use_stderr() {
                 e.exit();
             }
@@ -1338,14 +1618,14 @@ fn main() -> ExitCode {
                     println!(
                         "{} {} M{}{}",
                         c.factor,
-                        if c.accepted() {
+                        if c.divides {
                             "divides"
                         } else {
                             "does not divide"
                         },
                         c.exponent,
-                        if !c.proper {
-                            " (not a proper factor)"
+                        if c.divides && !c.proper {
+                            " but is not a proper factor (it is 1 or M_p itself)"
                         } else {
                             ""
                         }
