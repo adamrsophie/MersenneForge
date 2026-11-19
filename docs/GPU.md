@@ -230,7 +230,15 @@ Only this machine: **Apple M2, Metal backend** (macOS arm64, Rust 1.100.0,
   proof (n = 2^17) recorded in `docs/VALIDATION.md`; the complete runs listed
   above use n = 2^14 and below. The protocol tests in `tests/protocol_gpu.rs` belong
   to the core and are not described here.
-* Performance tuning of any kind (workgroup size, radix, fused stages, memory
-  layout). No speed claims are made.
+* Performance tuning (workgroup size, memory layout). Two opt-in variants
+  exist and are written but not yet validated or timed:
+  `MERSENNE_FORGE_GPU_RADIX4=1` runs two NTT stages per pass (`dif4`,
+  `dit4`, the same field operations in the same order, so bit identical),
+  and `MERSENNE_FORGE_GPU_PACKED=1` packs words 2j and 2j + 1 as the real
+  and imaginary part of element j and runs a half length transform with an
+  untangle, pointwise, and retangle pass (`sqr_packed`, `pmul_packed`; the
+  derivation is in `kernels.wgsl`). The packed path cannot use the
+  imaginary part fault check. `tf.wgsl` is a separate trial factoring
+  kernel. No speed claims are made.
 * Long-run behavior under device resets, thermal throttling, or driver
   timeouts beyond what the error paths above report.

@@ -290,8 +290,10 @@ None of these is a mathematical result; the protocol never turns one into
     MERSENNE_FORGE_CUDA_GRAPHS=1 target/release/mersenne-forge run --test prp --exponent 86243 --backend cuda --device 0 --budget 10m
 
 The last line runs the opt-in graph replay (32 squarings captured once per
-register and replayed). It has never run on a device; compare its res64
-with the run above before trusting it.
+register and replayed). `MERSENNE_FORGE_CUDA_NARROW=1` stores registers as
+32-bit words, two per 64-bit element (`mf_weight32`, `mf_carry_b32`; the
+model and the host emulation cover both kernels). Neither variant has run
+on a device; compare its res64 with the run above before trusting it.
 
 `cargo test --features cuda --test cuda_backend` covers import and export
 round trips, single and batched squarings, LL steps, multiplication, copy,
