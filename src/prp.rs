@@ -166,6 +166,9 @@ enum Step {
     },
 }
 
+/// Proof points that may wait for the background writer at one time.
+const PROOF_WRITE_DEPTH: usize = 2;
+
 struct Engine<'b, B: Backend> {
     be: &'b mut B,
     x: Reg,
@@ -179,6 +182,8 @@ struct Engine<'b, B: Backend> {
     final_x: Option<Residue>,
     /// x at k = n - 1, to show the terminal value is its square.
     pre_final: Option<Residue>,
+    /// Background writer of proof points, when the run has a proof.
+    writer: Option<proof::ProofWriter>,
 }
 
 fn apply_fault<B: Backend>(be: &mut B, r: Reg, kind: FaultKind, ll: bool) -> Result<(), StepErr> {
@@ -332,7 +337,7 @@ impl<'b, B: Backend> Engine<'b, B> {
             }
             self.final_x = Some(v);
         }
-        if let Some(store) = spec.proof.filter(|s| s.schedule.contains(k)) {
+        if spec.proof.is_some_and(|s| s.schedule.contains(k)) {
             // Export, durable write, and read back of the proof point.
             let sw = Stopwatch::start();
             let v = match &self.final_x {
@@ -348,12 +353,13 @@ impl<'b, B: Backend> Engine<'b, B> {
                     message: "simulated write failure".into(),
                 }));
             }
-            store.save(k, &v).map_err(|e| {
-                StepErr::Fatal(ProtocolError::ProofResidueWrite {
-                    k,
-                    message: e.to_string(),
-                })
-            })?;
+            self.writer
+                .as_ref()
+                .expect("a proof run has a writer")
+                .submit(k, v)
+                .map_err(|(k, message)| {
+                    StepErr::Fatal(ProtocolError::ProofResidueWrite { k, message })
+                })?;
             cnt.t_proof_points += sw.secs();
         }
         if ctl.halt_at == Some(k) {
@@ -410,6 +416,9 @@ fn run_engine<B: Backend>(
             step: spec.rule.effective(spec.block, n_errors),
             final_x: None,
             pre_final: None,
+            writer: spec
+                .proof
+                .map(|s| proof::ProofWriter::new(s.clone(), PROOF_WRITE_DEPTH)),
         };
         drive(&mut eng, from, n_errors, spec, ctl, on_verified, cnt)
     })
@@ -484,6 +493,14 @@ fn drive<B: Backend>(
                         .clone()
                         .expect("the final residue was recorded at k = n")
                 });
+                // Points up to here must be durable before a checkpoint says so
+                // and before the proof is built from them.
+                if let Some(w) = &eng.writer {
+                    let sw = Stopwatch::start();
+                    w.flush()
+                        .map_err(|(k, message)| ProtocolError::ProofResidueWrite { k, message })?;
+                    cnt.t_proof_points += sw.secs();
+                }
                 if let Some(f) = on_verified.as_mut() {
                     let sw = Stopwatch::start();
                     f(&verified, cnt.n_errors, final_x.as_ref())?;

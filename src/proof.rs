@@ -216,6 +216,87 @@ pub struct ProofStore {
     _lock: std::sync::Arc<fs::File>,
 }
 
+/// Writes proof points on a background thread so the computation continues
+/// while a point is written and read back. At most `depth` points wait at a
+/// time; a further submit blocks (backpressure), so memory stays bounded.
+/// [`ProofWriter::flush`] waits until every submitted point is durable and
+/// returns the first write error; callers flush before recording any state
+/// that claims those points are on disk.
+pub struct ProofWriter {
+    tx: Option<std::sync::mpsc::SyncSender<(u64, Residue)>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    state: std::sync::Arc<(std::sync::Mutex<WriterState>, std::sync::Condvar)>,
+}
+
+#[derive(Default)]
+struct WriterState {
+    pending: usize,
+    error: Option<(u64, String)>,
+}
+
+impl ProofWriter {
+    pub fn new(store: ProofStore, depth: usize) -> ProofWriter {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Residue)>(depth.max(1));
+        let state = std::sync::Arc::new((
+            std::sync::Mutex::new(WriterState::default()),
+            std::sync::Condvar::new(),
+        ));
+        let st = state.clone();
+        let handle = std::thread::spawn(move || {
+            for (k, x) in rx {
+                let r = store.save(k, &x);
+                let (m, cv) = &*st;
+                let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = r {
+                    g.error.get_or_insert((k, e.to_string()));
+                }
+                g.pending -= 1;
+                cv.notify_all();
+            }
+        });
+        ProofWriter {
+            tx: Some(tx),
+            handle: Some(handle),
+            state,
+        }
+    }
+
+    fn first_error(&self) -> Result<(), (u64, String)> {
+        let g = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
+        g.error.clone().map_or(Ok(()), Err)
+    }
+
+    /// Queue one point; blocks while `depth` points are already waiting.
+    pub fn submit(&self, k: u64, x: Residue) -> Result<(), (u64, String)> {
+        self.first_error()?;
+        self.state.0.lock().unwrap_or_else(|e| e.into_inner()).pending += 1;
+        let sent = self.tx.as_ref().expect("open until drop").send((k, x));
+        if sent.is_err() {
+            return Err((k, "the proof writer thread stopped".into()));
+        }
+        Ok(())
+    }
+
+    /// Wait until every submitted point is written and read back.
+    pub fn flush(&self) -> Result<(), (u64, String)> {
+        let (m, cv) = &*self.state;
+        let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+        while g.pending > 0 {
+            g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        g.error.clone().map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for ProofWriter {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 impl ProofStore {
     pub fn residue_dir(proof_dir: &Path, p: u32) -> PathBuf {
         proof_dir.join(format!("M{p}.residues"))
