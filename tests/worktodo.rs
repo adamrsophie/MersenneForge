@@ -346,3 +346,55 @@ fn check_factor_command() {
     assert_eq!(run("47").status.code(), Some(7));
     assert_eq!(run("abc").status.code(), Some(2));
 }
+
+/// Two workers under `supervise`, each with its own queue, both finish and
+/// write their status files.
+#[test]
+fn supervise_runs_one_worker_per_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut workers = Vec::new();
+    for (i, p) in [(0, 127), (1, 521)] {
+        let d = dir.path().join(format!("w{i}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("worktodo.txt"), format!("Test={p}\n")).unwrap();
+        workers.push(serde_json::json!({
+            "worktodo": d.join("worktodo.txt"),
+            "results": d.join("results.txt"),
+            "checkpoint_dir": d.join("ckpt"),
+            "status_file": d.join("status.json"),
+        }));
+    }
+    let cfg = dir.path().join("workers.json");
+    std::fs::write(&cfg, serde_json::to_string(&workers).unwrap()).unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_mersenne-forge"))
+        .args(["supervise", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    for (i, p) in [(0, 127), (1, 521)] {
+        let d = dir.path().join(format!("w{i}"));
+        let r = std::fs::read_to_string(d.join("results.txt")).unwrap();
+        assert!(r.contains(&format!("\"exponent\":{p}")), "{r}");
+        let st: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(d.join("status.json")).unwrap()).unwrap();
+        assert_eq!(
+            (st["state"].as_str(), st["exit_code"].as_u64()),
+            (Some("exited"), Some(0))
+        );
+    }
+    // A shared queue is refused before anything starts.
+    let same = serde_json::json!([workers[0].clone(), workers[0].clone()]);
+    std::fs::write(&cfg, same.to_string()).unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_mersenne-forge"))
+        .args(["supervise", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+}

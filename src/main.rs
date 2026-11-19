@@ -201,6 +201,36 @@ enum Cmd {
         proof_dir: Option<PathBuf>,
         #[arg(long)]
         proof_power: Option<u32>,
+        /// JSON health state, rewritten atomically as the session moves on:
+        /// pid, state, current line, completed and skipped counts, update
+        /// time, and the exit code when the session ends.
+        #[arg(long)]
+        status_file: Option<PathBuf>,
+    },
+    /// Run one `work` process per entry of a JSON list of workers (one
+    /// device and worktodo file each), restart a worker that crashes, and
+    /// stop them all on Ctrl-C.
+    Supervise {
+        #[arg(long)]
+        config: PathBuf,
+        /// Restarts allowed per worker before it is given up on.
+        #[arg(long, default_value_t = 5)]
+        max_restarts: u32,
+    },
+    /// Print queue, checkpoint, and worker state; with --watch, refresh
+    /// every N seconds until Ctrl-C.
+    Status {
+        #[arg(long, default_value = "worktodo.txt")]
+        worktodo: PathBuf,
+        #[arg(long, default_value = "results.txt")]
+        results: PathBuf,
+        #[arg(long)]
+        checkpoint_dir: Option<PathBuf>,
+        /// Worker status files to show (from `work --status-file`).
+        #[arg(long)]
+        status_file: Vec<PathBuf>,
+        #[arg(long)]
+        watch: Option<u64>,
     },
     /// Print one power reading in watts from a built-in sensor, for use as a
     /// benchmark telemetry command: rapl (Linux CPU package), nvidia
@@ -828,6 +858,36 @@ struct WorkArgs {
     budget: Option<String>,
     proof_dir: Option<PathBuf>,
     proof_power: Option<u32>,
+    status_file: Option<PathBuf>,
+}
+
+impl WorkArgs {
+    /// Rewrite the status file, when there is one. Failures are reported and
+    /// never stop the work.
+    fn status(&self, state: &str, current: Option<&str>, extra: serde_json::Value) {
+        let Some(path) = &self.status_file else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let mut v = json!({
+            "pid": std::process::id(),
+            "state": state,
+            "current": current,
+            "worktodo": self.worktodo,
+            "backend": self.kind.name(),
+            "device": self.device,
+            "updated": mersenne_forge::worktodo::utc_timestamp(now),
+        });
+        if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
+            o.extend(e.clone());
+        }
+        let text = serde_json::to_string_pretty(&v).expect("serializable");
+        if let Err(e) = mersenne_forge::checkpoint::write_atomic(path, text.as_bytes(), false) {
+            eprintln!("status file {}: {e}", path.display());
+        }
+    }
 }
 
 /// An exclusive lock in the convention AutoPrimeNet uses for the files it
@@ -1402,6 +1462,11 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
             }
         }
         if let Some(f) = next_factor {
+            w.status(
+                "running",
+                Some(&f.line),
+                json!({"done": done, "skipped": skipped.len()}),
+            );
             match run_factor_line(w, &f, deadline) {
                 Ok(true) => done += 1,
                 Ok(false) => {
@@ -1486,6 +1551,11 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
             continue;
         }
         let p = a.exponent;
+        w.status(
+            "running",
+            Some(&a.line),
+            json!({"done": done, "skipped": skipped.len()}),
+        );
         let proof_dir = match a.kind {
             WorkKind::Prp => w.proof_dir.clone(),
             WorkKind::Ll => None,
@@ -1761,6 +1831,213 @@ fn cmd_primenet(
     })
 }
 
+/// One worker of `supervise`: the `work` arguments for one device.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerSpec {
+    worktodo: PathBuf,
+    results: PathBuf,
+    checkpoint_dir: PathBuf,
+    #[serde(default = "cpu_name")]
+    backend: String,
+    device: Option<u32>,
+    budget: Option<String>,
+    proof_dir: Option<PathBuf>,
+    proof_power: Option<u32>,
+    status_file: Option<PathBuf>,
+}
+
+fn cpu_name() -> String {
+    "cpu".into()
+}
+
+fn cmd_supervise(config: &Path, max_restarts: u32) -> Result<u8, Failure> {
+    use std::process::{Child, Command};
+    let text = std::fs::read_to_string(config)
+        .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", config.display())))?;
+    let specs: Vec<WorkerSpec> =
+        serde_json::from_str(&text).map_err(|e| fail(2, format!("{}: {e}", config.display())))?;
+    if specs.is_empty() {
+        return Err(fail(2, "no workers in the configuration"));
+    }
+    // Two workers must never share a worktodo file or a device.
+    let mut seen = std::collections::HashSet::new();
+    for s in &specs {
+        let abs = std::path::absolute(&s.worktodo).unwrap_or_else(|_| s.worktodo.clone());
+        if !seen.insert(abs) {
+            return Err(fail(
+                2,
+                format!("{} is used by two workers", s.worktodo.display()),
+            ));
+        }
+        if BackendKind::parse(&s.backend).is_none() {
+            return Err(fail(2, format!("unknown backend {:?}", s.backend)));
+        }
+    }
+    let devices: Vec<_> = specs
+        .iter()
+        .filter(|s| s.backend != "cpu" && s.backend != "dwt")
+        .map(|s| (s.backend.clone(), s.device.unwrap_or(0)))
+        .collect();
+    if devices
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        != devices.len()
+    {
+        return Err(fail(2, "two workers use the same device"));
+    }
+    let exe = std::env::current_exe().map_err(|e| fail(EXIT_STATE, e.to_string()))?;
+    let spawn = |s: &WorkerSpec| -> std::io::Result<Child> {
+        let mut c = Command::new(&exe);
+        c.arg("work")
+            .arg("--worktodo")
+            .arg(&s.worktodo)
+            .arg("--results")
+            .arg(&s.results)
+            .arg("--checkpoint-dir")
+            .arg(&s.checkpoint_dir)
+            .arg("--backend")
+            .arg(&s.backend);
+        if let Some(d) = s.device {
+            c.arg("--device").arg(d.to_string());
+        }
+        if let Some(b) = &s.budget {
+            c.arg("--budget").arg(b);
+        }
+        if let Some(d) = &s.proof_dir {
+            c.arg("--proof-dir").arg(d);
+        }
+        if let Some(p) = s.proof_power {
+            c.arg("--proof-power").arg(p.to_string());
+        }
+        if let Some(f) = &s.status_file {
+            c.arg("--status-file").arg(f);
+        }
+        // Ctrl-C reaches the children through the terminal's process group;
+        // each finishes at its next valid boundary.
+        c.spawn()
+    };
+    let mut kids: Vec<(Option<Child>, u32)> = Vec::new();
+    for s in &specs {
+        let c =
+            spawn(s).map_err(|e| fail(EXIT_EXECUTION, format!("cannot start a worker: {e}")))?;
+        kids.push((Some(c), 0));
+    }
+    let mut worst = 0u8;
+    loop {
+        let mut running = 0;
+        for (i, (slot, restarts)) in kids.iter_mut().enumerate() {
+            let Some(child) = slot.as_mut() else { continue };
+            match child.try_wait() {
+                Ok(None) => running += 1,
+                Ok(Some(st)) => {
+                    let code = st.code().map_or(EXIT_EXECUTION, |c| c as u8);
+                    *slot = None;
+                    // 0: queue empty; 2/3/4/6: usage, stop or budget, unsupported,
+                    // or state a person must look at. Only crashes restart.
+                    let crashed = st.code().is_none() || code == EXIT_EXECUTION;
+                    if crashed && !STOP.load(Ordering::SeqCst) && *restarts < max_restarts {
+                        *restarts += 1;
+                        eprintln!(
+                            "worker {i} ({}) ended with {st}; restart {} of {max_restarts}",
+                            specs[i].worktodo.display(),
+                            restarts
+                        );
+                        std::thread::sleep(Duration::from_secs(5 * u64::from(*restarts)));
+                        match spawn(&specs[i]) {
+                            Ok(c) => {
+                                *slot = Some(c);
+                                running += 1;
+                            }
+                            Err(e) => eprintln!("worker {i} cannot restart: {e}"),
+                        }
+                    } else {
+                        eprintln!(
+                            "worker {i} ({}) ended with {st}",
+                            specs[i].worktodo.display()
+                        );
+                        worst = worst.max(code);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("worker {i}: {e}");
+                    *slot = None;
+                    worst = worst.max(EXIT_EXECUTION);
+                }
+            }
+        }
+        if running == 0 {
+            return Ok(worst);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Print the state of one queue: runnable and refused lines, checkpoints,
+/// result counts, and worker status files.
+fn print_status(worktodo: &Path, results: &Path, ckpt_dir: Option<&Path>, status: &[PathBuf]) {
+    use mersenne_forge::{factor, worktodo as wt};
+    let text = std::fs::read_to_string(worktodo).unwrap_or_default();
+    let (mut runnable, mut refused) = (Vec::new(), 0usize);
+    for l in text.lines() {
+        match (factor::parse_factor_line(l), wt::parse_line(l)) {
+            (Ok(Some(f)), _) => runnable.push(f.line),
+            (Ok(None), Ok(Some(a))) => runnable.push(a.line),
+            (Ok(None), Ok(None)) => {}
+            _ => refused += 1,
+        }
+    }
+    println!(
+        "{}: {} runnable, {} left for other programs",
+        worktodo.display(),
+        runnable.len(),
+        refused
+    );
+    for l in runnable.iter().take(5) {
+        println!("  {l}");
+    }
+    let lines = std::fs::read_to_string(results).unwrap_or_default();
+    let mut by_status = std::collections::BTreeMap::<String, usize>::new();
+    for v in lines
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+    {
+        let key = format!(
+            "{} {}",
+            v["worktype"].as_str().unwrap_or("?"),
+            v["status"].as_str().unwrap_or("?")
+        );
+        *by_status.entry(key).or_default() += 1;
+    }
+    println!("{}: {by_status:?}", results.display());
+    if let Some(d) = ckpt_dir {
+        for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+            let path = e.path();
+            if path.extension().is_some_and(|x| x == "ckpt") {
+                match Checkpoint::load_file(&path) {
+                    Ok(ck) => println!(
+                        "  {}: {} k = {} of {} ({:.1}%), {:.0} s",
+                        path.display(),
+                        ck.meta.protocol,
+                        ck.meta.k,
+                        ck.meta.exponent,
+                        100.0 * ck.meta.k as f64 / f64::from(ck.meta.exponent.max(1)),
+                        ck.meta.elapsed_secs
+                    ),
+                    Err(e) => println!("  {}: {e}", path.display()),
+                }
+            }
+        }
+    }
+    for s in status {
+        match std::fs::read_to_string(s) {
+            Ok(t) => println!("{}:\n{t}", s.display()),
+            Err(e) => println!("{}: {e}", s.display()),
+        }
+    }
+}
+
 fn cmd_bench(plan: &Path, output: &Path) -> Result<u8, Failure> {
     let text = std::fs::read_to_string(plan)
         .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", plan.display())))?;
@@ -2003,6 +2280,8 @@ fn main() -> ExitCode {
         | Cmd::BenchRender { .. }
         | Cmd::BenchAnalyze { .. }
         | Cmd::Work { .. }
+        | Cmd::Supervise { .. }
+        | Cmd::Status { .. }
         | Cmd::Power { .. }
         | Cmd::CheckpointExport { .. }
         | Cmd::Primenet { .. } => false,
@@ -2142,16 +2421,46 @@ fn main() -> ExitCode {
             budget,
             proof_dir,
             proof_power,
-        } => cmd_work(&WorkArgs {
+            status_file,
+        } => {
+            let w = WorkArgs {
+                worktodo,
+                results,
+                checkpoint_dir,
+                kind: backend.kind(),
+                device,
+                budget,
+                proof_dir,
+                proof_power,
+                status_file,
+            };
+            let r = cmd_work(&w);
+            let code = match &r {
+                Ok(c) => *c,
+                Err(f) => f.code,
+            };
+            w.status("exited", None, json!({"exit_code": code}));
+            r
+        }
+        Cmd::Supervise {
+            config,
+            max_restarts,
+        } => cmd_supervise(&config, max_restarts),
+        Cmd::Status {
             worktodo,
             results,
             checkpoint_dir,
-            kind: backend.kind(),
-            device,
-            budget,
-            proof_dir,
-            proof_power,
-        }),
+            status_file,
+            watch,
+        } => loop {
+            print_status(&worktodo, &results, checkpoint_dir.as_deref(), &status_file);
+            match watch {
+                Some(n) if !STOP.load(Ordering::SeqCst) => {
+                    std::thread::sleep(Duration::from_secs(n.max(1)))
+                }
+                _ => break Ok(0),
+            }
+        },
         Cmd::Primenet {
             user,
             password_file,
