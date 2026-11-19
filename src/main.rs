@@ -2117,15 +2117,21 @@ fn print_status(worktodo: &Path, results: &Path, ckpt_dir: Option<&Path>, status
             let path = e.path();
             if path.extension().is_some_and(|x| x == "ckpt") {
                 match Checkpoint::load_file(&path) {
-                    Ok(ck) => println!(
-                        "  {}: {} k = {} of {} ({:.1}%), {:.0} s",
-                        path.display(),
-                        ck.meta.protocol,
-                        ck.meta.k,
-                        ck.meta.exponent,
-                        100.0 * ck.meta.k as f64 / f64::from(ck.meta.exponent.max(1)),
-                        ck.meta.elapsed_secs
-                    ),
+                    Ok(ck) => {
+                        let done = (ck.meta.k as f64 / f64::from(ck.meta.exponent.max(1))).min(1.0);
+                        let filled = (done * 30.0).round() as usize;
+                        println!(
+                            "  {}: {} k = {} of {}\n    [{}{}] {:.1}%, {:.0} s",
+                            path.display(),
+                            ck.meta.protocol,
+                            ck.meta.k,
+                            ck.meta.exponent,
+                            "#".repeat(filled),
+                            ".".repeat(30 - filled),
+                            100.0 * done,
+                            ck.meta.elapsed_secs
+                        )
+                    }
                     Err(e) => println!("  {}: {e}", path.display()),
                 }
             }
@@ -2133,7 +2139,22 @@ fn print_status(worktodo: &Path, results: &Path, ckpt_dir: Option<&Path>, status
     }
     for s in status {
         match std::fs::read_to_string(s) {
-            Ok(t) => println!("{}:\n{t}", s.display()),
+            Ok(t) => match serde_json::from_str::<serde_json::Value>(&t) {
+                Ok(v) => println!(
+                    "{}: {} on {} {} at {}: {}{}",
+                    s.display(),
+                    v["state"].as_str().unwrap_or("?"),
+                    v["backend"].as_str().unwrap_or("?"),
+                    v["device"],
+                    v["updated"].as_str().unwrap_or("?"),
+                    v["current"].as_str().unwrap_or(""),
+                    v["exit_code"]
+                        .as_i64()
+                        .map(|c| format!(" (exit {c})"))
+                        .unwrap_or_default()
+                ),
+                Err(_) => println!("{}:\n{t}", s.display()),
+            },
             Err(e) => println!("{}: {e}", s.display()),
         }
     }
@@ -2587,15 +2608,43 @@ fn main() -> ExitCode {
             checkpoint_dir,
             status_file,
             watch,
-        } => loop {
-            print_status(&worktodo, &results, checkpoint_dir.as_deref(), &status_file);
-            match watch {
-                Some(n) if !STOP.load(Ordering::SeqCst) => {
-                    std::thread::sleep(Duration::from_secs(n.max(1)))
-                }
-                _ => break Ok(0),
+        } => {
+            // --watch: a full screen view on the terminal's alternate screen,
+            // redrawn every N seconds until Ctrl-C, then the screen is
+            // restored. Without it, one plain report.
+            let tty = watch.is_some() && std::io::IsTerminal::is_terminal(&std::io::stdout());
+            if tty {
+                print!("\x1b[?1049h\x1b[?25l");
             }
-        },
+            loop {
+                if tty {
+                    print!("\x1b[H\x1b[2J");
+                    println!(
+                        "mersenne-forge status, every {} s (Ctrl-C to quit)\n",
+                        watch.unwrap_or(1).max(1)
+                    );
+                }
+                print_status(&worktodo, &results, checkpoint_dir.as_deref(), &status_file);
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                match watch {
+                    Some(n) if !STOP.load(Ordering::SeqCst) => {
+                        let until = std::time::Instant::now() + Duration::from_secs(n.max(1));
+                        while std::time::Instant::now() < until && !STOP.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                    }
+                    _ => break,
+                }
+                if STOP.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
+            if tty {
+                print!("\x1b[?25h\x1b[?1049l");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+            Ok(0)
+        }
         Cmd::Primenet {
             user,
             password_file,
