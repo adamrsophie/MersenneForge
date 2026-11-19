@@ -25,6 +25,7 @@ pub mod worktodo;
 const BUILD_SOURCES: &[(&str, &[u8])] = &[
     ("Cargo.lock", include_bytes!("../Cargo.lock")),
     ("Cargo.toml", include_bytes!("../Cargo.toml")),
+    ("build.rs", include_bytes!("../build.rs")),
     ("src/backend/cpu.rs", include_bytes!("backend/cpu.rs")),
     (
         "src/backend/cuda/kernels.cu",

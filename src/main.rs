@@ -189,6 +189,15 @@ enum Cmd {
         #[arg(long)]
         proof_power: Option<u32>,
     },
+    /// Print one power reading in watts from a built-in sensor, for use as a
+    /// benchmark telemetry command: rapl (Linux CPU package), nvidia
+    /// (nvidia-smi, per device), or powermetrics (macOS, needs root).
+    Power {
+        #[arg(long)]
+        source: String,
+        #[arg(long, default_value_t = 0)]
+        device: u32,
+    },
     /// Check that a reported factor divides 2^p - 1. Exit 0 when it does.
     CheckFactor {
         #[arg(long)]
@@ -1527,7 +1536,8 @@ fn main() -> ExitCode {
         Cmd::Bench { .. }
         | Cmd::BenchRender { .. }
         | Cmd::BenchAnalyze { .. }
-        | Cmd::Work { .. } => false,
+        | Cmd::Work { .. }
+        | Cmd::Power { .. } => false,
     };
     let _ = ctrlc::set_handler(|| {
         if STOP.swap(true, Ordering::SeqCst) {
@@ -1605,6 +1615,14 @@ fn main() -> ExitCode {
             proof_dir,
             proof_power,
         }),
+        Cmd::Power { source, device } => {
+            mersenne_forge::evidence::sample_power(&source, device)
+                .map(|w| {
+                    println!("{w:.3} W");
+                    0
+                })
+                .map_err(|e| fail(EXIT_UNSUPPORTED, e))
+        }
         Cmd::CheckFactor {
             exponent,
             factor,

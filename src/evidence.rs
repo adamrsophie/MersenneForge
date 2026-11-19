@@ -5,7 +5,7 @@
 //! recorded observations. Every value that cannot be determined is recorded
 //! as unknown, never guessed.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -107,11 +107,11 @@ impl Provenance {
             .map(|f| f.0.to_string())
             .collect(),
             lockfile_sha3: hex(&crate::proof::sha3_256(&[include_bytes!("../Cargo.lock")])),
-            rustc: UNKNOWN.into(),
+            rustc: env!("MERSENNE_FORGE_RUSTC").into(),
             cpu_model: cpu_model().unwrap_or_else(|| UNKNOWN.into()),
             logical_cpus: std::thread::available_parallelism()
                 .map_or(UNKNOWN.into(), |n| n.to_string()),
-            power_policy: UNKNOWN.into(),
+            power_policy: power_policy(),
         }
     }
 }
@@ -188,6 +188,95 @@ pub struct PowerRecord {
     pub energy_joules: Option<f64>,
     /// Seconds between the first and last reading: what the energy covers.
     pub span_secs: f64,
+}
+
+/// The host's power policy where it can be read without privileges: the
+/// Linux CPU frequency governor, or the macOS low power mode setting.
+fn power_policy() -> String {
+    if let Ok(g) =
+        std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+    {
+        return format!("cpufreq governor {}", g.trim());
+    }
+    if cfg!(target_os = "macos") {
+        if let Ok(o) = std::process::Command::new("pmset").arg("-g").output() {
+            let text = String::from_utf8_lossy(&o.stdout);
+            if let Some(l) = text.lines().find(|l| l.trim_start().starts_with("lowpowermode")) {
+                return l.split_whitespace().collect::<Vec<_>>().join(" ");
+            }
+        }
+    }
+    UNKNOWN.into()
+}
+
+/// Read one power value in watts from a built-in source, for use as the
+/// benchmark telemetry command (`mersenne-forge power --source ...`):
+///
+/// * `rapl`: Linux powercap package energy counter, sampled 100 ms apart
+///   (`/sys/class/powercap/intel-rapl:0`, readable by root on most systems);
+///   system CPU package scope.
+/// * `nvidia`: `nvidia-smi --query-gpu=power.draw` for `device`; device scope.
+/// * `powermetrics`: macOS `powermetrics` combined CPU, GPU, and ANE power
+///   (needs root); system scope.
+pub fn sample_power(source: &str, device: u32) -> Result<f64, String> {
+    match source {
+        "rapl" => {
+            let base = Path::new("/sys/class/powercap/intel-rapl:0");
+            let read = |f: &str| -> Result<u64, String> {
+                std::fs::read_to_string(base.join(f))
+                    .map_err(|e| format!("{}: {e}", base.join(f).display()))?
+                    .trim()
+                    .parse()
+                    .map_err(|e| format!("{f}: {e}"))
+            };
+            let range = read("max_energy_range_uj")?;
+            let (e0, t0) = (read("energy_uj")?, Instant::now());
+            std::thread::sleep(Duration::from_millis(100));
+            let (e1, dt) = (read("energy_uj")?, t0.elapsed().as_secs_f64());
+            // The counter wraps at max_energy_range_uj.
+            let de = if e1 >= e0 { e1 - e0 } else { e1 + range - e0 };
+            Ok(de as f64 / 1e6 / dt)
+        }
+        "nvidia" => {
+            let o = std::process::Command::new("nvidia-smi")
+                .args([
+                    "--query-gpu=power.draw",
+                    "--format=csv,noheader,nounits",
+                    "-i",
+                    &device.to_string(),
+                ])
+                .output()
+                .map_err(|e| format!("nvidia-smi: {e}"))?;
+            if !o.status.success() {
+                return Err(format!("nvidia-smi exited with {}", o.status));
+            }
+            parse_watts(&String::from_utf8_lossy(&o.stdout))
+                .ok_or_else(|| "nvidia-smi printed no power value".into())
+        }
+        "powermetrics" => {
+            let o = std::process::Command::new("powermetrics")
+                .args(["-n", "1", "-i", "100", "--samplers", "cpu_power,gpu_power"])
+                .output()
+                .map_err(|e| format!("powermetrics: {e}"))?;
+            if !o.status.success() {
+                return Err(format!(
+                    "powermetrics exited with {} (it needs root)",
+                    o.status
+                ));
+            }
+            let text = String::from_utf8_lossy(&o.stdout);
+            let line = text
+                .lines()
+                .find(|l| l.contains("Combined Power"))
+                .ok_or("powermetrics printed no combined power line")?;
+            let mw = parse_watts(line.rsplit(':').next().unwrap_or(""))
+                .ok_or("unreadable combined power value")?;
+            Ok(mw / 1000.0)
+        }
+        other => Err(format!(
+            "unknown power source {other:?}: use rapl, nvidia, or powermetrics"
+        )),
+    }
 }
 
 /// One power reading: run the sensor command for at most `limit`, read at
@@ -574,8 +663,8 @@ mod tests {
     #[test]
     fn provenance_names_unknowns() {
         let p = Provenance::collect();
-        assert_eq!(p.rustc, "unknown");
-        assert_eq!(p.power_policy, "unknown");
+        assert!(p.rustc.starts_with("rustc ") || p.rustc == "unknown");
+        assert!(!p.power_policy.is_empty());
         assert_eq!(p.source_identity, crate::build_identity());
         assert_eq!(p.lockfile_sha3.len(), 64);
         assert_eq!(p.executable_sha3.len(), 64);

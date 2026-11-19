@@ -1214,7 +1214,7 @@ fn bench_production_runs_keep_verified_evidence() {
         v["provenance"]["source_identity"],
         mersenne_forge::build_identity()
     );
-    assert_eq!(v["provenance"]["rustc"], "unknown");
+    assert!(v["provenance"]["rustc"].as_str().unwrap().starts_with("rustc "));
     let prod = &v["observations"][0];
     assert_eq!(prod["status"], "completed", "{prod}");
     assert_eq!(prod["mode"], "production");
