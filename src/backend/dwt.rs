@@ -202,6 +202,62 @@ struct Plan {
     inv_weight: Vec<f64>,
     fwd: Arc<dyn Fft<f64>>,
     inv: Arc<dyn Fft<f64>>,
+    /// Opt-in packed real transform (see [`Packed`]).
+    packed: Option<Packed>,
+}
+
+/// The real input packed two values per complex value: a length n/2 complex
+/// transform of z_j = a_{2j} + i a_{2j+1}, untangled into the length n
+/// spectrum X_0..X_{n/2} (the rest is its conjugate mirror), about half the
+/// work of the complex transform of real data. Opt-in through the
+/// `MERSENNE_FORGE_DWT_PACKED=1` environment variable; its plan name differs,
+/// so checkpoints never cross between the two forms.
+///
+/// Untangle: with E = FFT(a_even), O = FFT(a_odd), w = exp(-2 pi i / n),
+/// Z = E + iO, so E_k = (Z_k + conj Z_{m-k}) / 2, O_k = (Z_k - conj Z_{m-k}) / 2i,
+/// and X_k = E_k + w^k O_k, X_{k+m} = E_k - w^k O_k. The inverse runs the
+/// same identities backwards: E_k = (Y_k + conj Y_{m-k}) / 2,
+/// O_k = (Y_k - conj Y_{m-k}) / (2 w^k), and IFFT(E + iO) / m gives the even
+/// and odd outputs as real and imaginary parts.
+struct Packed {
+    m: usize,
+    fwd: Arc<dyn Fft<f64>>,
+    inv: Arc<dyn Fft<f64>>,
+    /// w^k for k = 0..=m.
+    tw: Vec<C64>,
+}
+
+impl Packed {
+    fn new(n: usize, planner: &mut FftPlanner<f64>) -> Packed {
+        let m = n / 2;
+        let tw = (0..=m)
+            .map(|k| {
+                let a = -2.0 * std::f64::consts::PI * k as f64 / n as f64;
+                C64::new(a.cos(), a.sin())
+            })
+            .collect();
+        Packed {
+            m,
+            fwd: planner.plan_fft_forward(m),
+            inv: planner.plan_fft_inverse(m),
+            tw,
+        }
+    }
+
+    /// X_k from Z_k and conj Z_{m-k}.
+    fn untangle(zk: C64, zc: C64, w: C64) -> C64 {
+        (zk + zc) * 0.5 + w * ((zk - zc) * C64::new(0.0, -0.5))
+    }
+
+    /// E_k + i O_k from Y_k and conj Y_{m-k}.
+    fn retangle(yk: C64, yc: C64, w: C64) -> C64 {
+        (yk + yc) * 0.5 + C64::new(0.0, 1.0) * ((yk - yc) * 0.5 * w.conj())
+    }
+}
+
+/// Whether the packed transform was asked for.
+fn packed_requested() -> bool {
+    std::env::var("MERSENNE_FORGE_DWT_PACKED").is_ok_and(|v| v == "1")
 }
 
 impl Plan {
@@ -223,7 +279,85 @@ impl Plan {
             inv_weight,
             fwd: planner.plan_fft_forward(n),
             inv: planner.plan_fft_inverse(n),
+            packed: None,
         }
+    }
+
+    /// The same plan with the packed real transform, when n allows it.
+    fn with_packing(mut self) -> Plan {
+        if self.n >= 4 && self.n % 2 == 0 {
+            self.packed = Some(Packed::new(self.n, &mut FftPlanner::<f64>::new()));
+        }
+        self
+    }
+
+    /// Packed weighted transform of balanced words: X_0..=X_m into buf.
+    fn forward_packed(&self, pk: &Packed, x: &BalancedWords, buf: &mut [C64], scratch: &mut [C64]) {
+        let m = pk.m;
+        for (j, c) in buf[..m].iter_mut().enumerate() {
+            *c = C64::new(
+                x.0[2 * j] as f64 * self.weight[2 * j],
+                x.0[2 * j + 1] as f64 * self.weight[2 * j + 1],
+            );
+        }
+        pk.fwd.process_with_scratch(&mut buf[..m], scratch);
+        let z0 = buf[0];
+        buf[m] = C64::new(z0.re - z0.im, 0.0);
+        buf[0] = C64::new(z0.re + z0.im, 0.0);
+        for k in 1..=m / 2 {
+            let (zk, zmk) = (buf[k], buf[m - k]);
+            buf[k] = Packed::untangle(zk, zmk.conj(), pk.tw[k]);
+            buf[m - k] = Packed::untangle(zmk, zk.conj(), pk.tw[m - k]);
+        }
+    }
+
+    /// Packed counterpart of [`Plan::finish`] for a spectrum Y_0..=Y_m in buf.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_packed(
+        &self,
+        pk: &Packed,
+        buf: &mut [C64],
+        scratch: &mut [C64],
+        vals: &mut [i64],
+        addend: i64,
+        max_seen: &mut f64,
+        out: &mut BalancedWords,
+    ) -> BackendResult<()> {
+        let m = pk.m;
+        let (y0, ym) = (buf[0], buf[m]);
+        buf[0] = Packed::retangle(y0, ym.conj(), pk.tw[0]);
+        for k in 1..=m / 2 {
+            let (yk, ymk) = (buf[k], buf[m - k]);
+            buf[k] = Packed::retangle(yk, ymk.conj(), pk.tw[k]);
+            buf[m - k] = Packed::retangle(ymk, yk.conj(), pk.tw[m - k]);
+        }
+        pk.inv.process_with_scratch(&mut buf[..m], scratch);
+        let scale = 1.0 / m as f64;
+        let mut worst = 0.0f64;
+        for i in 0..self.n {
+            let c = buf[i / 2];
+            let raw = if i % 2 == 0 { c.re } else { c.im };
+            let x = raw * scale * self.inv_weight[i];
+            let r = x.round();
+            let err = (x - r).abs();
+            if !(err <= ROUNDOFF_LIMIT && r.abs() <= MAX_OUTPUT_MAGNITUDE) {
+                *max_seen = max_seen.max(if err.is_nan() { f64::INFINITY } else { err });
+                return Err(BackendError::Fault(format!(
+                    "roundoff check failed (packed transform): word {i} is {x} (distance {err:.4} from an integer, limit {ROUNDOFF_LIMIT}); \
+                     transform length {} is too short for p = {} or the data is corrupt",
+                    self.n, self.p
+                )));
+            }
+            worst = worst.max(err);
+            vals[i] = r as i64;
+        }
+        *max_seen = max_seen.max(worst);
+        vals[0] += addend;
+        self.carry(vals, true)?;
+        for (o, &v) in out.0.iter_mut().zip(vals.iter()) {
+            *o = v as i32;
+        }
+        Ok(())
     }
 
     /// Weighted transform of balanced words into `buf`.
@@ -370,7 +504,34 @@ impl DwtBackend {
     /// Picks the smallest supported transform length for p. Errors with
     /// BackendError::Unsupported outside supported_exponents().
     pub fn new(p: u32) -> BackendResult<DwtBackend> {
-        Ok(Self::build(p, length_for(p)?))
+        let mut be = Self::build(p, length_for(p)?);
+        if packed_requested() {
+            be.use_packed();
+        }
+        Ok(be)
+    }
+
+    /// Switch to the packed real transform (when the length is even and at
+    /// least 4). Used by `new` under `MERSENNE_FORGE_DWT_PACKED=1`, and by
+    /// tests directly.
+    #[doc(hidden)]
+    pub fn use_packed(&mut self) {
+        let plan = std::mem::replace(&mut self.plan, Plan::new(self.plan.p, self.plan.n));
+        self.plan = plan.with_packing();
+        if let Some(pk) = &self.plan.packed {
+            let need = pk
+                .fwd
+                .get_inplace_scratch_len()
+                .max(pk.inv.get_inplace_scratch_len());
+            if self.scratch.fft.len() < need {
+                self.scratch.fft.resize(need, C64::new(0.0, 0.0));
+            }
+        }
+    }
+
+    /// Whether the packed real transform is in use.
+    pub fn is_packed(&self) -> bool {
+        self.plan.packed.is_some()
     }
 
     /// Test-only: use transform length `n` regardless of the bits-per-word
@@ -442,6 +603,17 @@ impl DwtBackend {
     /// caller restores the original.
     fn square_loop(&mut self, x: &mut BalancedWords, count: u64, minus: i64) -> BackendResult<()> {
         let Scratch { a, fft, vals, .. } = &mut self.scratch;
+        if let Some(pk) = &self.plan.packed {
+            for _ in 0..count {
+                self.plan.forward_packed(pk, x, a, fft);
+                for c in a[..=pk.m].iter_mut() {
+                    *c = *c * *c;
+                }
+                self.plan
+                    .finish_packed(pk, a, fft, vals, -minus, &mut self.max_roundoff, x)?;
+            }
+            return Ok(());
+        }
         for _ in 0..count {
             self.plan.forward(x, a, fft);
             for c in a.iter_mut() {
@@ -474,7 +646,11 @@ impl Backend for DwtBackend {
         BackendIdentity {
             kind: "dwt".into(),
             build: crate::build_identity().into(),
-            plan: plan_name(self.plan.n),
+            plan: if self.plan.packed.is_some() {
+                format!("{} packed", plan_name(self.plan.n))
+            } else {
+                plan_name(self.plan.n)
+            },
             device: String::new(),
         }
     }
@@ -540,6 +716,20 @@ impl Backend for DwtBackend {
                 .get(&src.0)
                 .ok_or(BackendError::InvalidHandle(src.0))?,
         );
+        if let Some(pk) = &self.plan.packed {
+            self.plan.forward_packed(pk, x, a, fft);
+            self.plan.forward_packed(pk, y, b, fft);
+            for (u, v) in a[..=pk.m].iter_mut().zip(b[..=pk.m].iter()) {
+                *u *= *v;
+            }
+            let out = self
+                .regs
+                .get_mut(&dst.0)
+                .ok_or(BackendError::InvalidHandle(dst.0))?;
+            return self
+                .plan
+                .finish_packed(pk, a, fft, vals, 0, &mut self.max_roundoff, out);
+        }
         self.plan.forward(x, a, fft);
         self.plan.forward(y, b, fft);
         for (u, v) in a.iter_mut().zip(b.iter()) {
@@ -577,6 +767,42 @@ impl Backend for DwtBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The packed real transform gives the same residues as the CPU
+    /// reference, for squaring, LL steps, and products, at even lengths of
+    /// each radix family.
+    #[test]
+    fn packed_transform_matches_the_reference() {
+        use crate::backend::cpu::CpuBackend;
+        for p in [127u32, 521, 1279, 4423, 9941, 21701] {
+            let mut d = DwtBackend::new(p).unwrap();
+            d.use_packed();
+            if !d.is_packed() {
+                continue;
+            }
+            assert!(d.identity().plan.ends_with(" packed"));
+            let mut c = CpuBackend::new(p).unwrap();
+            let seed = Residue::from_u64(p, 3);
+            let (dx, dy, cx, cy) = (
+                d.alloc().unwrap(),
+                d.alloc().unwrap(),
+                c.alloc().unwrap(),
+                c.alloc().unwrap(),
+            );
+            for (be, x, y) in [
+                (&mut d as &mut dyn Backend, dx, dy),
+                (&mut c as &mut dyn Backend, cx, cy),
+            ] {
+                be.import(x, &seed).unwrap();
+                be.square(x, 50).unwrap();
+                be.copy(y, x).unwrap();
+                be.ll_step(y, 7).unwrap();
+                be.mul(x, y).unwrap();
+            }
+            assert_eq!(d.export(dx).unwrap(), c.export(cx).unwrap(), "p = {p}");
+            assert_eq!(d.export(dy).unwrap(), c.export(cy).unwrap(), "p = {p}");
+        }
+    }
 
     #[test]
     fn memory_estimate_matches_the_built_backend() {
