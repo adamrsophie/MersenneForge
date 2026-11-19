@@ -40,6 +40,8 @@ const MAX_IN_FLIGHT: usize = 2;
 pub struct GpuOptions {
     /// Adapter index as listed by probe(). None: the first hardware adapter.
     pub device: Option<u32>,
+    /// Fused radix 4 stages (also enabled by MERSENNE_FORGE_GPU_RADIX4=1).
+    pub radix4: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -62,6 +64,11 @@ pub struct GpuProbe {
 /// Inclusive range of exponents with a plan (see [`model::supported_range`]).
 pub fn supported_exponents() -> (u32, u32) {
     model::supported_range()
+}
+
+/// Whether fused radix 4 stages were asked for (MERSENNE_FORGE_GPU_RADIX4=1).
+fn radix4_requested() -> bool {
+    std::env::var("MERSENNE_FORGE_GPU_RADIX4").is_ok_and(|v| v == "1")
 }
 
 fn plan_name(n: u32) -> String {
@@ -202,6 +209,8 @@ struct Pipes {
     weight: wgpu::ComputePipeline,
     dif: wgpu::ComputePipeline,
     dit: wgpu::ComputePipeline,
+    dif4: wgpu::ComputePipeline,
+    dit4: wgpu::ComputePipeline,
     sqr: wgpu::ComputePipeline,
     pmul: wgpu::ComputePipeline,
     unweight: wgpu::ComputePipeline,
@@ -229,6 +238,9 @@ pub struct GpuBackend {
     bg_ll: wgpu::BindGroup,
     bg_dif: Vec<wgpu::BindGroup>,
     bg_dit: Vec<wgpu::BindGroup>,
+    /// Opt-in fused stages: (radix 4, bind group) per pass, forward and
+    /// inverse. None: one pass per stage.
+    fused: Option<(Vec<(bool, wgpu::BindGroup)>, Vec<(bool, wgpu::BindGroup)>)>,
     bg_carry: [wgpu::BindGroup; 2],
     regs: HashMap<u32, RegBuf>,
     /// First uncaptured device error or device loss. Sticky.
@@ -368,6 +380,8 @@ impl GpuBackend {
             weight: pipe("weight"),
             dif: pipe("dif"),
             dit: pipe("dit"),
+            dif4: pipe("dif4"),
+            dit4: pipe("dit4"),
             sqr: pipe("sqr"),
             pmul: pipe("pmul"),
             unweight: pipe("unweight"),
@@ -438,6 +452,28 @@ impl GpuBackend {
             bg_dit.push(sh.bind(&params, &s[1], &s[0]));
             m *= 2;
         }
+        // Fused stages: radix 4 passes from the first stage on, and one radix
+        // 2 pass when the stage count is odd (the last DIF stage, the last
+        // DIT stage).
+        let fused = (opts.radix4 || radix4_requested()).then(|| {
+            let mut f = Vec::new();
+            let mut m = plan.n / 2;
+            while m >= 1 {
+                let params = sh.params([plan.n, m, plan.n / (2 * m), 0]);
+                let four = m >= 2;
+                f.push((four, sh.bind(&params, &s[1], &s[0])));
+                m /= if four { 4 } else { 2 };
+            }
+            let mut i = Vec::new();
+            let mut h = 1;
+            while h < plan.n {
+                let params = sh.params([plan.n, h, plan.n / (2 * h), 0]);
+                let four = 4 * h <= plan.n;
+                i.push((four, sh.bind(&params, &s[1], &s[0])));
+                h *= if four { 4 } else { 2 };
+            }
+            (f, i)
+        });
         let max_groups = limits.max_compute_workgroups_per_dimension.max(1);
         let work = n * u64::from(2 * plan.log_n + plan.passes + 3);
         let g = GpuBackend {
@@ -446,6 +482,7 @@ impl GpuBackend {
             bg_carry: [sh.bind(&base, &s[0], &s[1]), sh.bind(&base, &s[1], &s[0])],
             bg_dif,
             bg_dit,
+            fused,
             base,
             s,
             sh,
@@ -491,6 +528,16 @@ impl GpuBackend {
     fn encode_forward(&self, pass: &mut wgpu::ComputePass, load: &wgpu::BindGroup) {
         let n = self.plan.n;
         self.dispatch(pass, &self.pipes.weight, load, n);
+        if let Some((fwd, _)) = &self.fused {
+            for (four, bg) in fwd {
+                if *four {
+                    self.dispatch(pass, &self.pipes.dif4, bg, n / 4);
+                } else {
+                    self.dispatch(pass, &self.pipes.dif, bg, n / 2);
+                }
+            }
+            return;
+        }
         for bg in &self.bg_dif {
             self.dispatch(pass, &self.pipes.dif, bg, n / 2);
         }
@@ -499,8 +546,21 @@ impl GpuBackend {
     /// Inverse transform T, unweight, carry, and store into `dst`.
     fn encode_back(&self, pass: &mut wgpu::ComputePass, unweight: &wgpu::BindGroup, dst: &RegBuf) {
         let n = self.plan.n;
-        for bg in &self.bg_dit {
-            self.dispatch(pass, &self.pipes.dit, bg, n / 2);
+        match &self.fused {
+            Some((_, inv)) => {
+                for (four, bg) in inv {
+                    if *four {
+                        self.dispatch(pass, &self.pipes.dit4, bg, n / 4);
+                    } else {
+                        self.dispatch(pass, &self.pipes.dit, bg, n / 2);
+                    }
+                }
+            }
+            None => {
+                for bg in &self.bg_dit {
+                    self.dispatch(pass, &self.pipes.dit, bg, n / 2);
+                }
+            }
         }
         self.dispatch(pass, &self.pipes.unweight, unweight, n);
         for t in 1..self.plan.passes {
@@ -612,7 +672,11 @@ impl Backend for GpuBackend {
                 crate::build_identity(),
                 kernel_source_hash()
             ),
-            plan: plan_name(self.plan.n),
+            plan: if self.fused.is_some() {
+                format!("{} radix4", plan_name(self.plan.n))
+            } else {
+                plan_name(self.plan.n)
+            },
             device: self.device_name.clone(),
         }
     }
@@ -751,6 +815,28 @@ mod tests {
 
     fn backend(p: u32) -> GpuBackend {
         GpuBackend::new(p, &GpuOptions::default()).expect("a hardware GPU adapter is required")
+    }
+
+    /// Fused radix 4 stages give the same residues as one pass per stage,
+    /// at odd and even stage counts.
+    #[test]
+    fn fused_stages_match_single_stages() {
+        let opts = GpuOptions {
+            radix4: true,
+            ..GpuOptions::default()
+        };
+        for p in [127u32, 521, 4423, 86243] {
+            let mut a = backend(p);
+            let mut b = GpuBackend::new(p, &opts).unwrap();
+            assert!(b.identity().plan.ends_with(" radix4"));
+            let x = Residue::from_u64(p, 3);
+            let (ra, rb) = (a.alloc().unwrap(), b.alloc().unwrap());
+            a.import(ra, &x).unwrap();
+            b.import(rb, &x).unwrap();
+            a.square(ra, 40).unwrap();
+            b.square(rb, 40).unwrap();
+            assert_eq!(a.export(ra).unwrap(), b.export(rb).unwrap(), "p = {p}");
+        }
     }
 
     impl GpuBackend {

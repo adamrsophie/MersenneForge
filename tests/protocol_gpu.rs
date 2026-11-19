@@ -11,8 +11,7 @@ use mersenne_forge::backend::cpu::CpuBackend;
 use mersenne_forge::backend::gpu::{GpuBackend, GpuOptions};
 
 fn mk(p: u32) -> GpuBackend {
-    GpuBackend::new(p, &GpuOptions { device: None })
-        .expect("a GPU adapter is required for these tests")
+    GpuBackend::new(p, &GpuOptions::default()).expect("a GPU adapter is required for these tests")
 }
 
 protocol_suite!(mk);

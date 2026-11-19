@@ -110,7 +110,13 @@ pub fn open(kind: BackendKind, p: u32, device: Option<u32>) -> BackendResult<Box
 #[cfg(feature = "gpu")]
 fn open_gpu(p: u32, device: Option<u32>) -> BackendResult<Box<dyn Backend>> {
     use crate::backend::gpu::{GpuBackend, GpuOptions};
-    Ok(Box::new(GpuBackend::new(p, &GpuOptions { device })?))
+    Ok(Box::new(GpuBackend::new(
+        p,
+        &GpuOptions {
+            device,
+            ..GpuOptions::default()
+        },
+    )?))
 }
 
 #[cfg(not(feature = "gpu"))]

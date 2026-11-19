@@ -125,6 +125,61 @@ fn dit(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw:
     }
 }
 
+// Two DIF stages in one pass (opt-in, MERSENNE_FORGE_GPU_RADIX4=1): the
+// stage with half block m (twiddle stride s = P.stride) then the stage with
+// half block m / 2 (stride 2s), on the four elements b + j + {0, 1, 2, 3} m/2.
+// The same field operations as two `dif` passes, in the same order, so the
+// result is identical; only memory traffic and dispatches halve.
+@compute @workgroup_size(256)
+fn dif4(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    let m = P.m;
+    let h = m / 2u;
+    let s = P.stride;
+    for (var u = g.x; u < P.n / 4u; u += nw.x * WG) {
+        let j = u % h;
+        let i0 = (u / h) * 2u * m + j;
+        let e0 = T[i0];
+        let e1 = T[i0 + h];
+        let e2 = T[i0 + m];
+        let e3 = T[i0 + m + h];
+        let a0 = cadd(e0, e2);
+        let a2 = cmul(csub(e0, e2), TW[j * s]);
+        let a1 = cadd(e1, e3);
+        let a3 = cmul(csub(e1, e3), TW[(j + h) * s]);
+        let t = TW[j * 2u * s];
+        T[i0] = cadd(a0, a1);
+        T[i0 + h] = cmul(csub(a0, a1), t);
+        T[i0 + m] = cadd(a2, a3);
+        T[i0 + m + h] = cmul(csub(a2, a3), t);
+    }
+}
+
+// Two DIT stages in one pass: half block h (stride s = P.stride) then half
+// block 2h (stride s / 2), on the elements b + j + {0, 1, 2, 3} h. Identical
+// to two `dit` passes.
+@compute @workgroup_size(256)
+fn dit4(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    let h = P.m;
+    let s = P.stride;
+    for (var u = g.x; u < P.n / 4u; u += nw.x * WG) {
+        let j = u % h;
+        let i0 = (u / h) * 4u * h + j;
+        let ca = conj(TW[j * s]);
+        let x1 = cmul(T[i0 + h], ca);
+        let x3 = cmul(T[i0 + 3u * h], ca);
+        let e0 = cadd(T[i0], x1);
+        let e1 = csub(T[i0], x1);
+        let e2 = cadd(T[i0 + 2u * h], x3);
+        let e3 = csub(T[i0 + 2u * h], x3);
+        let y2 = cmul(e2, conj(TW[j * (s / 2u)]));
+        let y3 = cmul(e3, conj(TW[(j + h) * (s / 2u)]));
+        T[i0] = cadd(e0, y2);
+        T[i0 + 2u * h] = csub(e0, y2);
+        T[i0 + h] = cadd(e1, y3);
+        T[i0 + 3u * h] = csub(e1, y3);
+    }
+}
+
 @compute @workgroup_size(256)
 fn sqr(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
     for (var i = g.x; i < P.n; i += nw.x * WG) {

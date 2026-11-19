@@ -316,7 +316,13 @@ fn error_paths() {
         }
     }
     assert!(matches!(
-        GpuBackend::new(521, &GpuOptions { device: Some(9999) }),
+        GpuBackend::new(
+            521,
+            &GpuOptions {
+                device: Some(9999),
+                ..GpuOptions::default()
+            }
+        ),
         Err(BackendError::Unsupported(_))
     ));
 
