@@ -12,8 +12,9 @@
 //!
 //! Limits (deliberate, see the `ponytail:` notes): TF runs on the CPU, with
 //! a fast path for factors below 2^64 and a slow arbitrary-precision path
-//! above it; P-1 stage 1 runs on any backend, stage 2 runs on the host with
-//! arbitrary-precision arithmetic and is practical only for small exponents.
+//! above it; P-1 runs both stages on any backend, but stage 2 takes one
+//! multiply and one host round trip per prime (no prime pairing) and the
+//! final gcd runs on the host, so it suits small and moderate exponents.
 
 use num_bigint::BigUint;
 use num_integer::Integer;
@@ -243,7 +244,7 @@ fn factor_from(
 
 /// P-1 with bounds b1 and b2 (b2 <= b1 skips stage 2). Stage 1 computes
 /// x = 3^E mod N on `be`; stage 2 multiplies (x^q - 1) over primes
-/// b1 < q <= b2 on the host. `stop` is polled about every 10,000 stage 1
+/// b1 < q <= b2, also on `be`. `stop` is polled about every 10,000 stage 1
 /// bits and every 1,000 stage 2 primes; a stopped run reports complete =
 /// false and must start over.
 pub fn pm1(
@@ -253,6 +254,30 @@ pub fn pm1(
     stop: &dyn Fn() -> bool,
 ) -> Result<Pm1Outcome, String> {
     pm1_resumable(be, b1, b2, None, stop, &mut |_, _| {})
+}
+
+/// dst = base^e on the backend (e >= 1), by left to right square and
+/// multiply; `scratch` is clobbered.
+fn pow_small(
+    be: &mut dyn Backend,
+    dst: crate::backend::Reg,
+    base: crate::backend::Reg,
+    e: u64,
+    scratch: crate::backend::Reg,
+) -> Result<(), String> {
+    let berr = |e: crate::backend::BackendError| e.to_string();
+    if e == 0 {
+        return Err("exponent 0".into());
+    }
+    be.copy(scratch, base).map_err(berr)?;
+    be.copy(dst, base).map_err(berr)?;
+    for i in (0..63 - e.leading_zeros()).rev() {
+        be.square(dst, 1).map_err(berr)?;
+        if e >> i & 1 == 1 {
+            be.mul(dst, scratch).map_err(berr)?;
+        }
+    }
+    Ok(())
 }
 
 /// Stage 1 state: after bit `i` of E (counting down), x = 3^(E >> i).
@@ -342,9 +367,12 @@ pub fn pm1_resumable(
         out.complete = true;
         return Ok(out);
     }
-    // ponytail: host stage 2 with one modular multiply per prime; a device
-    // stage 2 needs a subtract operation on the backend and a prime-pairing
-    // plan, and is the upgrade path for large exponents.
+    // Stage 2 on the backend: y = x^q walks the primes by multiplying with
+    // cached powers x^d for each prime gap d, and acc collects (y - 1). The
+    // backend has no subtraction, so y goes to the host once per prime for
+    // the O(p) "- 1" and comes back; every multiplication stays on the
+    // device. ponytail: no prime pairing or baby step giant step; one device
+    // multiply plus one round trip per prime, upgrade when B2 grows large.
     let primes: Vec<u64> = primes_below(b2 + 1)
         .into_iter()
         .filter(|&q| q > b1)
@@ -353,23 +381,51 @@ pub fn pm1_resumable(
         out.complete = true;
         return Ok(out);
     };
-    let mut gaps: std::collections::HashMap<u64, BigUint> = Default::default();
-    let mut y = xb.modpow(&BigUint::from(q0), &n);
-    let mut acc = minus1(&y);
-    let mut last = q0;
-    for (j, &q) in primes.iter().enumerate().skip(1) {
-        let d = q - last;
-        let xd = gaps
-            .entry(d)
-            .or_insert_with(|| xb.modpow(&BigUint::from(d), &n));
-        y = &y * &*xd % &n;
-        acc = acc * minus1(&y) % &n;
-        last = q;
-        if j % 1000 == 0 && stop() {
-            out.notes.push(format!("stopped in stage 2 at q = {q}"));
-            return Ok(out);
+    let xr = be.alloc().map_err(berr)?;
+    be.import(xr, &x1).map_err(berr)?;
+    let y = be.alloc().map_err(berr)?;
+    let acc = be.alloc().map_err(berr)?;
+    let tmp = be.alloc().map_err(berr)?;
+    let mut regs = vec![xr, y, acc, tmp];
+    let result = (|| -> Result<Option<BigUint>, String> {
+        let one_less = |r: &Residue| -> Result<Residue, String> {
+            Ok(Residue::from_biguint(p, &minus1(&r.to_biguint())))
+        };
+        pow_small(be, y, xr, q0, tmp)?;
+        let first = be.export(y).map_err(berr)?;
+        be.import(acc, &one_less(&first)?).map_err(berr)?;
+        let mut gaps: std::collections::HashMap<u64, crate::backend::Reg> = Default::default();
+        let mut last = q0;
+        for (j, &q) in primes.iter().enumerate().skip(1) {
+            let d = q - last;
+            let g = match gaps.get(&d) {
+                Some(&g) => g,
+                None => {
+                    let g = be.alloc().map_err(berr)?;
+                    regs.push(g);
+                    pow_small(be, g, xr, d, tmp)?;
+                    gaps.insert(d, g);
+                    g
+                }
+            };
+            be.mul(y, g).map_err(berr)?;
+            let yv = be.export(y).map_err(berr)?;
+            be.import(tmp, &one_less(&yv)?).map_err(berr)?;
+            be.mul(acc, tmp).map_err(berr)?;
+            last = q;
+            if j % 1000 == 0 && stop() {
+                return Ok(None);
+            }
         }
+        Ok(Some(be.export(acc).map_err(berr)?.to_biguint()))
+    })();
+    for r in regs {
+        let _ = be.free(r);
     }
+    let Some(acc) = result? else {
+        out.notes.push("stopped in stage 2".into());
+        return Ok(out);
+    };
     if let Some(f) = factor_from(p, &acc, &n, &mut out.notes) {
         out.factor = Some(f);
         out.stage = Some(2);

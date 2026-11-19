@@ -204,6 +204,9 @@ struct Plan {
     inv: Arc<dyn Fft<f64>>,
     /// Opt-in packed real transform (see [`Packed`]).
     packed: Option<Packed>,
+    /// Opt-in threaded transforms (forward, inverse) of length n, or of the
+    /// packed length when packing is on.
+    par: Option<(ParFft, ParFft)>,
 }
 
 /// The real input packed two values per complex value: a length n/2 complex
@@ -255,6 +258,144 @@ impl Packed {
     }
 }
 
+/// A four step FFT of length n = n1 * n2 spread over threads (opt-in with
+/// `MERSENNE_FORGE_DWT_THREADS=N`). With j = j1 + n1 j2 and k = n2 k1 + k2,
+///
+/// ```text
+/// X[n2 k1 + k2] = sum_j1 W_n^(j1 k2) W_n1^(j1 k1) sum_j2 x[j1 + n1 j2] W_n2^(j2 k2)
+/// ```
+///
+/// so: n1 transforms of length n2 (one per j1, on a gathered row), a twiddle
+/// by W_n^(j1 k2), a transpose, n2 transforms of length n1, and a transpose
+/// back. Each step splits its rows over the threads. Unnormalized in both
+/// directions, as rustfft is.
+struct ParFft {
+    n1: usize,
+    n2: usize,
+    f1: Arc<dyn Fft<f64>>,
+    f2: Arc<dyn Fft<f64>>,
+    /// W_n^(j1 k2) at [j1 * n2 + k2], with the transform's sign.
+    tw: Vec<C64>,
+    threads: usize,
+    tmp: std::sync::Mutex<Vec<C64>>,
+}
+
+impl ParFft {
+    /// None when n has no useful split (both factors at least 16).
+    fn new(n: usize, inverse: bool, threads: usize) -> Option<ParFft> {
+        let n1 = (16..=n.isqrt()).rev().find(|d| n % d == 0)?;
+        let n2 = n / n1;
+        let mut planner = FftPlanner::<f64>::new();
+        let (f1, f2) = if inverse {
+            (planner.plan_fft_inverse(n1), planner.plan_fft_inverse(n2))
+        } else {
+            (planner.plan_fft_forward(n1), planner.plan_fft_forward(n2))
+        };
+        let sign = if inverse { 1.0 } else { -1.0 };
+        let mut tw = Vec::with_capacity(n);
+        for j1 in 0..n1 {
+            for k2 in 0..n2 {
+                // Reduce the exponent first so the angle stays accurate.
+                let e = (j1 * k2) % n;
+                let a = sign * 2.0 * std::f64::consts::PI * e as f64 / n as f64;
+                tw.push(C64::new(a.cos(), a.sin()));
+            }
+        }
+        Some(ParFft {
+            n1,
+            n2,
+            f1,
+            f2,
+            tw,
+            threads: threads.max(1),
+            tmp: std::sync::Mutex::new(vec![C64::new(0.0, 0.0); n]),
+        })
+    }
+
+    /// Rows per thread for `rows` rows.
+    fn chunk(&self, rows: usize) -> usize {
+        rows.div_ceil(self.threads).max(1)
+    }
+
+    fn process(&self, buf: &mut [C64]) {
+        let (n1, n2) = (self.n1, self.n2);
+        let mut guard = self.tmp.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = &mut guard[..];
+        // 1. Rows j1 of tmp: gather x[j1 + n1 j2], transform (length n2),
+        //    twiddle.
+        let rows = self.chunk(n1);
+        std::thread::scope(|s| {
+            let src = &*buf;
+            for (c, block) in tmp.chunks_mut(rows * n2).enumerate() {
+                s.spawn(move || {
+                    let mut scratch = vec![C64::new(0.0, 0.0); self.f2.get_inplace_scratch_len()];
+                    for (r, row) in block.chunks_mut(n2).enumerate() {
+                        let j1 = c * rows + r;
+                        for (j2, v) in row.iter_mut().enumerate() {
+                            *v = src[j1 + n1 * j2];
+                        }
+                        self.f2.process_with_scratch(row, &mut scratch);
+                        for (k2, v) in row.iter_mut().enumerate() {
+                            *v *= self.tw[j1 * n2 + k2];
+                        }
+                    }
+                });
+            }
+        });
+        // 2. Rows k2 of buf: gather tmp[j1 n2 + k2], transform (length n1).
+        let rows = self.chunk(n2);
+        std::thread::scope(|s| {
+            let src = &*tmp;
+            for (c, block) in buf.chunks_mut(rows * n1).enumerate() {
+                s.spawn(move || {
+                    let mut scratch = vec![C64::new(0.0, 0.0); self.f1.get_inplace_scratch_len()];
+                    for (r, row) in block.chunks_mut(n1).enumerate() {
+                        let k2 = c * rows + r;
+                        for (j1, v) in row.iter_mut().enumerate() {
+                            *v = src[j1 * n2 + k2];
+                        }
+                        self.f1.process_with_scratch(row, &mut scratch);
+                    }
+                });
+            }
+        });
+        // 3. X[n2 k1 + k2] = buf[k2 n1 + k1]: transpose into tmp, copy back.
+        let rows = self.chunk(n1);
+        std::thread::scope(|s| {
+            let src = &*buf;
+            for (c, block) in tmp.chunks_mut(rows * n2).enumerate() {
+                s.spawn(move || {
+                    for (r, row) in block.chunks_mut(n2).enumerate() {
+                        let k1 = c * rows + r;
+                        for (k2, v) in row.iter_mut().enumerate() {
+                            *v = src[k2 * n1 + k1];
+                        }
+                    }
+                });
+            }
+        });
+        buf.copy_from_slice(tmp);
+    }
+}
+
+/// Run one transform: the threaded four step form when present, otherwise
+/// the single threaded plan.
+fn run_fft(f: &Arc<dyn Fft<f64>>, par: Option<&ParFft>, buf: &mut [C64], scratch: &mut [C64]) {
+    match par {
+        Some(p) => p.process(buf),
+        None => f.process_with_scratch(buf, scratch),
+    }
+}
+
+/// Threads asked for with MERSENNE_FORGE_DWT_THREADS (2 or more), if any.
+fn threads_requested() -> Option<usize> {
+    std::env::var("MERSENNE_FORGE_DWT_THREADS")
+        .ok()?
+        .parse()
+        .ok()
+        .filter(|&t: &usize| t >= 2)
+}
+
 /// Whether the packed transform was asked for.
 fn packed_requested() -> bool {
     std::env::var("MERSENNE_FORGE_DWT_PACKED").is_ok_and(|v| v == "1")
@@ -280,6 +421,7 @@ impl Plan {
             fwd: planner.plan_fft_forward(n),
             inv: planner.plan_fft_inverse(n),
             packed: None,
+            par: None,
         }
     }
 
@@ -300,7 +442,12 @@ impl Plan {
                 x.0[2 * j + 1] as f64 * self.weight[2 * j + 1],
             );
         }
-        pk.fwd.process_with_scratch(&mut buf[..m], scratch);
+        run_fft(
+            &pk.fwd,
+            self.par.as_ref().map(|p| &p.0),
+            &mut buf[..m],
+            scratch,
+        );
         let z0 = buf[0];
         buf[m] = C64::new(z0.re - z0.im, 0.0);
         buf[0] = C64::new(z0.re + z0.im, 0.0);
@@ -331,7 +478,12 @@ impl Plan {
             buf[k] = Packed::retangle(yk, ymk.conj(), pk.tw[k]);
             buf[m - k] = Packed::retangle(ymk, yk.conj(), pk.tw[m - k]);
         }
-        pk.inv.process_with_scratch(&mut buf[..m], scratch);
+        run_fft(
+            &pk.inv,
+            self.par.as_ref().map(|p| &p.1),
+            &mut buf[..m],
+            scratch,
+        );
         let scale = 1.0 / m as f64;
         let mut worst = 0.0f64;
         for i in 0..self.n {
@@ -368,7 +520,7 @@ impl Plan {
         for (i, c) in buf.iter_mut().enumerate() {
             *c = C64::new(x.0[i] as f64 * self.weight[i], 0.0);
         }
-        self.fwd.process_with_scratch(buf, scratch);
+        run_fft(&self.fwd, self.par.as_ref().map(|p| &p.0), buf, scratch);
     }
 
     /// Inverse transform, unweight, round, check roundoff, add `addend` to
@@ -384,7 +536,7 @@ impl Plan {
         max_seen: &mut f64,
         out: &mut BalancedWords,
     ) -> BackendResult<()> {
-        self.inv.process_with_scratch(buf, scratch);
+        run_fft(&self.inv, self.par.as_ref().map(|p| &p.1), buf, scratch);
         let scale = 1.0 / self.n as f64;
         let mut worst = 0.0f64;
         for i in 0..self.n {
@@ -508,7 +660,26 @@ impl DwtBackend {
         if packed_requested() {
             be.use_packed();
         }
+        if let Some(t) = threads_requested() {
+            be.use_threads(t);
+        }
         Ok(be)
+    }
+
+    /// Run the transforms as four step FFTs on `threads` threads (when the
+    /// length splits into two factors of at least 16). Call after
+    /// `use_packed`, which replaces the plan. Used by `new` under
+    /// `MERSENNE_FORGE_DWT_THREADS=N`, and by tests directly.
+    #[doc(hidden)]
+    pub fn use_threads(&mut self, threads: usize) {
+        let len = self.plan.packed.as_ref().map_or(self.plan.n, |pk| pk.m);
+        self.plan.par = ParFft::new(len, false, threads)
+            .and_then(|f| ParFft::new(len, true, threads).map(|i| (f, i)));
+    }
+
+    /// Threads the transforms use (1 when not threaded).
+    pub fn threads(&self) -> usize {
+        self.plan.par.as_ref().map_or(1, |p| p.0.threads)
     }
 
     /// Switch to the packed real transform (when the length is even and at
@@ -646,10 +817,15 @@ impl Backend for DwtBackend {
         BackendIdentity {
             kind: "dwt".into(),
             build: crate::build_identity().into(),
-            plan: if self.plan.packed.is_some() {
-                format!("{} packed", plan_name(self.plan.n))
-            } else {
-                plan_name(self.plan.n)
+            plan: {
+                let mut name = plan_name(self.plan.n);
+                if self.plan.packed.is_some() {
+                    name.push_str(" packed");
+                }
+                if let Some((f, _)) = &self.plan.par {
+                    name.push_str(&format!(" threads={}", f.threads));
+                }
+                name
             },
             device: String::new(),
         }
@@ -771,6 +947,45 @@ mod tests {
     /// The packed real transform gives the same residues as the CPU
     /// reference, for squaring, LL steps, and products, at even lengths of
     /// each radix family.
+    #[test]
+    fn threaded_transform_matches_the_reference() {
+        use crate::backend::cpu::CpuBackend;
+        for (p, packed) in [
+            (21701u32, false),
+            (86243, false),
+            (86243, true),
+            (216091, true),
+        ] {
+            let mut d = DwtBackend::new(p).unwrap();
+            if packed {
+                d.use_packed();
+            }
+            d.use_threads(3);
+            if d.threads() != 3 {
+                continue;
+            }
+            assert!(d.identity().plan.contains(" threads=3"));
+            let mut c = CpuBackend::new(p).unwrap();
+            let seed = Residue::from_u64(p, 3);
+            let (dx, dy, cx, cy) = (
+                d.alloc().unwrap(),
+                d.alloc().unwrap(),
+                c.alloc().unwrap(),
+                c.alloc().unwrap(),
+            );
+            for (be, x, y) in [
+                (&mut d as &mut dyn Backend, dx, dy),
+                (&mut c as &mut dyn Backend, cx, cy),
+            ] {
+                be.import(x, &seed).unwrap();
+                be.square(x, 20).unwrap();
+                be.copy(y, x).unwrap();
+                be.mul(x, y).unwrap();
+            }
+            assert_eq!(d.export(dx).unwrap(), c.export(cx).unwrap(), "p = {p}");
+        }
+    }
+
     #[test]
     fn packed_transform_matches_the_reference() {
         use crate::backend::cpu::CpuBackend;
