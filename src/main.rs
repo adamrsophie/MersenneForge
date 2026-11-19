@@ -295,6 +295,19 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// ECM stage 1 on 2^p - 1 (host arithmetic, small exponents only).
+    Ecm {
+        #[arg(long)]
+        exponent: u32,
+        #[arg(long)]
+        b1: u64,
+        #[arg(long, default_value_t = 10)]
+        curves: u32,
+        #[arg(long, default_value_t = 6)]
+        sigma: u64,
+        #[arg(long)]
+        json: bool,
+    },
     /// Check that a reported factor divides 2^p - 1. Exit 0 when it does.
     CheckFactor {
         #[arg(long)]
@@ -2275,7 +2288,10 @@ fn main() -> ExitCode {
         | Cmd::Run { json, .. }
         | Cmd::Resume { json, .. }
         | Cmd::Verify { json, .. } => *json,
-        Cmd::CheckFactor { json, .. } | Cmd::Tf { json, .. } | Cmd::Pm1 { json, .. } => *json,
+        Cmd::CheckFactor { json, .. }
+        | Cmd::Tf { json, .. }
+        | Cmd::Pm1 { json, .. }
+        | Cmd::Ecm { json, .. } => *json,
         Cmd::Bench { .. }
         | Cmd::BenchRender { .. }
         | Cmd::BenchAnalyze { .. }
@@ -2384,6 +2400,29 @@ fn main() -> ExitCode {
                 println!("M{exponent} P-1 B1={b1} B2={b2}: factor {:?}", o.factor);
             }
             Ok(if o.complete { 0 } else { EXIT_INCOMPLETE })
+        }
+        Cmd::Ecm {
+            exponent,
+            b1,
+            curves,
+            sigma,
+            json,
+        } => {
+            let stop = || STOP.load(Ordering::SeqCst);
+            let o = mersenne_forge::factor::ecm(exponent, b1, curves, sigma, &stop)
+                .map_err(|e| fail(2, e))?;
+            if json {
+                println!("{}", serde_json::to_string(&o).expect("serializable"));
+            } else {
+                for n in &o.notes {
+                    println!("note: {n}");
+                }
+                println!(
+                    "M{exponent} ECM B1={b1}: {} curves, factor {:?} (sigma {:?})",
+                    o.curves, o.factor, o.found_sigma
+                );
+            }
+            Ok(0)
         }
         Cmd::CheckpointExport { input, output } => {
             let ck = Checkpoint::load_file(&input)

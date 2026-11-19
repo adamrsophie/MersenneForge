@@ -378,6 +378,159 @@ pub fn pm1_resumable(
     Ok(out)
 }
 
+/// Outcome of an ECM run.
+#[derive(Debug, Clone, Serialize)]
+pub struct EcmOutcome {
+    pub exponent: u32,
+    pub b1: u64,
+    /// Curves run to the end of stage 1.
+    pub curves: u32,
+    /// Suyama parameter of the first curve; curve i uses sigma + i.
+    pub sigma: u64,
+    /// A checked proper factor, when one was found (it may be composite).
+    pub factor: Option<String>,
+    /// The sigma of the curve that found it.
+    pub found_sigma: Option<u64>,
+    pub notes: Vec<String>,
+}
+
+/// Arithmetic modulo N on the host.
+struct ModN<'a>(&'a BigUint);
+
+impl ModN<'_> {
+    fn add(&self, a: &BigUint, b: &BigUint) -> BigUint {
+        (a + b) % self.0
+    }
+    fn sub(&self, a: &BigUint, b: &BigUint) -> BigUint {
+        (a + self.0 - b) % self.0
+    }
+    fn mul(&self, a: &BigUint, b: &BigUint) -> BigUint {
+        a * b % self.0
+    }
+}
+
+/// Point X:Z on a Montgomery curve, with (A + 2) / 4.
+type Point = (BigUint, BigUint);
+
+fn xdbl(m: &ModN, p: &Point, a24: &BigUint) -> Point {
+    let t1 = m.mul(&m.add(&p.0, &p.1), &m.add(&p.0, &p.1));
+    let t2 = m.mul(&m.sub(&p.0, &p.1), &m.sub(&p.0, &p.1));
+    let t3 = m.sub(&t1, &t2);
+    (m.mul(&t1, &t2), m.mul(&t3, &m.add(&t2, &m.mul(a24, &t3))))
+}
+
+/// P + Q, given D = P - Q.
+fn xadd(m: &ModN, p: &Point, q: &Point, d: &Point) -> Point {
+    let u = m.mul(&m.sub(&p.0, &p.1), &m.add(&q.0, &q.1));
+    let v = m.mul(&m.add(&p.0, &p.1), &m.sub(&q.0, &q.1));
+    let s = m.add(&u, &v);
+    let t = m.sub(&u, &v);
+    (m.mul(&d.1, &m.mul(&s, &s)), m.mul(&d.0, &m.mul(&t, &t)))
+}
+
+/// k P by the Montgomery ladder.
+fn ladder(m: &ModN, p: &Point, k: u64, a24: &BigUint) -> Point {
+    if k == 1 {
+        return p.clone();
+    }
+    let (mut r0, mut r1) = (p.clone(), xdbl(m, p, a24));
+    for i in (0..63 - k.leading_zeros()).rev() {
+        if k >> i & 1 == 1 {
+            r0 = xadd(m, &r1, &r0, p);
+            r1 = xdbl(m, &r1, a24);
+        } else {
+            r1 = xadd(m, &r1, &r0, p);
+            r0 = xdbl(m, &r0, a24);
+        }
+    }
+    r0
+}
+
+/// ECM stage 1 on `curves` Montgomery curves with Suyama's parametrization
+/// (sigma, sigma + 1, ...), bound `b1`. Runs on the host with arbitrary
+/// precision arithmetic: practical for small exponents only. ponytail: no
+/// stage 2 and no Edwards curves; a device implementation with a stage 2 is
+/// the upgrade path. `stop` is polled once per prime.
+pub fn ecm(
+    p: u32,
+    b1: u64,
+    curves: u32,
+    sigma: u64,
+    stop: &dyn Fn() -> bool,
+) -> Result<EcmOutcome, String> {
+    crate::exponent::validate(p).map_err(|e| e.to_string())?;
+    if sigma < 6 || b1 < 2 {
+        return Err("sigma must be at least 6 and B1 at least 2".into());
+    }
+    let n = modulus(p);
+    let m = ModN(&n);
+    let mut out = EcmOutcome {
+        exponent: p,
+        b1,
+        curves: 0,
+        sigma,
+        factor: None,
+        found_sigma: None,
+        notes: Vec::new(),
+    };
+    let primes = primes_below(b1 + 1);
+    for c in 0..u64::from(curves) {
+        let s = BigUint::from(sigma + c);
+        let u = m.sub(&m.mul(&s, &s), &BigUint::from(5u32));
+        let v = m.mul(&BigUint::from(4u32), &s);
+        let u3 = m.mul(&m.mul(&u, &u), &u);
+        let vmu = m.sub(&v, &u);
+        // a24 = (v - u)^3 (3u + v) / (16 u^3 v)
+        let num = m.mul(
+            &m.mul(&m.mul(&vmu, &vmu), &vmu),
+            &m.add(&m.mul(&BigUint::from(3u32), &u), &v),
+        );
+        let den = m.mul(&m.mul(&BigUint::from(16u32), &u3), &v);
+        let g = den.gcd(&n);
+        if !g.is_one() {
+            if let Some(f) = factor_from(p, &den, &n, &mut out.notes) {
+                out.factor = Some(f);
+                out.found_sigma = Some(sigma + c);
+                return Ok(out);
+            }
+            continue;
+        }
+        let inv = mod_inverse_big(&den, &n).expect("gcd is 1");
+        let a24 = m.mul(&num, &inv);
+        let mut pt: Point = (u3, m.mul(&m.mul(&v, &v), &v));
+        for &q in &primes {
+            let mut qk = q;
+            while let Some(x) = qk.checked_mul(q).filter(|&x| x <= b1) {
+                qk = x;
+            }
+            pt = ladder(&m, &pt, qk, &a24);
+            if stop() {
+                out.notes
+                    .push(format!("stopped in curve sigma = {}", sigma + c));
+                return Ok(out);
+            }
+        }
+        out.curves += 1;
+        if let Some(f) = factor_from(p, &pt.1, &n, &mut out.notes) {
+            out.factor = Some(f);
+            out.found_sigma = Some(sigma + c);
+            return Ok(out);
+        }
+    }
+    Ok(out)
+}
+
+/// a^-1 mod n, when gcd(a, n) = 1, by the extended Euclidean algorithm.
+fn mod_inverse_big(a: &BigUint, n: &BigUint) -> Option<BigUint> {
+    use num_bigint::BigInt;
+    let e = BigInt::from(a.clone()).extended_gcd(&BigInt::from(n.clone()));
+    if !e.gcd.is_one() {
+        return None;
+    }
+    let nn = BigInt::from(n.clone());
+    ((e.x % &nn + &nn) % &nn).to_biguint()
+}
+
 /// What a factoring line asks for.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum FactorWork {
@@ -631,6 +784,35 @@ mod tests {
         assert_eq!((o.factor.as_deref(), o.stage), (Some("193707721"), Some(2)));
         let o = pm1(&mut be, 100, 200, &|| false).unwrap();
         assert!(o.factor.is_none() && o.complete);
+    }
+
+    #[test]
+    fn ecm_finds_a_small_factor_and_checks_it() {
+        // 2^67 - 1 = 193707721 * 761838257287: about a quarter of the curves
+        // at B1 = 2000 find the 28-bit factor (the 40-bit one is rarer).
+        let o = ecm(67, 2000, 40, 6, &|| false).unwrap();
+        assert!(
+            matches!(o.factor.as_deref(), Some("193707721" | "761838257287")),
+            "{o:?}"
+        );
+        // M61 is prime: nothing to find, and nothing false is reported.
+        let o = ecm(61, 500, 3, 6, &|| false).unwrap();
+        assert!(o.factor.is_none() && o.curves == 3);
+    }
+
+    #[test]
+    fn montgomery_ladder_matches_repeated_addition() {
+        let n = modulus(61);
+        let m = ModN(&n);
+        let a24 = BigUint::from(12345u32);
+        let p: Point = (BigUint::from(7u32), BigUint::one());
+        // 5P by the ladder against 2(2P) + P with explicit differences.
+        let p2 = xdbl(&m, &p, &a24);
+        let p3 = xadd(&m, &p2, &p, &p);
+        let p5 = xadd(&m, &p3, &p2, &p);
+        let l = ladder(&m, &p, 5, &a24);
+        // Compare X/Z projectively: X1 Z2 = X2 Z1.
+        assert_eq!(m.mul(&l.0, &p5.1), m.mul(&p5.0, &l.1));
     }
 
     #[test]
