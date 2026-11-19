@@ -44,6 +44,7 @@ fn upstream_line_forms() {
         "PRP=1,3,4423,-1", // base 3
         "PRP=4425",        // composite
         "Test=4423x",
+        "Test=3,2,1279,-1",              // 3*2^1279-1
         "PRPDC=1,2,1279,-1,75,0,2,1",    // base 2
         "PRP=1,2,1279,-1,75,0,3,5",      // residue type 5
         "PRP=1,2,23,-1,75,0,3,5,\"47\"", // known factors
@@ -138,7 +139,12 @@ fn work_runs_assignments_and_keeps_what_it_cannot_run() {
     // The proof file stays; checkpoints and proof points are cleaned up.
     assert!(proof.is_file());
     assert!(!dir.path().join("proof").join("M1279.residues").exists());
-    assert!(!dir.path().join("ckpt").join("M1279-prp.ckpt").exists());
+    let left: Vec<_> = std::fs::read_dir(dir.path().join("ckpt"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("M1279-"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
     // A results line torn by a crash is closed before the next one.
     let res = dir.path().join("results.json.txt");
     let mut torn = std::fs::read_to_string(&res).unwrap();
@@ -149,6 +155,12 @@ fn work_runs_assignments_and_keeps_what_it_cannot_run() {
     let text = std::fs::read_to_string(&res).unwrap();
     let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
     assert_eq!(last["exponent"], 127);
+    // The fragment moved aside whole; every results line is complete JSON.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("results.json.txt.torn")).unwrap(),
+        "{\"status\":\"C\",\"expo\n"
+    );
+    assert_eq!(text.lines().count(), 4);
     std::fs::write(
         &res,
         text.lines()

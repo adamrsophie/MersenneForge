@@ -22,6 +22,7 @@ use serde::Serialize;
 pub const BASE_URL: &str = "https://www.mersenne.org/";
 const PROOF_UPLOAD_URL: &str = "https://mersenne.org/proof_upload/";
 const CHUNK: usize = 5 * 1024 * 1024;
+const MAX_UPLOAD_ROUNDS: usize = 5;
 
 /// PrimeNet work preference codes, as the upstream script named them.
 pub fn worktype_code(name: &str) -> Option<u32> {
@@ -246,7 +247,9 @@ pub fn upload_proof(dir: &Path, user: &str, proof: &Path) -> Result<bool, String
         urlencode(user),
         data.len()
     );
-    loop {
+    // Each round asks which region is missing and sends it; a server that
+    // keeps asking for more is given up on after a few rounds.
+    for _round in 0..MAX_UPLOAD_ROUNDS {
         let reply: serde_json::Value =
             serde_json::from_str(&curl(&["--url".into(), primenet_url(&ask)?])?)
                 .map_err(|e| format!("proof upload reply: {e}"))?;
@@ -282,7 +285,9 @@ pub fn upload_proof(dir: &Path, user: &str, proof: &Path) -> Result<bool, String
             let size = (end - pos).min(CHUNK).min(data.len() - pos);
             let chunk = &data[pos..pos + size];
             private_file(&chunk_file, chunk).map_err(|e| e.to_string())?;
+            // An HTTP error status ends the upload, as upstream's script did.
             let page = curl(&[
+                "--fail-with-body".into(),
                 "--form".into(),
                 format!("Data=<{}", chunk_file.display()),
                 "--url".into(),
@@ -300,6 +305,9 @@ pub fn upload_proof(dir: &Path, user: &str, proof: &Path) -> Result<bool, String
         }
         // The region was sent without the final acknowledgment: ask again.
     }
+    Err(format!(
+        "the server still wanted data after {MAX_UPLOAD_ROUNDS} rounds"
+    ))
 }
 
 /// The exponent in a version 2 proof header ("PRP PROOF\nVERSION=2\n...
@@ -349,9 +357,14 @@ pub struct Exchange {
 impl Exchange {
     /// Result lines not yet sent (and not refused).
     pub fn unsent(&self) -> Vec<String> {
+        // A refused line is stored as "<line>\t<reason>".
         let done: std::collections::HashSet<String> = lines_of(&self.sent)
             .into_iter()
-            .chain(lines_of(&self.refused))
+            .chain(
+                lines_of(&self.refused)
+                    .into_iter()
+                    .map(|l| l.split('\t').next().unwrap_or_default().to_string()),
+            )
             .collect();
         lines_of(&self.results)
             .into_iter()

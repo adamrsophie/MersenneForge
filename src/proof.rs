@@ -276,6 +276,11 @@ impl ProofWriter {
             .pending += 1;
         let sent = self.tx.as_ref().expect("open until drop").send((k, x));
         if sent.is_err() {
+            self.state
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pending -= 1;
             return Err((k, "the proof writer thread stopped".into()));
         }
         Ok(())

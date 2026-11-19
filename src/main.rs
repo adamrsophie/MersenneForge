@@ -1026,9 +1026,14 @@ fn line_key(aid: Option<&str>, line: &str) -> String {
 /// Record a finished line by its text alone: the result line (once), the
 /// journal entry, then the line's removal, or its replacement by
 /// `replacement` (a PRP line whose P-1 has been done).
+///
+/// `entry` is the journal entry: the line itself when the line is done, or
+/// a marker (`pm1:<line>`) when only a step of it is, so a crash between
+/// journal and rewrite never makes the whole assignment look reported.
 fn commit_line(
     w: &WorkArgs,
     line: &str,
+    entry: &str,
     result: &str,
     replacement: Option<&str>,
 ) -> Result<(), Failure> {
@@ -1038,13 +1043,87 @@ fn commit_line(
         let logged = std::fs::read_to_string(&journal)
             .unwrap_or_default()
             .lines()
-            .any(|l| l == line);
+            .any(|l| l == entry);
         if !logged {
             append_durable(&w.results, result)?;
-            append_durable(&journal, line)?;
+            append_durable(&journal, entry)?;
         }
     }
     replace_line(&w.worktodo, line, replacement)
+}
+
+/// Run P-1 for a `work` line, saving stage 1 progress next to the
+/// checkpoints so a budgeted session continues where the last one stopped.
+fn work_pm1(
+    w: &WorkArgs,
+    p: u32,
+    key: &str,
+    b1: u64,
+    b2: u64,
+    deadline: Option<Instant>,
+) -> Result<mersenne_forge::factor::Pm1Outcome, Failure> {
+    use mersenne_forge::checkpoint::{CheckpointMeta, FORMAT_VERSION};
+    const PROTO: &str = "pm1-stage1/1";
+    if p > mersenne_forge::factor::WORK_PM1_MAX_P {
+        return Err(fail(
+            EXIT_UNSUPPORTED,
+            format!(
+                "P-1 of exponents above {} is left to another program",
+                mersenne_forge::factor::WORK_PM1_MAX_P
+            ),
+        ));
+    }
+    let path = w.checkpoint_dir.join(format!("M{p}-pm1-{key}.ckpt"));
+    create_dir_all_durable(&w.checkpoint_dir)
+        .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", w.checkpoint_dir.display())))?;
+    let resume = Checkpoint::load_latest(&path).ok().and_then(|(ck, _)| {
+        (ck.meta.protocol == PROTO
+            && ck.meta.exponent == p
+            && ck.meta.config == json!({"b1": b1})
+            && ck.residues.len() == 1)
+            .then(|| (ck.meta.k, ck.residues[0].clone()))
+    });
+    let mut be = open(w.kind, p, w.device)?;
+    let identity = be.identity();
+    let stop = || STOP.load(Ordering::SeqCst) || deadline.is_some_and(|d| Instant::now() >= d);
+    let mut save_err = None;
+    let mut save = |i: u64, x: &mersenne_forge::residue::Residue| {
+        let ck = Checkpoint {
+            meta: CheckpointMeta {
+                format_version: FORMAT_VERSION,
+                protocol: PROTO.into(),
+                exponent: p,
+                k: i,
+                state: "provisional".into(),
+                verified_k: 0,
+                n_errors: 0,
+                proof_durable_through: None,
+                backend: identity.clone(),
+                config: json!({"b1": b1}),
+                requested: json!({}),
+                elapsed_secs: 0.0,
+                crate_version: env!("CARGO_PKG_VERSION").into(),
+            },
+            residues: vec![x.clone()],
+        };
+        if let Err(e) = ck.save(&path) {
+            save_err.get_or_insert(e.to_string());
+        }
+    };
+    let o = mersenne_forge::factor::pm1_resumable(be.as_mut(), b1, b2, resume, &stop, &mut save)
+        .map_err(|e| fail(EXIT_EXECUTION, e))?;
+    if let Some(e) = save_err {
+        eprintln!("M{p}: P-1 progress not saved: {e}");
+    }
+    for n in &o.notes {
+        eprintln!("M{p}: {n}");
+    }
+    if o.complete {
+        for f in [prev_path(&path), path] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+    Ok(o)
 }
 
 /// Run one factoring line. Ok(true): reported and removed; Ok(false):
@@ -1113,22 +1192,19 @@ fn run_factor_line(
             // ponytail: a factor found early in the range does not end it, so
             // the whole range is reported as searched (rangecomplete).
             let line = factor::tf_result_line(f, &o, &now());
-            commit_line(w, &f.line, &line.to_string(), None)?;
+            commit_line(w, &f.line, &f.line, &line.to_string(), None)?;
             let _ = std::fs::remove_file(&state);
             println!("M{p}: TF {bit_lo}-{bit_hi} factors {:?}", o.factors);
             Ok(true)
         }
         FactorWork::Pm1 { b1, b2 } => {
-            let mut be = open(w.kind, p, w.device)?;
-            let o = factor::pm1(be.as_mut(), b1, b2, &stop).map_err(|e| fail(EXIT_EXECUTION, e))?;
-            for n in &o.notes {
-                eprintln!("M{p}: {n}");
-            }
+            let key = line_key(f.aid.as_deref(), &f.line);
+            let o = work_pm1(w, p, &key, b1, b2, deadline)?;
             if !o.complete {
                 return Ok(false);
             }
             let line = factor::pm1_result_line(f, &o, &now());
-            commit_line(w, &f.line, &line.to_string(), None)?;
+            commit_line(w, &f.line, &f.line, &line.to_string(), None)?;
             println!("M{p}: P-1 B1={b1} B2={b2} factor {:?}", o.factor);
             Ok(true)
         }
@@ -1214,6 +1290,18 @@ fn resume_with_fallback(
             ck = pck;
             used = prev;
             result = resume_from(be, &ck, path, proof_dir, ctl)?;
+            // The previous state failed too: put the newer file back, so a
+            // failed attempt never sidelines the newest valid checkpoint.
+            if matches!(
+                result,
+                Err(ProtocolError::CheckpointRejected { .. }
+                    | ProtocolError::ProofResidueMissing { .. })
+            ) && !path.exists()
+            {
+                std::fs::rename(&aside, path)
+                    .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", path.display())))?;
+                note = None;
+            }
         }
     }
     Ok((result, ck, used, note))
@@ -1273,6 +1361,20 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
         let mut next_factor = None;
         for raw in text.lines() {
             match mersenne_forge::factor::parse_factor_line(raw) {
+                Ok(Some(f))
+                    if matches!(f.work, mersenne_forge::factor::FactorWork::Pm1 { .. })
+                        && f.exponent > mersenne_forge::factor::WORK_PM1_MAX_P =>
+                {
+                    let e = format!(
+                        "P-1 of M{} is left to another program (above {})",
+                        f.exponent,
+                        mersenne_forge::factor::WORK_PM1_MAX_P
+                    );
+                    if warned.insert(e.clone()) {
+                        eprintln!("left in place: {e}");
+                    }
+                    continue;
+                }
                 Ok(Some(f)) if !skipped.contains(&f.line) => {
                     next_factor = Some(f);
                     break;
@@ -1349,12 +1451,18 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
                 aid: a.aid.clone(),
                 line: a.line.clone(),
             };
-            let outcome = open(w.kind, a.exponent, w.device).and_then(|mut be| {
-                let stop =
-                    || STOP.load(Ordering::SeqCst) || deadline.is_some_and(|d| Instant::now() >= d);
-                factor::pm1(be.as_mut(), b1, b2, &stop).map_err(|e| fail(EXIT_EXECUTION, e))
-            });
-            match outcome {
+            // A P-1 step recorded before a crash: only the rewrite is left.
+            let entry = format!("pm1:{}", a.line);
+            let stepped = std::fs::read_to_string(journal_path(&w.results))
+                .unwrap_or_default()
+                .lines()
+                .any(|l| l == entry);
+            if stepped {
+                replace_line(&w.worktodo, &a.line, Some(&next_line))?;
+                continue;
+            }
+            let key = line_key(a.aid.as_deref(), &a.line);
+            match work_pm1(w, a.exponent, &key, b1, b2, deadline) {
                 Ok(o) if !o.complete => {
                     println!("M{}: P-1 not finished; the line stays", a.exponent);
                     return Ok(EXIT_INCOMPLETE);
@@ -1364,8 +1472,13 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0, |d| d.as_secs());
                     let line = factor::pm1_result_line(&fl, &o, &wt::utc_timestamp(now));
-                    let replacement = o.factor.is_none().then_some(next_line.as_str());
-                    commit_line(w, &a.line, &line.to_string(), replacement)?;
+                    // A factor ends the assignment; otherwise only the P-1
+                    // step is done and the line comes back for the test.
+                    let (entry, replacement) = match o.factor {
+                        Some(_) => (a.line.clone(), None),
+                        None => (entry, Some(next_line.as_str())),
+                    };
+                    commit_line(w, &a.line, &entry, &line.to_string(), replacement)?;
                     println!("M{}: P-1 B1={b1} B2={b2} factor {:?}", a.exponent, o.factor);
                 }
                 Err(e) => leave(&a, &e.message, &mut skipped),

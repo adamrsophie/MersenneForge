@@ -252,6 +252,22 @@ pub fn pm1(
     b2: u64,
     stop: &dyn Fn() -> bool,
 ) -> Result<Pm1Outcome, String> {
+    pm1_resumable(be, b1, b2, None, stop, &mut |_, _| {})
+}
+
+/// Stage 1 state: after bit `i` of E (counting down), x = 3^(E >> i).
+pub type Stage1State = (u64, Residue);
+
+/// [`pm1`] that can start from a saved stage 1 state and hands one to
+/// `save` about once a minute and when stopped in stage 1.
+pub fn pm1_resumable(
+    be: &mut dyn Backend,
+    b1: u64,
+    b2: u64,
+    resume: Option<Stage1State>,
+    stop: &dyn Fn() -> bool,
+    save: &mut dyn FnMut(u64, &Residue),
+) -> Result<Pm1Outcome, String> {
     let p = be.exponent();
     if b1 < 2 {
         return Err("B1 must be at least 2".into());
@@ -271,23 +287,43 @@ pub fn pm1(
     let x = be.alloc().map_err(berr)?;
     let base = be.alloc().map_err(berr)?;
     let three = Residue::from_u64(p, 3);
-    be.import(x, &three).map_err(berr)?;
-    be.import(base, &three).map_err(berr)?;
     let bits = e.bits();
+    let start = match resume {
+        Some((i, ref r)) if i < bits && r.exponent() == p => {
+            be.import(x, r).map_err(berr)?;
+            i
+        }
+        Some(_) => return Err("the saved P-1 state does not fit these bounds".into()),
+        None => {
+            be.import(x, &three).map_err(berr)?;
+            bits - 1
+        }
+    };
+    be.import(base, &three).map_err(berr)?;
     let mut pending = 0u64;
-    for i in (0..bits - 1).rev() {
+    let mut last_save = std::time::Instant::now();
+    for i in (0..start).rev() {
         pending += 1;
         if e.bit(i) {
             be.square(x, pending).map_err(berr)?;
             pending = 0;
             be.mul(x, base).map_err(berr)?;
         }
-        if i % 10_000 == 0 && stop() {
-            be.free(base).map_err(berr)?;
-            be.free(x).map_err(berr)?;
-            out.notes
-                .push(format!("stopped in stage 1 with {i} bits left"));
-            return Ok(out);
+        if i % 10_000 == 0 && i > 0 {
+            let stopping = stop();
+            if stopping || last_save.elapsed() >= std::time::Duration::from_secs(60) {
+                be.square(x, pending).map_err(berr)?;
+                pending = 0;
+                save(i, &be.export(x).map_err(berr)?);
+                last_save = std::time::Instant::now();
+            }
+            if stopping {
+                be.free(base).map_err(berr)?;
+                be.free(x).map_err(berr)?;
+                out.notes
+                    .push(format!("stopped in stage 1 with {i} bits left"));
+                return Ok(out);
+            }
         }
     }
     be.square(x, pending).map_err(berr)?;
@@ -361,14 +397,19 @@ pub struct FactorLine {
     pub line: String,
 }
 
-/// Bounds for a `Pfactor=` line. ponytail: a fixed rule, B1 = 1,000,000 and
-/// B2 = 30 B1 scaled down for exponents below 10 million; upstream's
-/// cost model (probability of a factor against tests saved) is the
-/// upgrade path.
+/// Bounds for a `Pfactor=` line and for P-1 before a PRP test: stage 1
+/// only (B2 = B1), since stage 2 runs on the host. ponytail: a fixed rule,
+/// B1 = p / 10 between 1,000 and 1,000,000; upstream's cost model
+/// (probability of a factor against tests saved) is the upgrade path.
 pub fn pfactor_bounds(p: u32) -> (u64, u64) {
     let b1 = (u64::from(p) / 10).clamp(1000, 1_000_000);
-    (b1, 30 * b1)
+    (b1, b1)
 }
+
+/// Largest exponent `work` runs P-1 for. Above it the final gcd on the
+/// host (quadratic in p) and host stage 2 take too long, and the line
+/// stays in place for another program.
+pub const WORK_PM1_MAX_P: u32 = 10_000_000;
 
 /// Parse a `Factor=`, `Pminus1=`, or `Pfactor=` line. `Ok(None)` for any
 /// other line (including comments), so callers try this parser first.
@@ -466,7 +507,8 @@ pub fn with_pm1_done(line: &str, p: u32) -> Option<String> {
     Some(format!("{head}={}", f.join(",")))
 }
 
-/// The JSON result line for a TF run, in the form mfaktc writes.
+/// The JSON result line for a TF run. The keys follow mfaktc's JSON results
+/// as recalled, NOT checked against mfaktc output or a PrimeNet server.
 pub fn tf_result_line(a: &FactorLine, o: &TfOutcome, timestamp: &str) -> serde_json::Value {
     let mut v = serde_json::json!({
         "status": if o.factors.is_empty() { "NF" } else { "F" },
@@ -487,18 +529,20 @@ pub fn tf_result_line(a: &FactorLine, o: &TfOutcome, timestamp: &str) -> serde_j
     v
 }
 
-/// The JSON result line for a P-1 run.
+/// The JSON result line for a P-1 run, with the keys upstream PRPLL's P-1
+/// wrote (`B1`, `B2` when stage 2 ran, `factors`). Upstream's
+/// `fft-length` has no counterpart here and is left out.
 pub fn pm1_result_line(a: &FactorLine, o: &Pm1Outcome, timestamp: &str) -> serde_json::Value {
     let mut v = serde_json::json!({
         "status": if o.factor.is_some() { "F" } else { "NF" },
         "exponent": o.exponent,
         "worktype": "PM1",
-        "b1": o.b1,
+        "B1": o.b1,
         "program": program(),
         "timestamp": timestamp,
     });
     if o.b2 > o.b1 {
-        v["b2"] = o.b2.into();
+        v["B2"] = o.b2.into();
     }
     if let Some(f) = &o.factor {
         v["factors"] = serde_json::json!([f]);

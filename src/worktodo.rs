@@ -101,6 +101,10 @@ pub fn parse_line(raw: &str) -> Result<Option<Assignment>, String> {
     }
     let refuse = |why: &str| Err(format!("{why}: {line:?}"));
     let mersenne = parts.len() >= 4 && parts[0] == "1" && parts[1] == "2" && parts[3] == "-1";
+    // A k,b,n,c number line that is not 1,2,p,-1 names another number.
+    if parts.len() >= 4 && matches!(parts[3], "-1" | "+1" | "1") && !mersenne {
+        return refuse("not a Mersenne number line");
+    }
     let field = match kind {
         _ if mersenne => parts[2],
         WorkKind::Prp if parts.len() == 1 => parts[0],
