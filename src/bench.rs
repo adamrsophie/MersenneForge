@@ -182,8 +182,18 @@ impl Plan {
                     name,
                     options,
                     test,
-                    ..
+                    exponent,
+                    backend,
                 } => {
+                    // Names and the exponent are checked here, so a typo is a
+                    // usage error and not a failed observation at run time.
+                    if test != "ll" && test != "prp" {
+                        return Err(format!("{name}: test must be ll or prp, got {test:?}"));
+                    }
+                    if crate::select::BackendKind::parse(backend).is_none() {
+                        return Err(format!("{name}: unknown backend {backend:?}"));
+                    }
+                    crate::exponent::validate(*exponent).map_err(|e| format!("{name}: {e}"))?;
                     if let Some(b) = options.budget_secs {
                         deadline_after(now, &format!("{name}: budget_secs"), b)?;
                     }

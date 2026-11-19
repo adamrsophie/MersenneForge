@@ -217,8 +217,42 @@ pub fn write_atomic(path: &Path, bytes: &[u8], checkpoint_rotation: bool) -> std
     drop(f);
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
+    } else if checkpoint_rotation {
+        remove_stale_temporaries(path);
     }
     result
+}
+
+/// Remove temporary files a crashed writer left next to a checkpoint:
+/// `<name>.tmp.<pid>.<n>` from another process, untouched for an hour. A
+/// checkpoint has one writer at a time (it holds the checkpoint lock), so
+/// such a file cannot belong to a live write.
+fn remove_stale_temporaries(path: &Path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let prefix = format!("{}.tmp.", name.to_string_lossy());
+    let ours = format!("{prefix}{}.", std::process::id());
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age.as_secs() > 3600);
+        if n.starts_with(&prefix) && !n.starts_with(&ours) && old {
+            let _ = fs::remove_file(e.path());
+        }
+    }
 }
 
 /// The process umask, read without changing it for longer than a moment.
