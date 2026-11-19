@@ -1865,7 +1865,8 @@ fn cmd_tune(p: u32, kind: BackendKind, device: Option<u32>, iters: u64) -> Resul
     use mersenne_forge::backend::Backend;
     let unsupported =
         |e: mersenne_forge::backend::BackendError| fail(EXIT_UNSUPPORTED, e.to_string());
-    let mut variants: Vec<(&str, Box<dyn Backend>)> = vec![("", open(kind, p, device)?)];
+    let mut variants: Vec<(String, Box<dyn Backend>)> =
+        vec![(String::new(), open(kind, p, device)?)];
     match kind {
         BackendKind::Dwt => {
             use mersenne_forge::backend::dwt::DwtBackend;
@@ -1873,7 +1874,7 @@ fn cmd_tune(p: u32, kind: BackendKind, device: Option<u32>, iters: u64) -> Resul
             let mut b = DwtBackend::new(p).map_err(unsupported)?;
             b.use_packed();
             if b.is_packed() {
-                variants.push(("MERSENNE_FORGE_DWT_PACKED=1", Box::new(b)));
+                variants.push(("MERSENNE_FORGE_DWT_PACKED=1".into(), Box::new(b)));
             }
             if threads >= 2 {
                 for packed in [false, true] {
@@ -1883,18 +1884,15 @@ fn cmd_tune(p: u32, kind: BackendKind, device: Option<u32>, iters: u64) -> Resul
                     }
                     b.use_threads(threads);
                     if b.threads() > 1 && (!packed || b.is_packed()) {
-                        let setting: &'static str = Box::leak(
-                            format!(
-                                "{}MERSENNE_FORGE_DWT_THREADS={threads}",
-                                if packed {
-                                    "MERSENNE_FORGE_DWT_PACKED=1 "
-                                } else {
-                                    ""
-                                }
-                            )
-                            .into_boxed_str(),
+                        let setting = format!(
+                            "{}MERSENNE_FORGE_DWT_THREADS={threads}",
+                            if packed {
+                                "MERSENNE_FORGE_DWT_PACKED=1 "
+                            } else {
+                                ""
+                            }
                         );
-                        variants.push((setting, Box::new(b)));
+                        variants.push((setting.to_string(), Box::new(b)));
                     }
                 }
             }
@@ -1920,7 +1918,7 @@ fn cmd_tune(p: u32, kind: BackendKind, device: Option<u32>, iters: u64) -> Resul
                     },
                 )
                 .map_err(unsupported)?;
-                variants.push((setting, Box::new(b)));
+                variants.push((setting.to_string(), Box::new(b)));
             }
         }
         _ => {}
@@ -1942,7 +1940,7 @@ fn cmd_tune(p: u32, kind: BackendKind, device: Option<u32>, iters: u64) -> Resul
         let agrees = *reference.get_or_insert_with(|| out.clone()) == out;
         rows.push(json!({
             "plan": be.identity().plan,
-            "setting": if setting.is_empty() { "(default)" } else { *setting },
+            "setting": if setting.is_empty() { "(default)" } else { setting.as_str() },
             "ms_per_iteration": 1e3 * secs / iters.max(1) as f64,
             "agrees_with_default": agrees,
         }));
