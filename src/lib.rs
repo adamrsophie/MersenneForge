@@ -11,6 +11,7 @@ pub mod bench;
 pub mod checkpoint;
 pub mod evidence;
 pub mod exponent;
+pub mod factor;
 pub mod ll;
 pub mod oracle;
 pub mod primenet;
@@ -58,12 +59,13 @@ const BUILD_SOURCES: &[(&str, &[u8])] = &[
     ("src/checkpoint.rs", include_bytes!("checkpoint.rs")),
     ("src/evidence.rs", include_bytes!("evidence.rs")),
     ("src/exponent.rs", include_bytes!("exponent.rs")),
+    ("src/factor.rs", include_bytes!("factor.rs")),
     ("src/lib.rs", include_bytes!("lib.rs")),
     ("src/ll.rs", include_bytes!("ll.rs")),
     ("src/main.rs", include_bytes!("main.rs")),
     ("src/oracle.rs", include_bytes!("oracle.rs")),
-    ("src/proof.rs", include_bytes!("proof.rs")),
     ("src/primenet.rs", include_bytes!("primenet.rs")),
+    ("src/proof.rs", include_bytes!("proof.rs")),
     ("src/prp.rs", include_bytes!("prp.rs")),
     ("src/residue.rs", include_bytes!("residue.rs")),
     ("src/run.rs", include_bytes!("run.rs")),
@@ -122,7 +124,7 @@ mod build_tests {
             }
         }
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut expected = vec!["Cargo.lock".into(), "Cargo.toml".into()];
+        let mut expected = vec!["Cargo.lock".into(), "Cargo.toml".into(), "build.rs".into()];
         collect(root, &root.join("src"), &mut expected);
         expected.sort();
         assert_eq!(

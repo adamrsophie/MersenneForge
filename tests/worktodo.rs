@@ -211,21 +211,57 @@ fn an_interrupted_assignment_resumes_in_the_next_session() {
     );
 }
 
-/// An assignment this program must not run as given (here a PRP line that
-/// asks for P-1 first) stays in place, and later assignments still run.
+/// A line this program must not run as given (here a PRP residue type it
+/// does not compute) stays in place, and later assignments still run.
 #[test]
 fn an_unrunnable_assignment_does_not_block_the_queue() {
     let dir = tempfile::tempdir().unwrap();
     let todo = dir.path().join("worktodo.txt");
-    std::fs::write(&todo, "PRP=1,2,1279,-1,60,1\nTest=127\n").unwrap();
+    std::fs::write(&todo, "PRP=1,2,1279,-1,75,0,3,5\nTest=127\n").unwrap();
     let o = work(dir.path(), &[]);
-    assert_eq!(o.status.code(), Some(6));
-    assert!(String::from_utf8_lossy(&o.stderr).contains("asks for P-1"));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("residue type"));
     assert_eq!(
         std::fs::read_to_string(&todo).unwrap(),
-        "PRP=1,2,1279,-1,60,1\n"
+        "PRP=1,2,1279,-1,75,0,3,5\n"
     );
     assert_eq!(results(dir.path())[0]["exponent"], 127);
+}
+
+/// A PRP line that asks for P-1 gets it first: a PM1 result, then the PRP
+/// test of the rewritten line.
+#[test]
+fn p_minus_1_runs_before_a_prp_test_that_asks_for_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let todo = dir.path().join("worktodo.txt");
+    std::fs::write(&todo, "PRP=1,2,1279,-1,60,1\n").unwrap();
+    assert_eq!(work(dir.path(), &[]).status.code(), Some(0));
+    let r = results(dir.path());
+    assert_eq!(
+        (r[0]["worktype"].as_str(), r[0]["status"].as_str()),
+        (Some("PM1"), Some("NF"))
+    );
+    assert_eq!(r[1]["worktype"], "PRP-3");
+    assert_eq!(std::fs::read_to_string(&todo).unwrap(), "");
+}
+
+#[test]
+fn factoring_lines_report_factors() {
+    let dir = tempfile::tempdir().unwrap();
+    let todo = dir.path().join("worktodo.txt");
+    std::fs::write(&todo, "Factor=67,27,28\nPminus1=1,2,67,-1,2677,0\n").unwrap();
+    assert_eq!(work(dir.path(), &[]).status.code(), Some(0));
+    let r = results(dir.path());
+    assert_eq!(
+        (r[0]["worktype"].as_str(), r[0]["status"].as_str()),
+        (Some("TF"), Some("F"))
+    );
+    assert_eq!(r[0]["factors"][0], "193707721");
+    assert_eq!(r[0]["rangecomplete"], true);
+    assert_eq!(
+        (r[1]["worktype"].as_str(), r[1]["factors"][0].as_str()),
+        (Some("PM1"), Some("193707721"))
+    );
+    assert_eq!(std::fs::read_to_string(&todo).unwrap(), "");
 }
 
 /// Without an assignment ID, a second test of the same exponent is new work:

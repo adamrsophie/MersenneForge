@@ -142,7 +142,7 @@ enum Cmd {
         /// Backend for a portable checkpoint (from `checkpoint-export`);
         /// other checkpoints resume on the backend that wrote them.
         #[arg(long, value_enum)]
-        backend: Option<BackendKind>,
+        backend: Option<BackendArg>,
         #[arg(long)]
         json: bool,
     },
@@ -236,6 +236,34 @@ enum Cmd {
         /// Holds the session cookies and the sent and refused logs.
         #[arg(long, default_value = "primenet")]
         state_dir: PathBuf,
+    },
+    /// Trial factor 2^p - 1 between 2^from and 2^to on the CPU. Exit 0 with
+    /// or without a factor; factors are checked before they are printed.
+    Tf {
+        #[arg(long)]
+        exponent: u32,
+        #[arg(long)]
+        from: u32,
+        #[arg(long)]
+        to: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// P-1 factoring of 2^p - 1 with bounds B1 and B2 (stage 2 runs on the
+    /// host and suits small exponents only).
+    Pm1 {
+        #[arg(long)]
+        exponent: u32,
+        #[arg(long)]
+        b1: u64,
+        #[arg(long, default_value_t = 0)]
+        b2: u64,
+        #[arg(long, value_enum, default_value = "cpu")]
+        backend: BackendArg,
+        #[arg(long)]
+        device: Option<u32>,
+        #[arg(long)]
+        json: bool,
     },
     /// Check that a reported factor divides 2^p - 1. Exit 0 when it does.
     CheckFactor {
@@ -912,16 +940,26 @@ fn already_reported(results: &Path, a: &mersenne_forge::worktodo::Assignment) ->
 /// Remove the first line equal to `line` from the worktodo file, atomically,
 /// under its `.lck` lock so a program adding lines does not lose them.
 fn remove_line(worktodo: &Path, line: &str) -> Result<(), Failure> {
+    replace_line(worktodo, line, None)
+}
+
+/// Replace the first line equal to `line` by `with`, or remove it when
+/// `with` is None, atomically and under the worktodo `.lck` lock.
+fn replace_line(worktodo: &Path, line: &str, with: Option<&str>) -> Result<(), Failure> {
     let state = |e: std::io::Error| fail(EXIT_STATE, format!("{}: {e}", worktodo.display()));
     let _l = lck(worktodo)?;
     let text = std::fs::read_to_string(worktodo).map_err(state)?;
     let mut done = false;
     let kept: String = text
         .split_inclusive('\n')
-        .filter(|l| {
+        .filter_map(|l| {
             let hit = !done && l.trim_end_matches(['\r', '\n']) == line;
             done |= hit;
-            !hit
+            match (hit, with) {
+                (false, _) => Some(l.to_string()),
+                (true, Some(r)) => Some(format!("{r}\n")),
+                (true, None) => None,
+            }
         })
         .collect();
     mersenne_forge::checkpoint::write_atomic(worktodo, kept.as_bytes(), false).map_err(state)
@@ -965,19 +1003,136 @@ fn commit_result(
 /// hash of the line, so two assignments for one exponent never share state.
 fn assignment_checkpoint(dir: &Path, a: &mersenne_forge::worktodo::Assignment) -> PathBuf {
     use mersenne_forge::worktodo::WorkKind;
-    use sha3::Digest;
-    let key = match &a.aid {
-        Some(aid) => aid.to_ascii_lowercase(),
-        None => sha3::Sha3_256::digest(a.line.as_bytes())[..8]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect(),
-    };
+    let key = line_key(a.aid.as_deref(), &a.line);
     let test = match a.kind {
         WorkKind::Prp => "prp",
         WorkKind::Ll => "ll",
     };
     dir.join(format!("M{}-{test}-{key}.ckpt", a.exponent))
+}
+
+/// The assignment ID in lowercase, or the first 8 bytes of SHA3 of the line.
+fn line_key(aid: Option<&str>, line: &str) -> String {
+    use sha3::Digest;
+    match aid {
+        Some(aid) => aid.to_ascii_lowercase(),
+        None => sha3::Sha3_256::digest(line.as_bytes())[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    }
+}
+
+/// Record a finished line by its text alone: the result line (once), the
+/// journal entry, then the line's removal, or its replacement by
+/// `replacement` (a PRP line whose P-1 has been done).
+fn commit_line(
+    w: &WorkArgs,
+    line: &str,
+    result: &str,
+    replacement: Option<&str>,
+) -> Result<(), Failure> {
+    {
+        let _l = lck(&w.results)?;
+        let journal = journal_path(&w.results);
+        let logged = std::fs::read_to_string(&journal)
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l == line);
+        if !logged {
+            append_durable(&w.results, result)?;
+            append_durable(&journal, line)?;
+        }
+    }
+    replace_line(&w.worktodo, line, replacement)
+}
+
+/// Run one factoring line. Ok(true): reported and removed; Ok(false):
+/// stopped by the budget or a stop request, the line stays.
+fn run_factor_line(
+    w: &WorkArgs,
+    f: &mersenne_forge::factor::FactorLine,
+    deadline: Option<Instant>,
+) -> Result<bool, Failure> {
+    use mersenne_forge::factor::{self, FactorWork};
+    let p = f.exponent;
+    let stop = || STOP.load(Ordering::SeqCst) || deadline.is_some_and(|d| Instant::now() >= d);
+    let now = || {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        mersenne_forge::worktodo::utc_timestamp(secs)
+    };
+    let done_before = std::fs::read_to_string(journal_path(&w.results))
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l == f.line);
+    if done_before {
+        replace_line(&w.worktodo, &f.line, None)?;
+        return Ok(true);
+    }
+    match f.work {
+        FactorWork::Tf { bit_lo, bit_hi } => {
+            // Progress: the next untested k, as decimal text.
+            let state = w.checkpoint_dir.join(format!(
+                "M{p}-tf-{}.state",
+                line_key(f.aid.as_deref(), &f.line)
+            ));
+            create_dir_all_durable(&w.checkpoint_dir)
+                .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", w.checkpoint_dir.display())))?;
+            let from = std::fs::read_to_string(&state)
+                .ok()
+                .and_then(|t| t.trim().parse::<u128>().ok());
+            let mut last_save = Instant::now();
+            let mut save_err = None;
+            let o = factor::trial_factor(p, bit_lo, bit_hi, from, &stop, &mut |k| {
+                if last_save.elapsed() >= Duration::from_secs(30) {
+                    last_save = Instant::now();
+                    if let Err(e) = mersenne_forge::checkpoint::write_atomic(
+                        &state,
+                        k.to_string().as_bytes(),
+                        false,
+                    ) {
+                        save_err.get_or_insert(e.to_string());
+                    }
+                }
+            })
+            .map_err(|e| fail(EXIT_EXECUTION, e))?;
+            if let Some(e) = save_err {
+                eprintln!("M{p}: TF progress not saved: {e}");
+            }
+            if !o.complete {
+                mersenne_forge::checkpoint::write_atomic(
+                    &state,
+                    o.next_k.to_string().as_bytes(),
+                    false,
+                )
+                .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", state.display())))?;
+                return Ok(false);
+            }
+            // ponytail: a factor found early in the range does not end it, so
+            // the whole range is reported as searched (rangecomplete).
+            let line = factor::tf_result_line(f, &o, &now());
+            commit_line(w, &f.line, &line.to_string(), None)?;
+            let _ = std::fs::remove_file(&state);
+            println!("M{p}: TF {bit_lo}-{bit_hi} factors {:?}", o.factors);
+            Ok(true)
+        }
+        FactorWork::Pm1 { b1, b2 } => {
+            let mut be = open(w.kind, p, w.device)?;
+            let o = factor::pm1(be.as_mut(), b1, b2, &stop).map_err(|e| fail(EXIT_EXECUTION, e))?;
+            for n in &o.notes {
+                eprintln!("M{p}: {n}");
+            }
+            if !o.complete {
+                return Ok(false);
+            }
+            let line = factor::pm1_result_line(f, &o, &now());
+            commit_line(w, &f.line, &line.to_string(), None)?;
+            println!("M{p}: P-1 B1={b1} B2={b2} factor {:?}", o.factor);
+            Ok(true)
+        }
+    }
 }
 
 /// Delete the proof points of a finished run while holding the store's
@@ -1115,7 +1270,22 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
         let text = std::fs::read_to_string(&w.worktodo)
             .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", w.worktodo.display())))?;
         let mut next = None;
+        let mut next_factor = None;
         for raw in text.lines() {
+            match mersenne_forge::factor::parse_factor_line(raw) {
+                Ok(Some(f)) if !skipped.contains(&f.line) => {
+                    next_factor = Some(f);
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                Err(e) => {
+                    if warned.insert(e.clone()) {
+                        eprintln!("left in place: {e}");
+                    }
+                    continue;
+                }
+                Ok(None) => {}
+            }
             match wt::parse_line(raw) {
                 Ok(Some(a)) if !skipped.contains(&a.line) => {
                     next = Some(a);
@@ -1128,6 +1298,20 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
                     }
                 }
             }
+        }
+        if let Some(f) = next_factor {
+            match run_factor_line(w, &f, deadline) {
+                Ok(true) => done += 1,
+                Ok(false) => {
+                    println!("M{}: factoring not finished; the line stays", f.exponent);
+                    return Ok(EXIT_INCOMPLETE);
+                }
+                Err(e) => {
+                    eprintln!("left in place: M{}: {}", f.exponent, e.message);
+                    skipped.insert(f.line.clone());
+                }
+            }
+            continue;
         }
         let Some(a) = next else {
             println!(
@@ -1151,11 +1335,41 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
             continue;
         }
         if a.wants_pm1() {
-            leave(
-                &a,
-                "the line asks for P-1 before the test (tests_saved > 0); run it with `pm1` or set tests_saved to 0",
-                &mut skipped,
-            );
+            // P-1 first, as upstream does; a factor ends the assignment,
+            // otherwise the line stays with tests_saved = 0 for the test.
+            use mersenne_forge::factor::{self, FactorLine, FactorWork};
+            let (b1, b2) = factor::pfactor_bounds(a.exponent);
+            let Some(next_line) = factor::with_pm1_done(&a.line, a.exponent) else {
+                leave(&a, "cannot rewrite the line after P-1", &mut skipped);
+                continue;
+            };
+            let fl = FactorLine {
+                work: FactorWork::Pm1 { b1, b2 },
+                exponent: a.exponent,
+                aid: a.aid.clone(),
+                line: a.line.clone(),
+            };
+            let outcome = open(w.kind, a.exponent, w.device).and_then(|mut be| {
+                let stop =
+                    || STOP.load(Ordering::SeqCst) || deadline.is_some_and(|d| Instant::now() >= d);
+                factor::pm1(be.as_mut(), b1, b2, &stop).map_err(|e| fail(EXIT_EXECUTION, e))
+            });
+            match outcome {
+                Ok(o) if !o.complete => {
+                    println!("M{}: P-1 not finished; the line stays", a.exponent);
+                    return Ok(EXIT_INCOMPLETE);
+                }
+                Ok(o) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs());
+                    let line = factor::pm1_result_line(&fl, &o, &wt::utc_timestamp(now));
+                    let replacement = o.factor.is_none().then_some(next_line.as_str());
+                    commit_line(w, &a.line, &line.to_string(), replacement)?;
+                    println!("M{}: P-1 B1={b1} B2={b2} factor {:?}", a.exponent, o.factor);
+                }
+                Err(e) => leave(&a, &e.message, &mut skipped),
+            }
             continue;
         }
         let p = a.exponent;
@@ -1671,7 +1885,7 @@ fn main() -> ExitCode {
         | Cmd::Run { json, .. }
         | Cmd::Resume { json, .. }
         | Cmd::Verify { json, .. } => *json,
-        Cmd::CheckFactor { json, .. } => *json,
+        Cmd::CheckFactor { json, .. } | Cmd::Tf { json, .. } | Cmd::Pm1 { json, .. } => *json,
         Cmd::Bench { .. }
         | Cmd::BenchRender { .. }
         | Cmd::BenchAnalyze { .. }
@@ -1728,7 +1942,57 @@ fn main() -> ExitCode {
             backend,
             proof_dir,
             json,
-        } => cmd_resume(&checkpoint, budget, device, backend, proof_dir, json),
+        } => cmd_resume(
+            &checkpoint,
+            budget,
+            device,
+            backend.map(BackendArg::kind),
+            proof_dir,
+            json,
+        ),
+        Cmd::Tf {
+            exponent,
+            from,
+            to,
+            json,
+        } => {
+            let stop = || STOP.load(Ordering::SeqCst);
+            let o =
+                mersenne_forge::factor::trial_factor(exponent, from, to, None, &stop, &mut |_| {})
+                    .map_err(|e| fail(2, e))?;
+            if json {
+                println!("{}", serde_json::to_string(&o).expect("serializable"));
+            } else {
+                println!(
+                    "M{exponent} TF {from}-{to}: {} factors {:?}",
+                    if o.complete { "complete," } else { "stopped," },
+                    o.factors
+                );
+            }
+            Ok(if o.complete { 0 } else { EXIT_INCOMPLETE })
+        }
+        Cmd::Pm1 {
+            exponent,
+            b1,
+            b2,
+            backend,
+            device,
+            json,
+        } => {
+            let mut be = open(backend.kind(), exponent, device)?;
+            let stop = || STOP.load(Ordering::SeqCst);
+            let o = mersenne_forge::factor::pm1(be.as_mut(), b1, b2, &stop)
+                .map_err(|e| fail(EXIT_EXECUTION, e))?;
+            if json {
+                println!("{}", serde_json::to_string(&o).expect("serializable"));
+            } else {
+                for n in &o.notes {
+                    println!("note: {n}");
+                }
+                println!("M{exponent} P-1 B1={b1} B2={b2}: factor {:?}", o.factor);
+            }
+            Ok(if o.complete { 0 } else { EXIT_INCOMPLETE })
+        }
         Cmd::CheckpointExport { input, output } => {
             let ck = Checkpoint::load_file(&input)
                 .and_then(Checkpoint::portable)
