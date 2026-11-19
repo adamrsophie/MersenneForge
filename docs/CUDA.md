@@ -286,7 +286,12 @@ None of these is a mathematical result; the protocol never turns one into
     target/release/mersenne-forge doctor --json
     target/release/mersenne-forge run --test ll --exponent 44497 --backend cuda --device 0 --budget 10m
     target/release/mersenne-forge run --test prp --exponent 86243 --backend cuda --device 0 --budget 10m --proof-dir proofs --checkpoint-dir ckpt
-    target/release/mersenne-forge verify --proof PATH --backend cuda
+    target/release/mersenne-forge verify --proof PATH --backend cuda --budget 10m
+    MERSENNE_FORGE_CUDA_GRAPHS=1 target/release/mersenne-forge run --test prp --exponent 86243 --backend cuda --device 0 --budget 10m
+
+The last line runs the opt-in graph replay (32 squarings captured once per
+register and replayed). It has never run on a device; compare its res64
+with the run above before trusting it.
 
 `cargo test --features cuda --test cuda_backend` covers import and export
 round trips, single and batched squarings, LL steps, multiplication, copy,
