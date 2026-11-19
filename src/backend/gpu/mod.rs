@@ -9,6 +9,7 @@
 //! read them back, and only `import` writes them.
 
 pub mod model;
+pub mod tf;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -134,6 +135,32 @@ fn adapters() -> Vec<wgpu::Adapter> {
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
     pollster::block_on(instance.enumerate_adapters(BACKENDS))
+}
+
+/// The adapter at index `device`, or the first hardware adapter.
+fn pick_adapter(device: Option<u32>) -> BackendResult<wgpu::Adapter> {
+    let mut all = adapters();
+    match device {
+        Some(i) => {
+            if (i as usize) >= all.len() {
+                return Err(BackendError::Unsupported(format!(
+                    "GPU adapter index {i} does not exist ({} found)",
+                    all.len()
+                )));
+            }
+            Ok(all.swap_remove(i as usize))
+        }
+        None => all
+            .into_iter()
+            .find(|a| a.get_info().device_type != wgpu::DeviceType::Cpu)
+            .ok_or_else(|| {
+                BackendError::Unsupported(
+                    "no hardware GPU adapter found through Metal, Vulkan, or DX12 \
+                     (software adapters are used only when selected by index)"
+                        .into(),
+                )
+            }),
+    }
 }
 
 fn describe(id: u32, a: &wgpu::Adapter) -> GpuDevice {
@@ -277,28 +304,7 @@ impl GpuBackend {
                 "exponent {p} is outside the GPU backend range {lo}..={hi}"
             ))
         })?;
-        let mut all = adapters();
-        let adapter = match opts.device {
-            Some(i) => {
-                if (i as usize) >= all.len() {
-                    return Err(BackendError::Unsupported(format!(
-                        "GPU adapter index {i} does not exist ({} found)",
-                        all.len()
-                    )));
-                }
-                all.swap_remove(i as usize)
-            }
-            None => all
-                .into_iter()
-                .find(|a| a.get_info().device_type != wgpu::DeviceType::Cpu)
-                .ok_or_else(|| {
-                    BackendError::Unsupported(
-                        "no hardware GPU adapter found through Metal, Vulkan, or DX12 \
-                         (software adapters are used only when selected by index)"
-                            .into(),
-                    )
-                })?,
-        };
+        let adapter = pick_adapter(opts.device)?;
         let info = adapter.get_info();
         let device_name = format!("{} ({:?})", info.name, info.backend);
         let limits = adapter.limits();

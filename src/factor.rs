@@ -92,6 +92,40 @@ pub fn trial_factor(
     stop: &dyn Fn() -> bool,
     progress: &mut dyn FnMut(u128),
 ) -> Result<TfOutcome, String> {
+    trial_factor_with(p, bit_lo, bit_hi, from_k, stop, progress, &mut |p, qs| {
+        Ok(qs.iter().copied().filter(|&q| divides(p, q)).collect())
+    })
+}
+
+/// Whether q divides 2^p - 1, on the host.
+pub fn divides(p: u32, q: u128) -> bool {
+    match u64::try_from(q) {
+        Ok(q64) => pow2_mod(p, q64) == 1,
+        // ponytail: arbitrary precision above 2^64 is slow; a two-limb
+        // Montgomery multiply is the upgrade path.
+        Err(_) => {
+            let qb = BigUint::from(q);
+            BigUint::from(2u32).modpow(&BigUint::from(p), &qb) == BigUint::one()
+        }
+    }
+}
+
+/// Batch tester for [`trial_factor_with`]: the candidates of one segment
+/// in, the ones for which 2^p = 1 mod q out.
+pub type TfTester<'a> = dyn FnMut(u32, &[u128]) -> Result<Vec<u128>, String> + 'a;
+
+/// [`trial_factor`] with the candidates of each sieved segment handed to
+/// `test` in one batch (the GPU kernel, for example). Every q it returns is
+/// checked again exactly before it is reported.
+pub fn trial_factor_with(
+    p: u32,
+    bit_lo: u32,
+    bit_hi: u32,
+    from_k: Option<u128>,
+    stop: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut(u128),
+    test: &mut TfTester<'_>,
+) -> Result<TfOutcome, String> {
     crate::exponent::validate(p).map_err(|e| e.to_string())?;
     if !(bit_lo < bit_hi && bit_hi <= 120) {
         return Err(format!(
@@ -140,28 +174,25 @@ pub fn trial_factor(
                 i += s as usize;
             }
         }
-        for (i, _) in bad[..len].iter().enumerate().filter(|(_, b)| !**b) {
-            let q = two_p * (k0 + i as u128) + 1;
-            if !matches!(q & 7, 1 | 7) {
-                continue;
+        let cands: Vec<u128> = bad[..len]
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| !**b)
+            .map(|(i, _)| two_p * (k0 + i as u128) + 1)
+            .filter(|q| matches!(q & 7, 1 | 7))
+            .collect();
+        for q in test(p, &cands)? {
+            if !cands.contains(&q) {
+                return Err(format!("the tester returned {q}, which is not a candidate"));
             }
-            let divides = match u64::try_from(q) {
-                Ok(q64) => pow2_mod(p, q64) == 1,
-                // ponytail: arbitrary precision above 2^64 is slow; a two-limb
-                // Montgomery multiply (or a GPU kernel) is the upgrade path.
-                Err(_) => {
-                    let qb = BigUint::from(q);
-                    BigUint::from(2u32).modpow(&BigUint::from(p), &qb) == BigUint::one()
-                }
-            };
-            if divides {
-                let f = q.to_string();
-                let c = crate::worktodo::check_factor(p, &f)?;
-                if !c.accepted() {
-                    return Err(format!("internal error: {f} failed the factor check"));
-                }
-                factors.push(f);
+            let f = q.to_string();
+            let c = crate::worktodo::check_factor(p, &f)?;
+            if !c.accepted() {
+                return Err(format!(
+                    "{f} was reported as a factor but fails the factor check"
+                ));
             }
+            factors.push(f);
         }
         k0 += len as u128;
         progress(k0);

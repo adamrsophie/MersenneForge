@@ -276,11 +276,17 @@ enum Cmd {
         from: u32,
         #[arg(long)]
         to: u32,
+        /// Test candidates below 2^63 on the GPU (needs the gpu feature);
+        /// the sieve and every hit's final check stay on the host.
+        #[arg(long)]
+        gpu: bool,
+        #[arg(long)]
+        device: Option<u32>,
         #[arg(long)]
         json: bool,
     },
-    /// P-1 factoring of 2^p - 1 with bounds B1 and B2 (stage 2 runs on the
-    /// host and suits small exponents only).
+    /// P-1 factoring of 2^p - 1 with bounds B1 and B2, both stages on the
+    /// chosen backend (stage 2 also makes one host round trip per prime).
     Pm1 {
         #[arg(long)]
         exponent: u32,
@@ -1861,6 +1867,51 @@ fn cmd_primenet(
     })
 }
 
+#[cfg(feature = "gpu")]
+fn tf_on_gpu(
+    p: u32,
+    from: u32,
+    to: u32,
+    device: Option<u32>,
+    stop: &dyn Fn() -> bool,
+) -> Result<mersenne_forge::factor::TfOutcome, Failure> {
+    use mersenne_forge::backend::gpu::tf::{GpuTf, Q_LIMIT};
+    let tf = GpuTf::new(device).map_err(|e| fail(EXIT_UNSUPPORTED, e))?;
+    mersenne_forge::factor::trial_factor_with(p, from, to, None, stop, &mut |_| {}, &mut |p, qs| {
+        let (small, big): (Vec<u128>, Vec<u128>) = qs.iter().partition(|&&q| q < Q_LIMIT);
+        let small64: Vec<u64> = small.iter().map(|&q| q as u64).collect();
+        let mut hits: Vec<u128> = match tf.test(p, &small64)? {
+            Some(h) => h.into_iter().map(u128::from).collect(),
+            // More hits than slots: the host tests this batch.
+            None => small
+                .iter()
+                .copied()
+                .filter(|&q| mersenne_forge::factor::divides(p, q))
+                .collect(),
+        };
+        hits.extend(
+            big.into_iter()
+                .filter(|&q| mersenne_forge::factor::divides(p, q)),
+        );
+        Ok(hits)
+    })
+    .map_err(|e| fail(EXIT_EXECUTION, e))
+}
+
+#[cfg(not(feature = "gpu"))]
+fn tf_on_gpu(
+    _: u32,
+    _: u32,
+    _: u32,
+    _: Option<u32>,
+    _: &dyn Fn() -> bool,
+) -> Result<mersenne_forge::factor::TfOutcome, Failure> {
+    Err(fail(
+        EXIT_UNSUPPORTED,
+        "this build has no GPU support (build with --features gpu)",
+    ))
+}
+
 fn cmd_tune(p: u32, kind: BackendKind, device: Option<u32>, iters: u64) -> Result<u8, Failure> {
     use mersenne_forge::backend::Backend;
     let unsupported =
@@ -2506,12 +2557,17 @@ fn main() -> ExitCode {
             exponent,
             from,
             to,
+            gpu,
+            device,
             json,
         } => {
             let stop = || STOP.load(Ordering::SeqCst);
-            let o =
+            let o = if gpu {
+                tf_on_gpu(exponent, from, to, device, &stop)?
+            } else {
                 mersenne_forge::factor::trial_factor(exponent, from, to, None, &stop, &mut |_| {})
-                    .map_err(|e| fail(2, e))?;
+                    .map_err(|e| fail(2, e))?
+            };
             if json {
                 println!("{}", serde_json::to_string(&o).expect("serializable"));
             } else {

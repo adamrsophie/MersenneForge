@@ -54,6 +54,11 @@ const BUILD_SOURCES: &[(&str, &[u8])] = &[
         "src/backend/gpu/model.rs",
         include_bytes!("backend/gpu/model.rs"),
     ),
+    ("src/backend/gpu/tf.rs", include_bytes!("backend/gpu/tf.rs")),
+    (
+        "src/backend/gpu/tf.wgsl",
+        include_bytes!("backend/gpu/tf.wgsl"),
+    ),
     ("src/backend/mod.rs", include_bytes!("backend/mod.rs")),
     ("src/bench.rs", include_bytes!("bench.rs")),
     ("src/checkpoint.rs", include_bytes!("checkpoint.rs")),
