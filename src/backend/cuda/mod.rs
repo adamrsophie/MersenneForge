@@ -24,7 +24,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaGraph, CudaSlice, CudaStream, DriverError, LaunchConfig,
+    PushKernelArg,
 };
 use cudarc::nvrtc::{CompileError, CompileOptions};
 use sha3::{Digest, Sha3_256};
@@ -94,6 +95,9 @@ pub fn nvrtc_options(major: i32, minor: i32) -> Vec<String> {
     v.push(format!("--gpu-architecture=compute_{major}{minor}"));
     v
 }
+
+/// Squarings per captured CUDA graph (opt-in graph replay).
+const GRAPH_ITERS: u64 = 32;
 
 pub struct CudaOptions {
     /// CUDA device ordinal as listed by probe(). None: device 0.
@@ -304,6 +308,12 @@ pub struct CudaBackend {
     ll_seq: Vec<Launch>,
     mul_seq: Vec<Launch>,
     stream: Arc<CudaStream>,
+    /// Opt-in graph replay (MERSENNE_FORGE_CUDA_GRAPHS=1): one captured
+    /// graph of GRAPH_ITERS squarings (or LL steps) per register, replayed
+    /// instead of relaunching each kernel. Declared before `funcs`, so the
+    /// graphs are destroyed before the module that holds their kernels.
+    /// UNTESTED: no NVIDIA device has run this.
+    graphs: Option<HashMap<(u32, bool), CudaGraph>>,
     funcs: Vec<CudaFunction>,
     t: CudaSlice<u64>,
     t2: CudaSlice<u64>,
@@ -403,6 +413,9 @@ impl CudaBackend {
             mul_seq: plan.mul_launches(),
             plan,
             stream,
+            graphs: std::env::var("MERSENNE_FORGE_CUDA_GRAPHS")
+                .is_ok_and(|v| v == "1")
+                .then(HashMap::new),
             funcs,
             t,
             t2,
@@ -479,6 +492,51 @@ impl CudaBackend {
         Ok(())
     }
 
+    /// `n` squarings (or LL steps) of `r`: replayed from a captured graph
+    /// when graphs are on, with the remainder launched directly.
+    fn run_square(&mut self, ll: bool, r: Reg, n: u64) -> BackendResult<()> {
+        let direct =
+            |s: &Self, n: u64| s.submit(if ll { &s.ll_seq } else { &s.square_seq }, r, None, n);
+        let Some(graphs) = &self.graphs else {
+            return direct(self, n);
+        };
+        if n < GRAPH_ITERS {
+            return direct(self, n);
+        }
+        let key = (r.0, ll);
+        if !graphs.contains_key(&key) {
+            use cudarc::driver::sys;
+            self.stream
+                .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+                .map_err(|e| driver_err("begin graph capture", e))?;
+            let captured = direct(self, GRAPH_ITERS);
+            let graph = self
+                .stream
+                .end_capture(sys::CUgraphInstantiate_flags(0))
+                .map_err(|e| driver_err("end graph capture", e));
+            captured?;
+            match graph? {
+                Some(g) => {
+                    self.graphs.as_mut().expect("graphs are on").insert(key, g);
+                }
+                None => return direct(self, n),
+            }
+        }
+        let g = &self.graphs.as_ref().expect("graphs are on")[&key];
+        for _ in 0..n / GRAPH_ITERS {
+            g.launch().map_err(|e| driver_err("graph launch", e))?;
+        }
+        direct(self, n % GRAPH_ITERS)
+    }
+
+    /// Graphs hold the device addresses of one register: drop them when the
+    /// register is replaced or freed.
+    fn forget_graphs(&mut self, r: u32) {
+        if let Some(g) = self.graphs.as_mut() {
+            g.retain(|&(reg, _), _| reg != r);
+        }
+    }
+
     fn read_words(&self, r: Reg) -> BackendResult<Vec<u64>> {
         let words = self
             .stream
@@ -518,7 +576,11 @@ impl Backend for CudaBackend {
         BackendIdentity {
             kind: "cuda".into(),
             build: self.build.clone(),
-            plan: plan_name(self.plan.n),
+            plan: if self.graphs.is_some() {
+                format!("{} graphs", plan_name(self.plan.n))
+            } else {
+                plan_name(self.plan.n)
+            },
             device: self.device.clone(),
         }
     }
@@ -536,6 +598,7 @@ impl Backend for CudaBackend {
     }
 
     fn free(&mut self, r: Reg) -> BackendResult<()> {
+        self.forget_graphs(r.0);
         self.regs
             .remove(&r.0)
             .map(|_| ())
@@ -563,6 +626,7 @@ impl Backend for CudaBackend {
             .and_then(|_| self.stream.synchronize())
             .map_err(|e| driver_err("copy to device", e));
         // `words` stays alive until the synchronize above has returned.
+        self.forget_graphs(r.0);
         self.regs.insert(r.0, dst);
         drop(words);
         self.note(res)
@@ -588,6 +652,7 @@ impl Backend for CudaBackend {
             .stream
             .memcpy_dtod(self.reg(src)?, &mut d)
             .map_err(|e| driver_err("device copy", e));
+        self.forget_graphs(dst.0);
         self.regs.insert(dst.0, d);
         self.note(res)
     }
@@ -595,14 +660,14 @@ impl Backend for CudaBackend {
     fn square(&mut self, r: Reg, n: u64) -> BackendResult<()> {
         self.live()?;
         self.reg(r)?;
-        let res = self.submit(&self.square_seq, r, None, n);
+        let res = self.run_square(false, r, n);
         self.note(res)
     }
 
     fn ll_step(&mut self, r: Reg, n: u64) -> BackendResult<()> {
         self.live()?;
         self.reg(r)?;
-        let res = self.submit(&self.ll_seq, r, None, n);
+        let res = self.run_square(true, r, n);
         self.note(res)
     }
 
