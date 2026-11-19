@@ -139,8 +139,21 @@ enum Cmd {
         budget: Option<String>,
         #[arg(long)]
         device: Option<u32>,
+        /// Backend for a portable checkpoint (from `checkpoint-export`);
+        /// other checkpoints resume on the backend that wrote them.
+        #[arg(long, value_enum)]
+        backend: Option<BackendKind>,
         #[arg(long)]
         json: bool,
+    },
+    /// Write a portable copy of a checkpoint: its last verified state, not
+    /// tied to a backend, build, or device. Resume it with `resume
+    /// --backend`, or place it at a `work` checkpoint path.
+    CheckpointExport {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
     },
     /// Verify a PRP proof file.
     Verify {
@@ -628,20 +641,30 @@ fn cmd_resume(
     path: &Path,
     budget: Option<String>,
     device: Option<u32>,
+    backend: Option<BackendKind>,
     proof_dir: Option<PathBuf>,
     as_json: bool,
 ) -> Result<u8, Failure> {
     let _lock = lock_checkpoint(path)?;
     let (first, _) = Checkpoint::load_latest(path).map_err(|e| fail(EXIT_STATE, e.to_string()))?;
-    let kind = BackendKind::parse(&first.meta.backend.kind).ok_or_else(|| {
-        fail(
-            EXIT_UNSUPPORTED,
-            format!(
-                "unknown backend {:?} in checkpoint",
-                first.meta.backend.kind
-            ),
-        )
-    })?;
+    let portable = first.meta.backend.kind == mersenne_forge::checkpoint::PORTABLE;
+    let kind = match (portable, backend) {
+        (true, Some(k)) => Ok(k),
+        (true, None) => Err(fail(2, "a portable checkpoint needs --backend")),
+        (false, Some(_)) => Err(fail(
+            2,
+            "--backend applies only to a portable checkpoint (see checkpoint-export)",
+        )),
+        (false, None) => BackendKind::parse(&first.meta.backend.kind).ok_or_else(|| {
+            fail(
+                EXIT_UNSUPPORTED,
+                format!(
+                    "unknown backend {:?} in checkpoint",
+                    first.meta.backend.kind
+                ),
+            )
+        }),
+    }?;
     let deadline = deadline(&budget, kind)?;
     let mut be = open(kind, first.meta.exponent, device)?;
     let mut ctl = Control {
@@ -1172,8 +1195,14 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
                         ),
                     ));
                 }
-                // Resume on the backend the run started on.
-                let kind = BackendKind::parse(&ck.meta.backend.kind).ok_or_else(|| {
+                // Resume on the backend the run started on; a portable
+                // checkpoint runs on the backend this session uses.
+                let kind = if ck.meta.backend.kind == mersenne_forge::checkpoint::PORTABLE {
+                    Some(w.kind)
+                } else {
+                    BackendKind::parse(&ck.meta.backend.kind)
+                };
+                let kind = kind.ok_or_else(|| {
                     fail(
                         EXIT_UNSUPPORTED,
                         format!("unknown backend {:?} in checkpoint", ck.meta.backend.kind),
@@ -1648,6 +1677,7 @@ fn main() -> ExitCode {
         | Cmd::BenchAnalyze { .. }
         | Cmd::Work { .. }
         | Cmd::Power { .. }
+        | Cmd::CheckpointExport { .. }
         | Cmd::Primenet { .. } => false,
     };
     let _ = ctrlc::set_handler(|| {
@@ -1695,9 +1725,28 @@ fn main() -> ExitCode {
             checkpoint,
             budget,
             device,
+            backend,
             proof_dir,
             json,
-        } => cmd_resume(&checkpoint, budget, device, proof_dir, json),
+        } => cmd_resume(&checkpoint, budget, device, backend, proof_dir, json),
+        Cmd::CheckpointExport { input, output } => {
+            let ck = Checkpoint::load_file(&input)
+                .and_then(Checkpoint::portable)
+                .map_err(|e| fail(EXIT_STATE, e.to_string()))?;
+            if output.exists() {
+                return Err(fail(EXIT_STATE, format!("{} exists", output.display())));
+            }
+            ck.save(&output)
+                .map_err(|e| fail(EXIT_STATE, e.to_string()))?;
+            println!(
+                "M{} {} at k = {} written to {}",
+                ck.meta.exponent,
+                ck.meta.protocol,
+                ck.meta.k,
+                output.display()
+            );
+            Ok(0)
+        }
         Cmd::Verify {
             proof,
             backend,

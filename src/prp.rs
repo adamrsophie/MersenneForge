@@ -812,7 +812,7 @@ pub fn run_prp<B: Backend>(
                 ))
                 .into());
             }
-            if m.backend != be.identity() {
+            if m.backend != be.identity() && m.backend.kind != crate::checkpoint::PORTABLE {
                 return Err(CheckpointError::Mismatch(format!(
                     "written by backend {:?}, resuming on {:?}",
                     m.backend,

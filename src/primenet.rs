@@ -63,11 +63,34 @@ fn urlencode(s: &str) -> String {
         .collect()
 }
 
-/// Run curl with `args`; return its stdout. `--fail` is not used, because
+/// Accept a URL only on the PrimeNet hosts, over https.
+fn primenet_url(url: &str) -> Result<String, String> {
+    let ok = ["https://mersenne.org/", "https://www.mersenne.org/"]
+        .iter()
+        .any(|h| url.starts_with(h))
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control());
+    if ok {
+        Ok(url.to_string())
+    } else {
+        Err(format!("refusing a URL outside mersenne.org: {url:?}"))
+    }
+}
+
+/// Run curl with `args`; return its stdout. Every URL goes after `--url`
+/// so it can never be read as an option. `--fail` is not used, because
 /// PrimeNet reports errors in the page body.
 fn curl(args: &[String]) -> Result<String, String> {
     let o = std::process::Command::new("curl")
-        .args(["--silent", "--show-error", "--max-time", "120"])
+        .args([
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "120",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+        ])
         .args(args)
         .output()
         .map_err(|e| format!("curl: {e}"))?;
@@ -120,7 +143,8 @@ impl Session {
         a.extend([
             "--data-binary".into(),
             format!("@{}", form.display()),
-            url.into(),
+            "--url".into(),
+            primenet_url(url)?,
         ]);
         curl(&a)
     }
@@ -223,8 +247,9 @@ pub fn upload_proof(dir: &Path, user: &str, proof: &Path) -> Result<bool, String
         data.len()
     );
     loop {
-        let reply: serde_json::Value = serde_json::from_str(&curl(&[ask.clone()])?)
-            .map_err(|e| format!("proof upload reply: {e}"))?;
+        let reply: serde_json::Value =
+            serde_json::from_str(&curl(&["--url".into(), primenet_url(&ask)?])?)
+                .map_err(|e| format!("proof upload reply: {e}"))?;
         if reply.get("error_status").is_some() {
             return Ok(reply["error_status"] == 409
                 && reply["error_description"] == "Proof already uploaded");
@@ -237,7 +262,7 @@ pub fn upload_proof(dir: &Path, user: &str, proof: &Path) -> Result<bool, String
             Some(rest) => format!("https:{rest}"),
             None => url.to_string(),
         };
-        let base = format!("{url}&FileMD5={file_md5}");
+        let base = format!("{}&FileMD5={file_md5}", primenet_url(&url)?);
         // The first region the server still needs; its end is inclusive.
         let (mut pos, end) = need
             .iter()
@@ -260,6 +285,7 @@ pub fn upload_proof(dir: &Path, user: &str, proof: &Path) -> Result<bool, String
             let page = curl(&[
                 "--form".into(),
                 format!("Data=<{}", chunk_file.display()),
+                "--url".into(),
                 format!(
                     "{base}&DataOffset={pos}&DataSize={size}&DataMD5={}",
                     md5hex(chunk)
@@ -444,6 +470,15 @@ mod tests {
             "PRP=ABC,1,2,124647911,-1,77,0"
         );
         assert!(parse_assignment_page("nothing").is_err());
+    }
+
+    #[test]
+    fn only_primenet_urls_are_used() {
+        assert!(primenet_url("https://www.mersenne.org/proof_upload/?a=1").is_ok());
+        assert!(primenet_url("https://mersenne.org.evil.example/").is_err());
+        assert!(primenet_url("http://www.mersenne.org/").is_err());
+        assert!(primenet_url("-K/etc/passwd").is_err());
+        assert!(primenet_url("https://www.mersenne.org/ x").is_err());
     }
 
     #[test]

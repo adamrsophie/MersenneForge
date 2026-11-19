@@ -527,3 +527,61 @@ fn damaged_proof_residue_files_are_errors() {
     std::fs::remove_file(&file).unwrap();
     assert!(matches!(store.load(k), Err(ProofError::Residue { .. })));
 }
+
+/// A portable export of a CPU checkpoint resumes on the DWT backend and
+/// gives the oracle result; the original still refuses the other backend.
+#[test]
+fn portable_checkpoints_move_between_backends() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = halted_prp(dir.path());
+    let ck = Checkpoint::load_file(&path).unwrap();
+    let cfg = prp_cfg(dir.path(), None);
+    let refused = run_prp(
+        &mut DwtBackend::new(PRIME_P).unwrap(),
+        PRIME_P,
+        &cfg,
+        serde_json::json!({}),
+        Some(&ck),
+        &mut Control::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        refused,
+        ProtocolError::Checkpoint(CheckpointError::Mismatch(_))
+    ));
+    let port = ck.portable().unwrap();
+    assert_eq!(port.meta.backend.kind, mersenne_forge::checkpoint::PORTABLE);
+    let out = dir.path().join("portable.ckpt");
+    port.save(&out).unwrap();
+    let back = Checkpoint::load_file(&out).unwrap();
+    let r = run_prp(
+        &mut DwtBackend::new(PRIME_P).unwrap(),
+        PRIME_P,
+        &cfg,
+        serde_json::json!({}),
+        Some(&back),
+        &mut Control::default(),
+    )
+    .unwrap();
+    assert_eq!(r.result.unwrap().res64, common::oracle_prp_res64(PRIME_P));
+
+    // LL rewinds to the last Jacobi verified residue.
+    let mut ctl = Control {
+        halt_at: Some(300),
+        ..Control::default()
+    };
+    let lcfg = ll_cfg(dir.path());
+    run_ll(
+        &mut CpuBackend::new(PRIME_P).unwrap(),
+        PRIME_P,
+        &lcfg,
+        serde_json::json!({}),
+        None,
+        &mut ctl,
+    )
+    .unwrap();
+    let (l, _) = Checkpoint::load_latest(lcfg.checkpoint.as_ref().unwrap()).unwrap();
+    let lp = l.clone().portable().unwrap();
+    assert_eq!(lp.meta.k, l.meta.verified_k);
+    assert_eq!(lp.residues[0], l.residues[1]);
+}

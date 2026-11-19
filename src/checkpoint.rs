@@ -44,6 +44,8 @@ pub const FORMAT_VERSION: u32 = 1;
 const MAGIC: &[u8; 20] = b"MERSENNE-FORGE-CKPT\n";
 const MAX_META: u64 = 1 << 20;
 const MAX_RESIDUES: u32 = 4;
+/// Backend kind of a portable checkpoint: one any backend may resume.
+pub const PORTABLE: &str = "portable";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckpointError {
@@ -281,6 +283,31 @@ impl Checkpoint {
         let h = sha3_256(&[&b]);
         b.extend_from_slice(&h);
         b
+    }
+
+    /// This checkpoint's last verified state, not tied to a backend. A PRP
+    /// state is verified as stored. An LL state rewinds to its last Jacobi
+    /// verified residue, so nothing unverified moves to another backend.
+    pub fn portable(mut self) -> Result<Checkpoint, CheckpointError> {
+        match (self.meta.protocol.as_str(), self.meta.state.as_str()) {
+            ("ll-jacobi/1", _) if self.residues.len() == 2 => {
+                self.meta.k = self.meta.verified_k;
+                self.residues[0] = self.residues[1].clone();
+            }
+            (p, "verified" | "completed") if p.starts_with("prp-") => {}
+            (p, st) => {
+                return Err(CheckpointError::Mismatch(format!(
+                    "no portable form for a {p} checkpoint in state {st:?}"
+                )))
+            }
+        }
+        self.meta.backend = BackendIdentity {
+            kind: PORTABLE.into(),
+            build: String::new(),
+            plan: String::new(),
+            device: String::new(),
+        };
+        Ok(self)
     }
 
     pub fn save(&self, path: &Path) -> Result<(), CheckpointError> {
