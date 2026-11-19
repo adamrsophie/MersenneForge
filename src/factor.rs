@@ -439,7 +439,9 @@ pub fn pm1_resumable(
 pub struct EcmOutcome {
     pub exponent: u32,
     pub b1: u64,
-    /// Curves run to the end of stage 1.
+    /// Stage 2 bound (B2 <= B1 skips stage 2).
+    pub b2: u64,
+    /// Curves run to the end (of stage 2 when it runs).
     pub curves: u32,
     /// Suyama parameter of the first curve; curve i uses sigma + i.
     pub sigma: u64,
@@ -510,6 +512,7 @@ fn ladder(m: &ModN, p: &Point, k: u64, a24: &BigUint) -> Point {
 pub fn ecm(
     p: u32,
     b1: u64,
+    b2: u64,
     curves: u32,
     sigma: u64,
     stop: &dyn Fn() -> bool,
@@ -523,13 +526,20 @@ pub fn ecm(
     let mut out = EcmOutcome {
         exponent: p,
         b1,
+        b2,
         curves: 0,
         sigma,
         factor: None,
         found_sigma: None,
         notes: Vec::new(),
     };
-    let primes = primes_below(b1 + 1);
+    let primes = primes_below(b1.max(b2) + 1);
+    let stage2: Vec<u64> = primes
+        .iter()
+        .copied()
+        .filter(|&q| q > b1 && q <= b2)
+        .collect();
+    let primes: Vec<u64> = primes.into_iter().filter(|&q| q <= b1).collect();
     for c in 0..u64::from(curves) {
         let s = BigUint::from(sigma + c);
         let u = m.sub(&m.mul(&s, &s), &BigUint::from(5u32));
@@ -566,12 +576,50 @@ pub fn ecm(
                 return Ok(out);
             }
         }
-        out.curves += 1;
         if let Some(f) = factor_from(p, &pt.1, &n, &mut out.notes) {
+            out.curves += 1;
             out.factor = Some(f);
             out.found_sigma = Some(sigma + c);
             return Ok(out);
         }
+        // Stage 2, standard continuation: walk the odd multiples m Q with
+        // (m + 2) Q = xADD(m Q, 2 Q; difference (m - 2) Q), one xADD per odd
+        // m, and multiply Z(q Q) into acc for every prime q in (B1, B2]. A
+        // factor f of N divides acc when the order of Q mod f is such a q.
+        // ponytail: no baby step giant step pairing; about 3 (B2 - B1)
+        // multiplications per curve.
+        if let Some(&first) = stage2.first() {
+            let two = xdbl(&m, &pt, &a24);
+            let mut prev = ladder(&m, &pt, first - 2, &a24);
+            let mut cur = ladder(&m, &pt, first, &a24);
+            let mut mq = first;
+            let mut acc = BigUint::one();
+            let mut next = stage2.iter().peekable();
+            while let Some(&&q) = next.peek() {
+                if mq == q {
+                    acc = m.mul(&acc, &cur.1);
+                    next.next();
+                    if next.peek().is_none() {
+                        break;
+                    }
+                }
+                let after = xadd(&m, &cur, &two, &prev);
+                prev = std::mem::replace(&mut cur, after);
+                mq += 2;
+                if mq % 2_000_000 == 1 && stop() {
+                    out.notes
+                        .push(format!("stopped in stage 2 of curve sigma = {}", sigma + c));
+                    return Ok(out);
+                }
+            }
+            if let Some(f) = factor_from(p, &acc, &n, &mut out.notes) {
+                out.curves += 1;
+                out.factor = Some(f);
+                out.found_sigma = Some(sigma + c);
+                return Ok(out);
+            }
+        }
+        out.curves += 1;
     }
     Ok(out)
 }
@@ -846,14 +894,29 @@ mod tests {
     fn ecm_finds_a_small_factor_and_checks_it() {
         // 2^67 - 1 = 193707721 * 761838257287: about a quarter of the curves
         // at B1 = 2000 find the 28-bit factor (the 40-bit one is rarer).
-        let o = ecm(67, 2000, 40, 6, &|| false).unwrap();
+        let o = ecm(67, 2000, 0, 40, 6, &|| false).unwrap();
+        assert_eq!(o.b2, 0);
         assert!(
             matches!(o.factor.as_deref(), Some("193707721" | "761838257287")),
             "{o:?}"
         );
         // M61 is prime: nothing to find, and nothing false is reported.
-        let o = ecm(61, 500, 3, 6, &|| false).unwrap();
+        let o = ecm(61, 500, 5000, 3, 6, &|| false).unwrap();
         assert!(o.factor.is_none() && o.curves == 3);
+    }
+
+    #[test]
+    fn ecm_stage_2_finds_at_least_what_stage_1_finds() {
+        // Stage 1 is the same with or without stage 2, so stage 2 can only
+        // find a factor on the same curve or an earlier one.
+        let s1 = ecm(67, 300, 0, 60, 6, &|| false).unwrap();
+        let s2 = ecm(67, 300, 30_000, 60, 6, &|| false).unwrap();
+        if let Some(at) = s1.found_sigma {
+            assert!(s2.found_sigma.is_some_and(|b| b <= at), "{s1:?} {s2:?}");
+        }
+        if let Some(f) = s2.factor.as_deref() {
+            assert!(matches!(f, "193707721" | "761838257287"), "{s2:?}");
+        }
     }
 
     #[test]

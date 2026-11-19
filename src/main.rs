@@ -295,12 +295,15 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// ECM stage 1 on 2^p - 1 (host arithmetic, small exponents only).
+    /// ECM stages 1 and 2 on 2^p - 1 (host arithmetic, small exponents
+    /// only). Stage 2 runs when --b2 is above --b1.
     Ecm {
         #[arg(long)]
         exponent: u32,
         #[arg(long)]
         b1: u64,
+        #[arg(long, default_value_t = 0)]
+        b2: u64,
         #[arg(long, default_value_t = 10)]
         curves: u32,
         #[arg(long, default_value_t = 6)]
@@ -2490,12 +2493,13 @@ fn main() -> ExitCode {
         Cmd::Ecm {
             exponent,
             b1,
+            b2,
             curves,
             sigma,
             json,
         } => {
             let stop = || STOP.load(Ordering::SeqCst);
-            let o = mersenne_forge::factor::ecm(exponent, b1, curves, sigma, &stop)
+            let o = mersenne_forge::factor::ecm(exponent, b1, b2, curves, sigma, &stop)
                 .map_err(|e| fail(2, e))?;
             if json {
                 println!("{}", serde_json::to_string(&o).expect("serializable"));
