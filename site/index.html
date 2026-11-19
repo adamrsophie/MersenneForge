@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MersenneForge</title>
+<meta name="description" content="A Rust engine for Lucas-Lehmer and base 3 probable prime tests of Mersenne numbers, with Gerbicz error checking, PRP proofs, and durable checkpoints.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon.ico" sizes="any">
+<style>
+:root {
+  --bg: #ffffff; --fg: #1b1d22; --muted: #5b606b; --line: #e3e5ea;
+  --panel: #f6f7f9; --accent: #d9531a; --code: #f1f2f5;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161b; --fg: #e8e9ec; --muted: #9aa0ab; --line: #2a2e36;
+    --panel: #1b1e24; --accent: #ff6a2b; --code: #1f2229;
+  }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.wrap { max-width: 920px; margin: 0 auto; padding: 0 16px; }
+header.top { border-bottom: 1px solid var(--line); }
+header.top .wrap { display: flex; align-items: center; justify-content: space-between; height: 60px; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 650; color: var(--fg); }
+.brand img { width: 28px; height: 28px; }
+nav a { margin-left: 20px; color: var(--muted); font-size: 15px; }
+.hero { padding: 72px 0 48px; display: grid; grid-template-columns: 1fr auto; gap: 40px; align-items: center; }
+.hero h1 { font-size: 44px; line-height: 1.1; margin: 0 0 16px; letter-spacing: -0.02em; }
+.hero p { font-size: 19px; color: var(--muted); margin: 0 0 28px; max-width: 34em; }
+.hero img { width: 180px; height: 180px; }
+.btn { display: inline-block; padding: 10px 18px; border-radius: 8px; font-weight: 600; margin-right: 10px; }
+.btn.primary { background: var(--accent); color: #fff; }
+.btn.ghost { border: 1px solid var(--line); color: var(--fg); }
+.btn:hover { text-decoration: none; opacity: 0.9; }
+section { padding: 40px 0; border-top: 1px solid var(--line); }
+h2 { font-size: 24px; margin: 0 0 16px; letter-spacing: -0.01em; }
+.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; }
+.card h3 { margin: 0 0 6px; font-size: 16px; }
+.card p { margin: 0; color: var(--muted); font-size: 15px; }
+.table-scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 15px; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; }
+.tag { display: inline-block; font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+.ok { background: rgba(46, 160, 67, 0.15); color: #2ea043; }
+.part { background: rgba(210, 153, 34, 0.15); color: #b8860b; }
+.no { background: rgba(140, 140, 150, 0.15); color: var(--muted); }
+pre { background: var(--code); border: 1px solid var(--line); border-radius: 10px; padding: 16px; overflow-x: auto; font-size: 14px; line-height: 1.5; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.note { color: var(--muted); font-size: 15px; }
+ul.links { padding-left: 18px; margin: 0; }
+footer { border-top: 1px solid var(--line); padding: 28px 0 40px; color: var(--muted); font-size: 14px; }
+@media (max-width: 720px) {
+  .hero { grid-template-columns: 1fr; padding: 40px 0 32px; }
+  .hero img { display: none; }
+  .hero h1 { font-size: 34px; }
+  .grid { grid-template-columns: 1fr; }
+  nav a { margin-left: 14px; }
+  nav a.wide { display: none; }
+}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="./"><img src="logo.svg" alt="">MersenneForge</a>
+    <nav>
+      <a href="#status">Status</a>
+      <a class="wide" href="#usage">Usage</a>
+      <a href="https://github.com/adamrsophie/MersenneForge">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="hero">
+    <div>
+      <h1>Checked primality tests for Mersenne numbers, in Rust.</h1>
+      <p>MersenneForge runs Lucas-Lehmer and base 3 probable prime tests of M<sub>p</sub> = 2<sup>p</sup> &minus; 1 with Gerbicz error checking, PRP proofs, and durable checkpoints.</p>
+      <a class="btn primary" href="https://github.com/adamrsophie/MersenneForge">View on GitHub</a>
+      <a class="btn ghost" href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/STATUS.md">Capability status</a>
+    </div>
+    <img src="logo.svg" alt="MersenneForge logo">
+  </div>
+
+  <section>
+    <h2>Design</h2>
+    <div class="grid">
+      <div class="card"><h3>One protocol layer</h3><p>The LL, PRP, Gerbicz, proof, and checkpoint state machines are written once over a small arithmetic trait. Backends only do modular arithmetic.</p></div>
+      <div class="card"><h3>Errors caught, not hidden</h3><p>Gerbicz checks with rollback for PRP, the Jacobi check for LL, hashed and versioned checkpoints, and atomic writes.</p></div>
+      <div class="card"><h3>Pure Rust</h3><p>No linked native library and no upstream code. Protocol semantics and the proof format follow PRPLL (gpuowl).</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Backends</h2>
+    <div class="table-scroll">
+    <table>
+      <tr><th>Backend</th><th>Arithmetic</th><th>Status</th></tr>
+      <tr><td><code>cpu</code></td><td>Exact big integer, Mersenne folding</td><td><span class="tag ok">CPU tested</span></td></tr>
+      <tr><td><code>dwt</code></td><td>f64 irrational base DWT, roundoff checked</td><td><span class="tag ok">CPU tested</span></td></tr>
+      <tr><td><code>gpu</code></td><td>Exact integer NTT over GF(M31<sup>2</sup>) via wgpu</td><td><span class="tag part">Apple GPU (Metal) only</span></td></tr>
+      <tr><td><code>cuda</code></td><td>CUDA C kernels via cudarc</td><td><span class="tag no">Never run on CUDA hardware</span></td></tr>
+    </table>
+    </div>
+  </section>
+
+  <section id="status">
+    <h2>Status</h2>
+    <div class="table-scroll">
+    <table>
+      <tr><th>Area</th><th>Status</th></tr>
+      <tr><td>Checked PRP (Gerbicz), rollback, stop conditions</td><td><span class="tag ok">Implemented, tested</span></td></tr>
+      <tr><td>LL with Jacobi check</td><td><span class="tag ok">Implemented, tested</span></td></tr>
+      <tr><td>Checkpoints and resume</td><td><span class="tag ok">Implemented, tested</span></td></tr>
+      <tr><td>PRP proofs (format version 2); an upstream proof verifies here</td><td><span class="tag ok">Implemented, tested</span></td></tr>
+      <tr><td>Assignment queue, worktodo and result lines, factor checks</td><td><span class="tag part">Never submitted to PrimeNet</span></td></tr>
+      <tr><td>Our proofs accepted by an upstream verifier</td><td><span class="tag no">Not tested</span></td></tr>
+      <tr><td>NVIDIA, AMD, or Intel GPUs</td><td><span class="tag no">Not validated</span></td></tr>
+      <tr><td>Performance comparison</td><td><span class="tag no">Not measured</span></td></tr>
+    </table>
+    </div>
+    <p class="note">Every capability, with its evidence or what is missing, is listed in <a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/STATUS.md">docs/STATUS.md</a>. No local result is a discovery claim.</p>
+  </section>
+
+  <section id="usage">
+    <h2>Build and run</h2>
+<pre><code>cargo build --release                  # cpu and dwt backends
+cargo build --release --features gpu   # adds the wgpu backend
+
+mersenne-forge doctor --json --exponent 44497
+mersenne-forge run --test prp --exponent 44497 --backend dwt \
+    --proof-power 8 --proof-dir work/proof --checkpoint-dir work/ckpt --budget 1h
+mersenne-forge verify --proof work/proof/44497-8.proof --backend cpu
+mersenne-forge work --worktodo worktodo.txt --results results.json.txt \
+    --checkpoint-dir work/ckpt --proof-dir work/proof --backend dwt
+mersenne-forge check-factor --exponent 11 --factor 23</code></pre>
+    <p class="note">Requires Rust 1.89 or newer.</p>
+  </section>
+
+  <section>
+    <h2>Documentation</h2>
+    <ul class="links">
+      <li><a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/ARCHITECTURE.md">Architecture</a></li>
+      <li><a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/PROTOCOL.md">Protocol and formats</a></li>
+      <li><a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/VALIDATION.md">Validation report</a></li>
+      <li><a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/BENCHMARK.md">Benchmark method</a></li>
+      <li><a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/GPU.md">GPU backend</a> and <a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/CUDA.md">CUDA backend</a></li>
+    </ul>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    GPL-3.0-only. The protocol logic was written by studying the GPLv3 source of PRPLL/gpuowl by Mihai Preda and George Woltman. Copyright &copy; 2026 Adam R Sophie.
+  </div>
+</footer>
+</body>
+</html>
