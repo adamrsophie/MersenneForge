@@ -29,9 +29,10 @@ Everything in this repository is Rust (plus WGSL and CUDA C kernel sources embed
 | Acceptance of our proofs by an upstream verifier | not tested |
 | GPU arithmetic | implemented; validated only on an Apple GPU through Metal; not validated on NVIDIA, AMD, or Intel |
 | CUDA arithmetic | implemented; never run on CUDA hardware |
-| Performance | harness only; no performance comparison has been measured |
+| Assignment queue (`work`), worktodo and result lines, factor checks | implemented, CPU tested; never submitted to PrimeNet |
+| Performance | harness with production mode, retained artifacts, power telemetry, and paired analysis; no performance comparison has been measured |
 
-CI runs CPU tests, CUDA model and kernel host emulation, strict documentation checks, and feature compilation. GPU hardware tests are run by hand. Details, commands, and observed results: [docs/VALIDATION.md](docs/VALIDATION.md). Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Protocol and formats: [docs/PROTOCOL.md](docs/PROTOCOL.md). Benchmark method: [docs/BENCHMARK.md](docs/BENCHMARK.md).
+CI runs CPU tests, CUDA model and kernel host emulation, strict documentation checks, and feature compilation. GPU hardware tests are run by hand. Details, commands, and observed results: [docs/VALIDATION.md](docs/VALIDATION.md). Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Protocol and formats: [docs/PROTOCOL.md](docs/PROTOCOL.md). Benchmark method: [docs/BENCHMARK.md](docs/BENCHMARK.md). Every capability and what is missing: [docs/STATUS.md](docs/STATUS.md).
 
 ## Build
 
@@ -54,7 +55,13 @@ mersenne-forge resume --checkpoint work/ckpt/M44497-prp.ckpt --budget 1h
 mersenne-forge resume --checkpoint moved/ckpt/M44497-prp.ckpt --proof-dir moved/proof --budget 1h
 mersenne-forge verify --proof work/proof/44497-8.proof --backend cpu
 mersenne-forge bench --plan bench/cpu-smoke.json --output work/bench/cpu-smoke.json
+mersenne-forge bench-render --input work/bench/cpu-smoke.json --output work/bench/cpu-smoke.csv
+mersenne-forge bench-analyze --input work/bench/cpu-smoke.json --baseline 0 --candidate 1
+mersenne-forge work --worktodo worktodo.txt --results results.json.txt --checkpoint-dir work/ckpt --proof-dir work/proof --backend dwt
+mersenne-forge check-factor --exponent 11 --factor 23
 ```
+
+`work` takes `PRP=`, `PRPDC=`, `Test=`, and `DoubleCheck=` lines for Mersenne numbers (the forms upstream PRPLL accepts), runs or resumes each in turn, appends a result line in upstream's JSON form to the results file (fsynced), and only then removes the assignment. Lines it cannot run (P-1, CERT, other number forms, composite exponents) stay in the file. An assignment already present in the results file is removed without running again; a results line torn by a crash is closed before the next line is written. Before starting a PRP with a proof it checks that the proof points and the proof file fit on disk. An assignment that cannot start (the backend refuses it, too little disk, a checkpoint from another build, or a checkpoint `run` wrote for the same exponent) stays in the file with a message, later assignments still run, and the session exits 6. An interrupted assignment resumes from its checkpoint with its original settings. After a durable result it deletes that assignment's checkpoints and, once the proof is verified, its proof points; the proof file stays for upload. One process per worktodo file (it is locked); run one per device with separate files. Nothing is sent to any server, and acceptance of these result lines by PrimeNet has not been tested.
 
 `--backend gpu` and `--backend cuda` require `--budget`; `--device N` selects the adapter index or CUDA ordinal. Add `--json` for machine-readable output (failures too, as a JSON object with `kind`, `message`, and `exit_code`). Exit codes: 0 success, 2 usage, 3 incomplete (budget or Ctrl-C, also during the proof stage; a checkpoint is written when a checkpoint directory was given), 4 unsupported, 5 execution failure (also a failed proof generation or write), 6 checkpoint or file error, 7 proof rejected (also a rejected self verification). `run` refuses to start over an existing checkpoint: continue with `resume`, or delete the checkpoint and its `.prev` to start over. A run or resume holds a lock on `<checkpoint>.lock`, and a PRP run with a proof directory also locks `M<p>.residues/.lock` there, so a second process on the same checkpoint or proof store is refused.
 

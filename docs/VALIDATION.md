@@ -2,6 +2,25 @@
 
 Historical results below used Apple M2 (macOS 27.2, arm64), Rust 1.100.0 stable. The completion checks dated 2026-11-16 used the same hardware with macOS 27.2.1. No NVIDIA, AMD, or Intel GPU was available. Nothing here was run on CUDA hardware.
 
+## Benchmark evidence, work queue, and factor checks (2026-11-19)
+
+Implementation source SHA3-256: `390fa29f7066fc0c46b4e48831a7d1076c4221adc5f7c818157ad7980758c914`; debug executable SHA-256 `79b8d86d8292c0132b8b712310721f1b226d4926860bbdd806144b6f2b40d4af` (Apple M2, macOS 27.2.1, Rust 1.100.0).
+
+New: benchmark modes, retention with a quota, the external proof verification adapter, provenance, the `proof_points` timer and unclassified remainder, power telemetry, `bench-render`, `bench-analyze`, the `work` queue, worktodo and result lines, proof MD5, disk preflight, and `check-factor`. The capability list is in [STATUS.md](STATUS.md). The external verification adapter was exercised only with this program's own `verify` standing in for an independent verifier, and telemetry only with a command printing a fixed value; no real power sensor was read.
+
+| Command | Observed result |
+|---|---|
+| `cargo test --locked` | 137 passed, 0 failed, 5 ignored by default |
+| `cargo clippy --locked --all-targets -- -D warnings`, also with `--features gpu`, `--features cuda`, `--features gpu,cuda` | passed |
+| `cargo fmt --check`; `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --features gpu,cuda`; `cargo +1.89 check --locked --all-targets --features gpu,cuda` | passed |
+| `cargo test --locked --features gpu --lib --test gpu_backend --test protocol_gpu -- --test-threads=1` | 65 passed, 0 failed, 1 ignored; real Apple M2 through Metal |
+| `cargo test --locked --features cuda --lib backend::cuda` | 19 passed; CPU model and host code only |
+| `cargo test --locked --features cuda --test cuda_kernel_emulation` | 6 passed; CPU emulation, not CUDA hardware |
+| `cargo test --locked --test reference -- --ignored`; upstream fixture test | 1 passed each |
+| Independent Python big-integer sweep against the debug CLI | 688 of 688 agree (172 prime exponents up to 1024, LL and PRP, `cpu` and `dwt`) |
+
+Still open: no CUDA kernel has run on NVIDIA hardware; no upstream verifier has checked a proof generated here; no result line has been submitted to PrimeNet; no performance comparison or energy measurement.
+
 ## Temporary file ownership and CSV quoting (2026-11-17)
 
 Implementation source SHA3-256: `2283ef92ecfac447ef2a74d6fca7f43b11e8c6b8209b47911633aa0ee060d87f`; debug executable SHA-256 `c5e77bd5bface421bcc432b3d5f098de6d931ce871598438a6b9200b44a77131` (Apple M2, macOS 27.2.1, Rust 1.100.0).
@@ -357,3 +376,7 @@ For AMD or Intel GPUs, run the `gpu` lines (Vulkan) the same way.
 Upstream verifier interoperability (our proofs accepted by PRPLL): build PRPLL at commit `90a3d8db84e742773f45e2adfba3131199fa8101` per its README, generate a proof here for an exponent inside the upstream FFT range (for example the M1257787 run above), and run the upstream verifier with its documented interface `prpll -verify <file>`. This has not been done. One attempt was made on the development machine (Apple M2, macOS, 2026-11-16): PRPLL at that commit builds with Apple clang and lists the Apple M2 as an OpenCL 1.2 device, but `prpll -verify test/786433-10.proof` cannot run there. With the default FP64 transform it stops with "FP64 not supported"; with the integer transforms (`-fft 1:256:1:256`, `-fft 3:256:1:256`) the process aborts inside the Apple OpenCL compiler during `clCompileProgram`, before any arithmetic. So the upstream verifier needs a host with a working OpenCL or CUDA driver.
 
 Performance: no measurement exists. See [BENCHMARK.md](BENCHMARK.md).
+
+Before and after optimization on NVIDIA (not done): build at a fixed commit, write one plan with the upstream PRPLL command as an `external` entry and this program's `cuda` engine entry in `production` mode with `retain` and `verify_with` naming the upstream verifier, add a `telemetry` command that prints device watts (for example `nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits -i 0`), run it, and compare with `bench-analyze`. Change one kernel at a time, keep the old variant selectable, and repeat the same frozen plan. No such run exists, and no optimization is claimed.
+
+Work queue: `tests/worktodo.rs` checks the upstream assignment forms and refusals, the result fields against the proof file's MD5, outbox idempotency, and resumption of a budget stopped assignment. No result line has been submitted to PrimeNet or read by AutoPrimeNet.

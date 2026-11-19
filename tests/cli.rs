@@ -1184,3 +1184,186 @@ fn bench_csv_quotes_every_text_field() {
     assert_eq!(ext[col("argv")], r#"["echo","a,b\n\"c\""]"#);
     assert_eq!(ext[col("status")], "completed");
 }
+
+/// Production mode, retained artifacts, an external verifier (this binary's
+/// own `verify`, standing in for an independent one), and a sampled power
+/// command. The verifier must accept the proof and reject an altered copy.
+#[test]
+fn bench_production_runs_keep_verified_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = env!("CARGO_BIN_EXE_mersenne-forge");
+    let plan = serde_json::json!({
+        "name": "evidence", "order": "sequential", "repeats": 1,
+        "telemetry": {"argv": ["echo", "12.5 W"], "interval_ms": 20, "sensor": "fixed test value", "scope": "system"},
+        "entries": [
+            {"kind": "engine", "name": "prod", "test": "prp", "exponent": 1279, "backend": "cpu",
+             "options": {"block_size": 32, "check_step": 128, "proof_power": 3, "mode": "production", "retain": true,
+                         "verify_with": {"argv": [exe, "verify", "--proof", "{proof}"], "accept_text": ": accepted"}}},
+            {"kind": "engine", "name": "steady", "test": "ll", "exponent": 1279, "backend": "dwt"}]});
+    let out = dir.path().join("e.json");
+    let o = bench(&plan, &out);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let v = read_json(&out);
+    assert_eq!(v["schema_version"], 2);
+    assert_eq!(
+        v["provenance"]["source_identity"],
+        mersenne_forge::build_identity()
+    );
+    assert_eq!(v["provenance"]["rustc"], "unknown");
+    let prod = &v["observations"][0];
+    assert_eq!(prod["status"], "completed", "{prod}");
+    assert_eq!(prod["mode"], "production");
+    assert!(prod["reliability"]["gerbicz_passed"].as_u64().unwrap() > 0);
+    assert!(prod["timings"]["checkpoint_io"].as_f64().unwrap() > 0.0);
+    assert!(prod["timings"]["proof_points"].as_f64().unwrap() > 0.0);
+    assert!(prod["unclassified_secs"].as_f64().unwrap() >= 0.0);
+    let ev = &prod["external_verification"];
+    assert_eq!(ev["status"], "verified");
+    assert_eq!(
+        (ev["accepted"].as_bool(), ev["altered_rejected"].as_bool()),
+        (Some(true), Some(true))
+    );
+    assert_ne!(ev["altered_exit_code"], 0);
+    assert_eq!(ev["verifier_sha3"].as_str().unwrap().len(), 64);
+    // Retained files exist after the scratch directory is gone, with the
+    // recorded hashes.
+    let arts = prod["artifacts"].as_array().unwrap();
+    assert_eq!(arts.len(), 2);
+    for a in arts {
+        let p = Path::new(a["path"].as_str().unwrap());
+        assert_eq!(
+            mersenne_forge::evidence::file_sha3(p).unwrap(),
+            a["sha3"].as_str().unwrap()
+        );
+    }
+    assert!(arts.iter().any(|a| a["name"] == "1279-3.proof"));
+    // Power: a fixed 12.5 W reading integrates to 12.5 W times the span.
+    for o in v["observations"].as_array().unwrap() {
+        let pw = &o["power"];
+        assert_eq!(pw["missing"], 0);
+        assert_eq!(pw["scope"], "system");
+        let e = o["energy_joules"].as_f64().unwrap();
+        assert!((e - 12.5 * pw["span_secs"].as_f64().unwrap()).abs() < 1e-9);
+    }
+    assert_eq!(v["observations"][1]["mode"], "steady_state");
+    assert!(v["observations"][1]["artifacts"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    // The same execution renders to CSV without rerunning; the hashes and
+    // statuses carry over.
+    let csv = dir.path().join("again.csv");
+    let r = cli(&["bench-render", "--input", s(&out), "--output", s(&csv)]);
+    assert_eq!(
+        r.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let records = parse_csv(&std::fs::read_to_string(&csv).unwrap());
+    let col = |n: &str| records[0].iter().position(|h| h == n).unwrap();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[1][col("external_verification")], "verified");
+    assert!(records[1][col("artifacts")].contains(arts[0]["sha3"].as_str().unwrap()));
+    assert_eq!(records[1][col("schema_version")], "2");
+}
+
+/// A quota smaller than the proof keeps the hash but not the file; a
+/// verifier that accepts everything fails the altered copy check.
+#[test]
+fn bench_quota_and_a_verifier_that_accepts_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan = serde_json::json!({
+        "name": "q", "order": "sequential", "repeats": 1, "retain_max_bytes": 10,
+        "entries": [{"kind": "engine", "name": "p", "test": "prp", "exponent": 127, "backend": "cpu",
+            "options": {"block_size": 16, "check_step": 64, "proof_power": 2, "retain": true,
+                        "verify_with": {"argv": ["echo", "{proof} ok"], "accept_text": "ok"}}}]});
+    let out = dir.path().join("q.json");
+    assert_eq!(bench(&plan, &out).status.code(), Some(0));
+    let o = &read_json(&out)["observations"][0];
+    assert_eq!(o["status"], "failed");
+    assert_eq!(o["error"], "external verification failed");
+    assert_eq!(o["external_verification"]["altered_rejected"], false);
+    for a in o["artifacts"].as_array().unwrap() {
+        assert!(a["path"].is_null());
+        assert!(a["not_retained"].as_str().unwrap().contains("quota"));
+        assert_eq!(a["sha3"].as_str().unwrap().len(), 64);
+    }
+    // Invalid evidence settings are usage errors before anything runs.
+    for bad in [
+        serde_json::json!({"mode": "production"}),
+        serde_json::json!({"mode": "fast"}),
+        serde_json::json!({"verify_with": {"argv": ["x"], "accept_text": "ok"}, "proof_power": 2}),
+    ] {
+        let plan = serde_json::json!({"name": "b", "order": "sequential", "repeats": 1,
+            "entries": [{"kind": "engine", "name": "p", "test": "prp", "exponent": 127, "backend": "cpu", "options": bad}]});
+        assert_eq!(
+            bench(&plan, &dir.path().join("b.json")).status.code(),
+            Some(2),
+            "{bad}"
+        );
+    }
+}
+
+/// Paired analysis over a recorded plan: one pair per repeat, failures kept
+/// in the cost accounting, and an interval from a fixed seed.
+#[test]
+fn bench_analyze_pairs_by_repeat() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan = serde_json::json!({"name": "a", "order": "randomized", "seed": 5, "repeats": 5, "warmups": 1,
+        "entries": [
+            {"kind": "engine", "name": "cpu", "test": "ll", "exponent": 521, "backend": "cpu"},
+            {"kind": "engine", "name": "dwt", "test": "ll", "exponent": 521, "backend": "dwt"},
+            {"kind": "engine", "name": "bad", "test": "ll", "exponent": 520, "backend": "cpu"}]});
+    let out = dir.path().join("a.json");
+    assert_eq!(bench(&plan, &out).status.code(), Some(0));
+    let run = |b: &str, c: &str| {
+        cli(&[
+            "bench-analyze",
+            "--input",
+            s(&out),
+            "--baseline",
+            b,
+            "--candidate",
+            c,
+        ])
+    };
+    let o = run("0", "1");
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["usable_pairs"], 5);
+    let [lo, hi] = [
+        v["bootstrap"]["interval_95"][0].as_f64().unwrap(),
+        v["bootstrap"]["interval_95"][1].as_f64().unwrap(),
+    ];
+    let m = v["median_ratio"].as_f64().unwrap();
+    assert!(lo <= m && m <= hi);
+    assert_eq!(
+        o.stdout,
+        run("0", "1").stdout,
+        "the same seed gives the same report"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&run("0", "2").stdout).unwrap();
+    assert_eq!(v["usable_pairs"], 0);
+    assert_eq!(
+        v["candidate"]["cost"]["not_completed"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    assert!(v["median_ratio"].is_null());
+    assert_eq!(run("0", "0").status.code(), Some(2));
+    assert_eq!(run("0", "9").status.code(), Some(2));
+}

@@ -40,6 +40,22 @@ Accounting boundaries: `iterations` is time inside backend squaring or LL step c
 
 Energy: the harness reads no power sensor, so `energy_joules` is always null and `telemetry` is `unavailable`. Missing telemetry is never replaced by an estimate.
 
+## Evidence options (output schema version 2)
+
+Outputs carry `schema_version` 2 and a `provenance` block: executable path and SHA3-256, source identity, crate version, profile, target architecture, OS, and environment, compiled instruction set features, Cargo features, lockfile SHA3-256, CPU model, and logical CPU count. The compiler version and the power policy are not available to the program and are recorded as `unknown`. Version 1 outputs (no `schema_version`) are still read by `bench-render` and `bench-analyze`.
+
+Engine options:
+
+- `mode`: `steady_state` (default; no checkpoints, proof only when `proof_power` is given) or `production` (checkpoints at every passed check; PRP entries must give `proof_power`, and proof self verification cannot be turned off). Both modes include startup; `timings.init` shows it.
+- `retain`: keep the run report and the proof file in `<execution_dir>/artifacts/N/`, each recorded with size and SHA3-256. The plan field `retain_max_bytes` (default 1 GiB) caps the total: a file that does not fit is hashed and recorded with `not_retained` giving the reason, but not kept. A retention error marks the observation failed with the reason and keeps its measurements.
+- `verify_with`: `{argv, accept_text, timeout_secs}`. After a completed PRP with a proof, `argv` runs with `{proof}` replaced by the proof path, then again on a copy with one bit flipped. The proof counts as verified only when the first run exits 0 and prints `accept_text`, and the altered copy is not accepted. The record keeps the exact argv, exit codes, captures, the verifier's SHA3-256, and the time; anything else marks the observation failed. The adapter has been tested only with this program's own `verify` standing in for an independent verifier.
+
+Timing: `timings.proof_points` is the export, durable write, and read back of PRP proof points, which were previously only part of the wall time. `unclassified_secs` is wall time not covered by any timer (for example the terminal residue round trip and report assembly). The timers do not overlap.
+
+Telemetry: the plan field `telemetry` is `{argv, interval_ms, sensor, scope}`. The command runs every `interval_ms` (at least 10) during each observation, plus once at the end, and prints the power in watts as the first number of its output. `scope` is `device` or `system`; the two are different metrics. `power` keeps every reading with its time; `energy_joules` is the trapezoidal integral over the sampled span, and stays null when any reading is missing or fewer than two exist. No sensor is built in: on the Mac used here power readings need root, so energy has not been measured.
+
+Rendering and analysis: `bench-render --input out.json --output out.csv` (or `.json`) writes a recorded execution again without running anything. `bench-analyze --input out.json --baseline I --candidate J [--metric wall_secs|iterations|energy_joules] [--seed S]` pairs the measured runs of two entries by repeat, counts a pair only when both completed, and reports the per pair ratios, the median ratio with a 95% percentile bootstrap interval (2000 resamples, fixed seed), and the full cost of each entry including failed runs. With fewer than 5 usable pairs it says the interval is not meaningful. Tune on one plan and evaluate on a separate, frozen plan with other exponents.
+
 ## Method for a comparison (not yet done)
 
 1. Freeze the plan (exponent cohort, settings, repeats, order, seed) before looking at results.

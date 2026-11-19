@@ -128,3 +128,11 @@ There is no compatibility with upstream savefiles.
 12. A stop request ends an LL run after the current batch of at most 1000 iterations; PRP stops at the next block boundary as upstream.
 13. Verification is stricter than upstream: zero middles, noncanonical residues, and a folded A or B of zero are rejected, and for p below 2^17 the terminal residue is recomputed directly. Upstream checks the proof equation only.
 14. The exported terminal residue (PRP x_p, LL s_(p-2)) is compared with the resident value after export.
+
+## Assignment and result lines
+
+`work` reads the worktodo forms of the pinned upstream parser: `PRP=` and `PRPDC=` with `[AID,]1,2,p,-1[,tf,saved]` or a bare `[AID,]p`, and `Test=` and `DoubleCheck=` with `[AID,]p[,...]`. An empty or `N/A` first field is skipped; a 32 digit hex field is the assignment ID. Any other number form (k other than 1, base other than 2, c other than -1), a composite exponent, and the kinds `Cert=`, `Pminus1=`, and `Pfactor=` are refused and left in the file.
+
+Each finished assignment appends one JSON line with the fields upstream writes: `status` (`P` or `C`), `exponent`, `worktype` (`PRP-3` or `LL`), `res64`; for PRP also `res2048`, `residue-type` 1, `errors.gerbicz`, and `proof` with `version` 1 (the value upstream writes for its version 2 files), `power`, `hashsize` 64, and the lowercase hex MD5 of the proof file; for LL `shift-count` 0, `error-code` "00000000", and `errors.jacobi` when nonzero; then `program` (name, version, port, os), `aid` when present, and a UTC `timestamp`. Upstream fields with no counterpart here (`fft-type`, `fft-length`, `user`, `uid`) are omitted. MD5 is used only to name the proof file in this line.
+
+`check-factor` accepts q when 2^p mod q is 1 and q is neither 1 nor M_p; a composite divisor is accepted too. It also reports whether q has the form 2kp+1 with q = +-1 mod 8. Every divisor of M_p has that form, so a divisor without it could only come from an arithmetic error.

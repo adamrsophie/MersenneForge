@@ -165,6 +165,62 @@ enum Cmd {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Process assignments from a worktodo file, one after another: run or
+    /// resume each, append its result line to the results file, then remove
+    /// the assignment. Lines this program cannot run are left in place.
+    Work {
+        #[arg(long)]
+        worktodo: PathBuf,
+        #[arg(long)]
+        results: PathBuf,
+        /// Checkpoints, one per assignment; an interrupted assignment resumes.
+        #[arg(long)]
+        checkpoint_dir: PathBuf,
+        #[arg(long, value_enum, default_value = "cpu")]
+        backend: BackendArg,
+        #[arg(long)]
+        device: Option<u32>,
+        /// Budget for the whole session (required for gpu and cuda).
+        #[arg(long)]
+        budget: Option<String>,
+        /// Proof directory for PRP assignments (the proof files are kept).
+        #[arg(long)]
+        proof_dir: Option<PathBuf>,
+        #[arg(long)]
+        proof_power: Option<u32>,
+    },
+    /// Check that a reported factor divides 2^p - 1. Exit 0 when it does.
+    CheckFactor {
+        #[arg(long)]
+        exponent: u32,
+        #[arg(long)]
+        factor: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a recorded benchmark JSON output again as .json or .csv,
+    /// without running anything.
+    BenchRender {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Paired comparison of two entries of a recorded benchmark (by entry
+    /// index), with a bootstrap interval. Prints JSON.
+    BenchAnalyze {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        baseline: usize,
+        #[arg(long)]
+        candidate: usize,
+        /// wall_secs, iterations, or energy_joules.
+        #[arg(long, default_value = "wall_secs")]
+        metric: String,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
 }
 
 struct Failure {
@@ -687,6 +743,281 @@ fn verify_message(p: u32, claim: &str, recomputed: bool) -> String {
     }
 }
 
+struct WorkArgs {
+    worktodo: PathBuf,
+    results: PathBuf,
+    checkpoint_dir: PathBuf,
+    kind: BackendKind,
+    device: Option<u32>,
+    budget: Option<String>,
+    proof_dir: Option<PathBuf>,
+    proof_power: Option<u32>,
+}
+
+/// Append one line to the results file and make it durable before the
+/// assignment is removed: a crash in between leaves a result already in the
+/// outbox, which the next session recognizes instead of running again.
+fn append_result(path: &Path, line: &str) -> Result<(), Failure> {
+    use std::io::Write;
+    let state = |e: std::io::Error| fail(EXIT_STATE, format!("{}: {e}", path.display()));
+    if let Some(d) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        create_dir_all_durable(d).map_err(state)?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(state)?;
+    // A line torn by a crash is closed first, so the new line stays whole.
+    let torn = std::fs::read(path)
+        .map_err(state)?
+        .last()
+        .is_some_and(|&c| c != b'\n');
+    let sep = if torn { "\n" } else { "" };
+    f.write_all(format!("{sep}{line}\n").as_bytes())
+        .map_err(state)?;
+    f.sync_all().map_err(state)
+}
+
+/// True when the results file already holds a result for this assignment
+/// (same AID, or without an AID the same exponent and work type).
+fn already_reported(results: &Path, a: &mersenne_forge::worktodo::Assignment) -> bool {
+    let wt = match a.kind {
+        mersenne_forge::worktodo::WorkKind::Prp => "PRP-3",
+        mersenne_forge::worktodo::WorkKind::Ll => "LL",
+    };
+    std::fs::read_to_string(results)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .any(|v| match &a.aid {
+            Some(aid) => v["aid"] == aid.as_str(),
+            None => v["exponent"] == a.exponent && v["worktype"] == wt && v["aid"].is_null(),
+        })
+}
+
+/// Remove the first line equal to `line` from the worktodo file, atomically.
+fn remove_line(worktodo: &Path, line: &str) -> Result<(), Failure> {
+    let state = |e: std::io::Error| fail(EXIT_STATE, format!("{}: {e}", worktodo.display()));
+    let text = std::fs::read_to_string(worktodo).map_err(state)?;
+    let mut done = false;
+    let kept: String = text
+        .split_inclusive('\n')
+        .filter(|l| {
+            let hit = !done && l.trim_end_matches(['\r', '\n']) == line;
+            done |= hit;
+            !hit
+        })
+        .collect();
+    mersenne_forge::checkpoint::write_atomic(worktodo, kept.as_bytes(), false).map_err(state)
+}
+
+fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
+    use mersenne_forge::worktodo::{self as wt, WorkKind};
+    let deadline = deadline(&w.budget, w.kind)?;
+    // One worker per worktodo file.
+    let _lock = lock_checkpoint(&w.worktodo)?;
+    let mut done = 0usize;
+    // Assignments this session could not start, and messages already shown.
+    let mut skipped = std::collections::HashSet::new();
+    let mut warned = std::collections::HashSet::new();
+    loop {
+        if STOP.load(Ordering::SeqCst) {
+            println!("stopped after {done} assignments");
+            return Ok(EXIT_INCOMPLETE);
+        }
+        let text = std::fs::read_to_string(&w.worktodo)
+            .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", w.worktodo.display())))?;
+        let mut next = None;
+        for raw in text.lines() {
+            match wt::parse_line(raw) {
+                Ok(Some(a)) if !skipped.contains(&a.line) => {
+                    next = Some(a);
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    if warned.insert(e.clone()) {
+                        eprintln!("left in place: {e}");
+                    }
+                }
+            }
+        }
+        let Some(a) = next else {
+            println!(
+                "no runnable assignment left; {done} completed, {} could not start",
+                skipped.len()
+            );
+            return Ok(if skipped.is_empty() { 0 } else { EXIT_STATE });
+        };
+        if already_reported(&w.results, &a) {
+            eprintln!(
+                "M{}: already in {}; removing the assignment",
+                a.exponent,
+                w.results.display()
+            );
+            remove_line(&w.worktodo, &a.line)?;
+            continue;
+        }
+        let p = a.exponent;
+        let proof_dir = match a.kind {
+            WorkKind::Prp => w.proof_dir.clone(),
+            WorkKind::Ll => None,
+        };
+        let ckpt = w.checkpoint_dir.join(match a.kind {
+            WorkKind::Prp => format!("M{p}-prp.ckpt"),
+            WorkKind::Ll => format!("M{p}-ll.ckpt"),
+        });
+        let prp_cfg = PrpConfig {
+            block_size: 1000,
+            check_step: None,
+            proof_power: proof_dir.as_ref().and(w.proof_power),
+            proof_dir: proof_dir.clone(),
+            verify_proof: true,
+            checkpoint: Some(ckpt.clone()),
+            max_batch: 1000,
+        };
+        let mut ctl = Control {
+            stop: Some(&STOP),
+            deadline,
+            ..Control::default()
+        };
+        // Anything that keeps this assignment from starting leaves it in
+        // place and moves on to the next one.
+        let started = (|| -> Result<_, Failure> {
+            let lock = lock_checkpoint(&ckpt)?;
+            let ck = if ckpt.exists() || prev_path(&ckpt).exists() {
+                let (ck, _) =
+                    Checkpoint::load_latest(&ckpt).map_err(|e| fail(EXIT_STATE, e.to_string()))?;
+                if ck.meta.requested.get("assignment").is_none() {
+                    return Err(fail(
+                        EXIT_STATE,
+                        format!(
+                            "{} was not written by `work`; finish it with `resume` or delete it",
+                            ckpt.display()
+                        ),
+                    ));
+                }
+                Some(ck)
+            } else {
+                None
+            };
+            if let (Some(dir), None, WorkKind::Prp) = (&proof_dir, &ck, a.kind) {
+                let eff = prp::effective_config(p, &prp_cfg).map_err(protocol_failure)?;
+                let power = eff.proof_power.unwrap_or(0);
+                create_dir_all_durable(dir)
+                    .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", dir.display())))?;
+                let need = wt::proof_disk_need(p, power);
+                match wt::free_bytes(dir) {
+                    Some(free) if free < need => {
+                        return Err(fail(
+                            EXIT_STATE,
+                            format!(
+                                "the proof needs about {need} bytes in {}, {free} are free",
+                                dir.display()
+                            ),
+                        ))
+                    }
+                    Some(_) => {}
+                    None => eprintln!(
+                        "M{p}: free disk space unknown; the proof needs about {need} bytes"
+                    ),
+                }
+            }
+            let be = open(w.kind, p, w.device)?;
+            Ok((lock, ck, be))
+        })();
+        let (ck_lock, ck, mut be) = match started {
+            Ok(x) => x,
+            Err(f) => {
+                eprintln!("left in place: M{p}: {}", f.message);
+                skipped.insert(a.line.clone());
+                continue;
+            }
+        };
+        let result = match &ck {
+            Some(ck) => match resume_from(&mut be, ck, &ckpt, None, &mut ctl) {
+                Ok(r) => r,
+                Err(f) => {
+                    eprintln!("left in place: M{p}: {}", f.message);
+                    skipped.insert(a.line.clone());
+                    continue;
+                }
+            },
+            None => match a.kind {
+                WorkKind::Prp => prp::run_prp(
+                    &mut be,
+                    p,
+                    &prp_cfg,
+                    json!({"assignment": a}),
+                    None,
+                    &mut ctl,
+                ),
+                WorkKind::Ll => ll::run_ll(
+                    &mut be,
+                    p,
+                    &LlConfig {
+                        log_step: 20_000,
+                        jacobi: JacobiCadence::Auto,
+                        checkpoint: Some(ckpt.clone()),
+                        max_batch: 1000,
+                    },
+                    json!({"assignment": a}),
+                    None,
+                    &mut ctl,
+                ),
+            },
+        };
+        let report = result.map_err(protocol_failure)?;
+        let code = exit_for(&report);
+        let Some(r) = report.result.as_ref().filter(|_| code == 0) else {
+            println!(
+                "M{p}: not completed ({}); the assignment stays, and the next session resumes it",
+                report.evidence.proof_stage.name()
+            );
+            return Ok(if code == 0 { EXIT_INCOMPLETE } else { code });
+        };
+        let proof_info = report
+            .evidence
+            .proof
+            .as_ref()
+            .map(|e| -> Result<wt::ProofInfo, Failure> {
+                Ok(wt::ProofInfo {
+                    power: e.power,
+                    md5: wt::file_md5(&e.path)
+                        .map_err(|x| fail(EXIT_STATE, format!("{}: {x}", e.path.display())))?,
+                })
+            })
+            .transpose()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let line = wt::result_line(
+            &a,
+            r,
+            &report,
+            proof_info.as_ref(),
+            w.kind.name(),
+            &wt::utc_timestamp(now),
+        );
+        append_result(&w.results, &line.to_string())?;
+        remove_line(&w.worktodo, &a.line)?;
+        // The result is durable: the checkpoints and, after a verified proof,
+        // the proof points are no longer needed. The proof file is kept.
+        for f in [ckpt.clone(), prev_path(&ckpt)] {
+            let _ = std::fs::remove_file(f);
+        }
+        if report.evidence.proof_stage == ProofStage::Verified {
+            if let Some(dir) = &proof_dir {
+                let _ = std::fs::remove_dir_all(proof::ProofStore::residue_dir(dir, p));
+            }
+        }
+        drop(ck_lock);
+        done += 1;
+        println!("M{p}: {:?} res64 {}", r.verdict, r.res64);
+    }
+}
+
 fn cmd_bench(plan: &Path, output: &Path) -> Result<u8, Failure> {
     let text = std::fs::read_to_string(plan)
         .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", plan.display())))?;
@@ -912,7 +1243,11 @@ fn main() -> ExitCode {
         | Cmd::Run { json, .. }
         | Cmd::Resume { json, .. }
         | Cmd::Verify { json, .. } => *json,
-        Cmd::Bench { .. } => false,
+        Cmd::CheckFactor { json, .. } => *json,
+        Cmd::Bench { .. }
+        | Cmd::BenchRender { .. }
+        | Cmd::BenchAnalyze { .. }
+        | Cmd::Work { .. } => false,
     };
     let _ = ctrlc::set_handler(|| {
         if STOP.swap(true, Ordering::SeqCst) {
@@ -971,6 +1306,89 @@ fn main() -> ExitCode {
             json,
         } => cmd_verify(&proof, backend, exponent, device, budget, json),
         Cmd::Bench { plan, output } => cmd_bench(&plan, &output),
+        Cmd::Work {
+            worktodo,
+            results,
+            checkpoint_dir,
+            backend,
+            device,
+            budget,
+            proof_dir,
+            proof_power,
+        } => cmd_work(&WorkArgs {
+            worktodo,
+            results,
+            checkpoint_dir,
+            kind: backend.kind(),
+            device,
+            budget,
+            proof_dir,
+            proof_power,
+        }),
+        Cmd::CheckFactor {
+            exponent,
+            factor,
+            json,
+        } => mersenne_forge::worktodo::check_factor(exponent, &factor)
+            .map_err(|e| fail(2, e))
+            .map(|c| {
+                if json {
+                    println!("{}", serde_json::to_string(&c).expect("json"));
+                } else {
+                    println!(
+                        "{} {} M{}{}",
+                        c.factor,
+                        if c.accepted() {
+                            "divides"
+                        } else {
+                            "does not divide"
+                        },
+                        c.exponent,
+                        if !c.proper {
+                            " (not a proper factor)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                if c.accepted() {
+                    0
+                } else {
+                    EXIT_REJECTED
+                }
+            }),
+        Cmd::BenchRender { input, output } => bench::render(&input, &output)
+            .map(|out| {
+                println!(
+                    "{} observations written to {}",
+                    out.observations.len(),
+                    output.display()
+                );
+                0
+            })
+            .map_err(|e| fail(EXIT_STATE, e)),
+        Cmd::BenchAnalyze {
+            input,
+            baseline,
+            candidate,
+            metric,
+            seed,
+        } => {
+            let text = std::fs::read_to_string(&input)
+                .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", input.display())));
+            text.and_then(|t| {
+                serde_json::from_str::<bench::BenchOutput>(&t)
+                    .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", input.display())))
+            })
+            .and_then(|out| {
+                mersenne_forge::evidence::analyze(&out, baseline, candidate, &metric, seed)
+                    .map_err(|e| fail(2, e))
+            })
+            .map(|v| {
+                println!("{}", serde_json::to_string_pretty(&v).expect("json"));
+                0
+            })
+        }
     };
     match r {
         Ok(code) => ExitCode::from(code),

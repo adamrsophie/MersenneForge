@@ -1,0 +1,491 @@
+// Copyright (C) 2026 Adam R Sophie. GPL-3.0-only.
+
+//! Benchmark evidence that is not arithmetic: the provenance of the harness
+//! executable and host, optional power telemetry, and paired analysis of
+//! recorded observations. Every value that cannot be determined is recorded
+//! as unknown, never guessed.
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
+use crate::bench::{BenchOutput, Observation};
+
+const UNKNOWN: &str = "unknown";
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// SHA3-256 of a file, streamed.
+pub fn file_sha3(path: &std::path::Path) -> std::io::Result<String> {
+    use sha3::{Digest, Sha3_256};
+    let mut h = Sha3_256::new();
+    let mut f = std::fs::File::open(path)?;
+    std::io::copy(&mut f, &mut h)?;
+    Ok(hex(&h.finalize()))
+}
+
+/// What ran the benchmark and where.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Provenance {
+    pub executable: String,
+    pub executable_sha3: String,
+    /// Source identity (see `build_identity`).
+    pub source_identity: String,
+    pub crate_version: String,
+    /// "debug" or "release", from `debug_assertions`.
+    pub profile: String,
+    pub target_arch: String,
+    pub target_os: String,
+    pub target_env: String,
+    /// Instruction set features enabled at compile time, from a fixed list.
+    pub target_features: Vec<String>,
+    /// Cargo features compiled in.
+    pub cargo_features: Vec<String>,
+    pub lockfile_sha3: String,
+    /// The compiler is not recorded in the executable: always unknown.
+    pub rustc: String,
+    pub cpu_model: String,
+    pub logical_cpus: String,
+    /// No power policy is read: always unknown.
+    pub power_policy: String,
+}
+
+impl Provenance {
+    pub fn collect() -> Provenance {
+        let exe = std::env::current_exe().ok();
+        let features: &[(&str, bool)] = &[
+            ("sse4.2", cfg!(target_feature = "sse4.2")),
+            ("avx2", cfg!(target_feature = "avx2")),
+            ("fma", cfg!(target_feature = "fma")),
+            ("avx512f", cfg!(target_feature = "avx512f")),
+            ("neon", cfg!(target_feature = "neon")),
+        ];
+        Provenance {
+            executable: exe
+                .as_ref()
+                .map_or(UNKNOWN.into(), |p| p.display().to_string()),
+            executable_sha3: exe
+                .as_deref()
+                .and_then(|p| file_sha3(p).ok())
+                .unwrap_or_else(|| UNKNOWN.into()),
+            source_identity: crate::build_identity().into(),
+            crate_version: env!("CARGO_PKG_VERSION").into(),
+            profile: if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
+            .into(),
+            target_arch: std::env::consts::ARCH.into(),
+            target_os: std::env::consts::OS.into(),
+            target_env: if cfg!(target_env = "gnu") {
+                "gnu"
+            } else if cfg!(target_env = "musl") {
+                "musl"
+            } else if cfg!(target_env = "msvc") {
+                "msvc"
+            } else {
+                "none"
+            }
+            .into(),
+            target_features: features
+                .iter()
+                .filter(|f| f.1)
+                .map(|f| f.0.to_string())
+                .collect(),
+            cargo_features: [
+                ("gpu", cfg!(feature = "gpu")),
+                ("cuda", cfg!(feature = "cuda")),
+            ]
+            .iter()
+            .filter(|f| f.1)
+            .map(|f| f.0.to_string())
+            .collect(),
+            lockfile_sha3: hex(&crate::proof::sha3_256(&[include_bytes!("../Cargo.lock")])),
+            rustc: UNKNOWN.into(),
+            cpu_model: cpu_model().unwrap_or_else(|| UNKNOWN.into()),
+            logical_cpus: std::thread::available_parallelism()
+                .map_or(UNKNOWN.into(), |n| n.to_string()),
+            power_policy: UNKNOWN.into(),
+        }
+    }
+}
+
+/// The CPU model string where the operating system reports one.
+fn cpu_model() -> Option<String> {
+    if cfg!(target_os = "macos") {
+        let o = std::process::Command::new("sysctl")
+            .args(["-n", "machdep.cpu.brand_string"])
+            .output()
+            .ok()?;
+        let s = String::from_utf8(o.stdout).ok()?.trim().to_string();
+        return (o.status.success() && !s.is_empty()).then_some(s);
+    }
+    let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    text.lines()
+        .find(|l| l.starts_with("model name"))
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, v)| v.trim().to_string())
+}
+
+/// A power sensor read by running a command. The command prints the current
+/// power in watts as the first number on its standard output.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetrySpec {
+    pub argv: Vec<String>,
+    /// Sampling interval in milliseconds (at least 10).
+    pub interval_ms: u64,
+    /// Free text naming the sensor (for example a device and its counter).
+    pub sensor: String,
+    /// "device" (one device's power) or "system" (wall power of the host).
+    /// The two are different metrics and are never added together.
+    pub scope: String,
+}
+
+impl TelemetrySpec {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.argv.is_empty() {
+            return Err("telemetry argv is empty".into());
+        }
+        if self.interval_ms < 10 {
+            return Err("telemetry interval_ms must be at least 10".into());
+        }
+        if !matches!(self.scope.as_str(), "device" | "system") {
+            return Err(format!(
+                "telemetry scope must be device or system, got {:?}",
+                self.scope
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One reading: seconds since the observation started, and watts, or None
+/// when the command failed or printed no number.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PowerSample {
+    pub t_secs: f64,
+    pub watts: Option<f64>,
+}
+
+/// Power readings of one observation and the energy integrated from them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PowerRecord {
+    pub sensor: String,
+    pub scope: String,
+    pub interval_ms: u64,
+    pub unit: String,
+    pub samples: Vec<PowerSample>,
+    pub missing: usize,
+    /// Trapezoidal integral of power over the sampled span, in joules. Null
+    /// unless at least two readings exist and none is missing.
+    pub energy_joules: Option<f64>,
+    /// Seconds between the first and last reading: what the energy covers.
+    pub span_secs: f64,
+}
+
+fn read_watts(argv: &[String]) -> Option<f64> {
+    let o = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !o.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&o.stdout)
+        .split(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == 'e' || c == 'E'))
+        .find_map(|t| t.parse::<f64>().ok())
+        .filter(|w| w.is_finite() && *w >= 0.0)
+}
+
+/// A sampler running on its own thread while a workload runs.
+pub struct Sampler {
+    spec: TelemetrySpec,
+    stop: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<Vec<PowerSample>>,
+}
+
+impl Sampler {
+    pub fn start(spec: &TelemetrySpec) -> Sampler {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (flag, argv, every) = (
+            stop.clone(),
+            spec.argv.clone(),
+            Duration::from_millis(spec.interval_ms),
+        );
+        let handle = std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let mut v = Vec::new();
+            let sample = |v: &mut Vec<PowerSample>| {
+                v.push(PowerSample {
+                    t_secs: t0.elapsed().as_secs_f64(),
+                    watts: read_watts(&argv),
+                })
+            };
+            'outer: loop {
+                sample(&mut v);
+                // Wait in short steps so a finished workload is not delayed.
+                let next = t0 + every.mul_f64(v.len() as f64);
+                while Instant::now() < next {
+                    if flag.load(Ordering::SeqCst) {
+                        break 'outer;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+            // A closing reading, so the span reaches the end of the workload.
+            sample(&mut v);
+            v
+        });
+        Sampler {
+            spec: spec.clone(),
+            stop,
+            handle,
+        }
+    }
+
+    /// Stop sampling, take one last reading, and integrate.
+    pub fn finish(self) -> PowerRecord {
+        self.stop.store(true, Ordering::SeqCst);
+        let samples = self.handle.join().unwrap_or_default();
+        integrate(&self.spec, samples)
+    }
+}
+
+pub fn integrate(spec: &TelemetrySpec, samples: Vec<PowerSample>) -> PowerRecord {
+    let missing = samples.iter().filter(|s| s.watts.is_none()).count();
+    let span = match (samples.first(), samples.last()) {
+        (Some(a), Some(b)) => b.t_secs - a.t_secs,
+        _ => 0.0,
+    };
+    let energy = (missing == 0 && samples.len() >= 2).then(|| {
+        samples
+            .windows(2)
+            .map(|w| {
+                let (a, b) = (&w[0], &w[1]);
+                (b.t_secs - a.t_secs) * (a.watts.unwrap_or(0.0) + b.watts.unwrap_or(0.0)) / 2.0
+            })
+            .sum()
+    });
+    PowerRecord {
+        sensor: spec.sensor.clone(),
+        scope: spec.scope.clone(),
+        interval_ms: spec.interval_ms,
+        unit: "W".into(),
+        samples,
+        missing,
+        energy_joules: energy,
+        span_secs: span,
+    }
+}
+
+/// The value of `metric` for one observation, when it has one.
+fn metric_value(o: &Observation, metric: &str) -> Option<f64> {
+    match metric {
+        "wall_secs" => Some(o.wall_secs),
+        "iterations" => o.timings.as_ref().map(|t| t.iterations),
+        "energy_joules" => o.energy_joules,
+        _ => None,
+    }
+}
+
+/// Paired comparison of two entries of one recorded plan. Pairs are the
+/// measured (not warmup) observations of the same repeat; a pair counts only
+/// when both runs completed. The ratio is candidate / baseline. The median
+/// ratio has a percentile bootstrap 95% interval from `resamples` draws with
+/// a fixed seed, so the report is reproducible. Failed and incomplete runs
+/// are listed with the wall time they cost; they are never dropped silently.
+pub fn analyze(
+    out: &BenchOutput,
+    baseline: usize,
+    candidate: usize,
+    metric: &str,
+    seed: u64,
+) -> Result<serde_json::Value, String> {
+    if !matches!(metric, "wall_secs" | "iterations" | "energy_joules") {
+        return Err(format!(
+            "unknown metric {metric:?}: use wall_secs, iterations, or energy_joules"
+        ));
+    }
+    let n = out.plan.entries.len();
+    for (what, i) in [("baseline", baseline), ("candidate", candidate)] {
+        if i >= n {
+            return Err(format!(
+                "{what} index {i} is not an entry (the plan has {n})"
+            ));
+        }
+    }
+    if baseline == candidate {
+        return Err("baseline and candidate are the same entry".into());
+    }
+    let measured = |i: usize| -> Vec<&Observation> {
+        out.observations
+            .iter()
+            .filter(|o| o.entry_index == i && !o.warmup)
+            .collect()
+    };
+    let (base, cand) = (measured(baseline), measured(candidate));
+    let cost = |v: &[&Observation]| {
+        let not_done: Vec<_> = v
+            .iter()
+            .filter(|o| o.status != "completed")
+            .map(|o| serde_json::json!({"sequence": o.sequence, "repeat": o.repeat, "status": o.status, "error": o.error, "wall_secs": o.wall_secs}))
+            .collect();
+        serde_json::json!({
+            "runs": v.len(),
+            "completed": v.iter().filter(|o| o.status == "completed").count(),
+            "not_completed": not_done,
+            "total_wall_secs": v.iter().map(|o| o.wall_secs).sum::<f64>(),
+        })
+    };
+    let mut ratios = Vec::new();
+    let mut pairs = Vec::new();
+    for b in &base {
+        let Some(c) = cand.iter().find(|c| c.repeat == b.repeat) else {
+            continue;
+        };
+        let usable = b.status == "completed" && c.status == "completed";
+        let (vb, vc) = (metric_value(b, metric), metric_value(c, metric));
+        let ratio = match (usable, vb, vc) {
+            (true, Some(x), Some(y)) if x > 0.0 => Some(y / x),
+            _ => None,
+        };
+        if let Some(r) = ratio {
+            ratios.push(r);
+        }
+        pairs.push(serde_json::json!({"repeat": b.repeat, "baseline": vb, "candidate": vc, "ratio": ratio}));
+    }
+    let median = |v: &mut Vec<f64>| -> Option<f64> {
+        if v.is_empty() {
+            return None;
+        }
+        v.sort_by(f64::total_cmp);
+        let m = v.len() / 2;
+        Some(if v.len() % 2 == 1 {
+            v[m]
+        } else {
+            (v[m - 1] + v[m]) / 2.0
+        })
+    };
+    let resamples = 2000;
+    let interval = (ratios.len() >= 2).then(|| {
+        let mut st = seed;
+        let mut meds: Vec<f64> = (0..resamples)
+            .map(|_| {
+                let mut s: Vec<f64> = (0..ratios.len())
+                    .map(|_| ratios[(next(&mut st) % ratios.len() as u64) as usize])
+                    .collect();
+                median(&mut s).expect("nonempty")
+            })
+            .collect();
+        meds.sort_by(f64::total_cmp);
+        [
+            meds[resamples * 25 / 1000],
+            meds[resamples * 975 / 1000 - 1],
+        ]
+    });
+    let mut sorted = ratios.clone();
+    let name = |i: usize| out.plan.entries[i].name().to_string();
+    Ok(serde_json::json!({
+        "metric": metric,
+        "ratio": "candidate / baseline",
+        "baseline": {"index": baseline, "name": name(baseline), "cost": cost(&base)},
+        "candidate": {"index": candidate, "name": name(candidate), "cost": cost(&cand)},
+        "pairs": pairs,
+        "usable_pairs": ratios.len(),
+        "median_ratio": median(&mut sorted),
+        "bootstrap": {"interval_95": interval, "resamples": resamples, "seed": seed},
+        "note": if ratios.len() < 5 {
+            "fewer than 5 usable pairs: the interval is not a meaningful uncertainty estimate"
+        } else {
+            "each pair is one complete run per entry in the same repeat; iterations are not samples"
+        },
+        "plan_sha3": out.plan_sha3,
+        "source_identity": out.build,
+    }))
+}
+
+fn next(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Where a retained or verified artifact is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Artifact {
+    pub name: String,
+    /// The retained copy, or None when it was not kept.
+    pub path: Option<PathBuf>,
+    pub bytes: u64,
+    pub sha3: String,
+    /// Why the file was not kept (for example the retention quota).
+    pub not_retained: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec() -> TelemetrySpec {
+        TelemetrySpec {
+            argv: vec!["x".into()],
+            interval_ms: 100,
+            sensor: "s".into(),
+            scope: "device".into(),
+        }
+    }
+
+    #[test]
+    fn energy_is_the_trapezoid_and_missing_readings_void_it() {
+        let s = |t: f64, w: Option<f64>| PowerSample {
+            t_secs: t,
+            watts: w,
+        };
+        let r = integrate(
+            &spec(),
+            vec![s(0.0, Some(10.0)), s(1.0, Some(20.0)), s(3.0, Some(20.0))],
+        );
+        assert_eq!(r.energy_joules, Some(15.0 + 40.0));
+        assert_eq!(r.span_secs, 3.0);
+        let r = integrate(
+            &spec(),
+            vec![s(0.0, Some(10.0)), s(1.0, None), s(2.0, Some(10.0))],
+        );
+        assert_eq!((r.energy_joules, r.missing), (None, 1));
+        assert_eq!(
+            integrate(&spec(), vec![s(0.0, Some(5.0))]).energy_joules,
+            None
+        );
+    }
+
+    #[test]
+    fn telemetry_specs_are_checked() {
+        assert!(spec().validate().is_ok());
+        let mut t = spec();
+        t.scope = "both".into();
+        assert!(t.validate().is_err());
+        let mut t = spec();
+        t.interval_ms = 1;
+        assert!(t.validate().is_err());
+    }
+
+    #[test]
+    fn provenance_names_unknowns() {
+        let p = Provenance::collect();
+        assert_eq!(p.rustc, "unknown");
+        assert_eq!(p.power_policy, "unknown");
+        assert_eq!(p.source_identity, crate::build_identity());
+        assert_eq!(p.lockfile_sha3.len(), 64);
+        assert_eq!(p.executable_sha3.len(), 64);
+    }
+}

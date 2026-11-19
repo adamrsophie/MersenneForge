@@ -9,6 +9,7 @@
 pub mod backend;
 pub mod bench;
 pub mod checkpoint;
+pub mod evidence;
 pub mod exponent;
 pub mod ll;
 pub mod oracle;
@@ -17,6 +18,7 @@ pub mod prp;
 pub mod residue;
 pub mod run;
 pub mod select;
+pub mod worktodo;
 
 // Include source bytes so packaged builds and uncommitted changes have an
 // identity without relying on a Git checkout or a native build script.
@@ -52,6 +54,7 @@ const BUILD_SOURCES: &[(&str, &[u8])] = &[
     ("src/backend/mod.rs", include_bytes!("backend/mod.rs")),
     ("src/bench.rs", include_bytes!("bench.rs")),
     ("src/checkpoint.rs", include_bytes!("checkpoint.rs")),
+    ("src/evidence.rs", include_bytes!("evidence.rs")),
     ("src/exponent.rs", include_bytes!("exponent.rs")),
     ("src/lib.rs", include_bytes!("lib.rs")),
     ("src/ll.rs", include_bytes!("ll.rs")),
@@ -62,6 +65,7 @@ const BUILD_SOURCES: &[(&str, &[u8])] = &[
     ("src/residue.rs", include_bytes!("residue.rs")),
     ("src/run.rs", include_bytes!("run.rs")),
     ("src/select.rs", include_bytes!("select.rs")),
+    ("src/worktodo.rs", include_bytes!("worktodo.rs")),
 ];
 
 /// Crate version and SHA3-256 of the source files, manifest, and lockfile.

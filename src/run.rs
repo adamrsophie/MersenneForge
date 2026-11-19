@@ -225,6 +225,9 @@ pub struct Timings {
     pub iterations: f64,
     pub checks: f64,
     pub checkpoint_io: f64,
+    /// PRP: export, durable write, and read back of proof points.
+    #[serde(default)]
+    pub proof_points: f64,
     pub proof_generation: f64,
     pub proof_verification: f64,
 }

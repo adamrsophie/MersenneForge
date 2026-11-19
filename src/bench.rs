@@ -43,6 +43,49 @@ pub struct EngineOptions {
     pub jacobi_every_log: Option<bool>,
     pub device: Option<u32>,
     pub budget_secs: Option<f64>,
+    /// "steady_state" (default: no checkpoints, proof only when requested)
+    /// or "production" (checkpoints at every passed check, and for PRP a
+    /// required proof with self verification).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Keep the proof file and the run report in the execution directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retain: Option<bool>,
+    /// Check the generated proof with an external verifier, and an altered
+    /// copy of it, which must be rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_with: Option<ExternalVerifier>,
+}
+
+/// An external proof verifier. `{proof}` in `argv` is replaced by the proof
+/// path. Acceptance needs exit status 0 and `accept_text` in its standard
+/// output or error, so a process that merely exits 0 does not count.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalVerifier {
+    pub argv: Vec<String>,
+    pub accept_text: String,
+    pub timeout_secs: Option<f64>,
+}
+
+/// What the external verifier said about the proof and an altered copy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExternalVerification {
+    pub argv: Vec<String>,
+    /// SHA3-256 of the verifier program when `argv[0]` is a file path.
+    pub verifier_sha3: String,
+    pub exit_code: Option<i32>,
+    pub accepted: bool,
+    pub altered_exit_code: Option<i32>,
+    pub altered_rejected: bool,
+    pub stdout: PathBuf,
+    pub stderr: PathBuf,
+    pub altered_stdout: PathBuf,
+    pub altered_stderr: PathBuf,
+    pub secs: f64,
+    /// "verified" only when the proof was accepted and the altered copy
+    /// rejected; otherwise "failed".
+    pub status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -82,7 +125,17 @@ pub struct Plan {
     #[serde(default)]
     pub warmups: u32,
     pub entries: Vec<Entry>,
+    /// Optional power sensor sampled during every observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<crate::evidence::TelemetrySpec>,
+    /// Total bytes of retained artifacts (default 1 GiB). Files that would
+    /// exceed it are hashed and recorded but not kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retain_max_bytes: Option<u64>,
 }
+
+/// Default retention quota: 1 GiB.
+pub const DEFAULT_RETAIN_MAX_BYTES: u64 = 1 << 30;
 
 /// A number of seconds as a `Duration`: finite, positive, representable.
 fn seconds(what: &str, s: f64) -> Result<Duration, String> {
@@ -113,12 +166,54 @@ impl Plan {
         if self.repeats == 0 {
             return Err("repeats must be at least 1".into());
         }
+        if let Some(t) = &self.telemetry {
+            t.validate()?;
+        }
         let now = Instant::now();
         for e in &self.entries {
             match e {
-                Entry::Engine { name, options, .. } => {
+                Entry::Engine {
+                    name,
+                    options,
+                    test,
+                    ..
+                } => {
                     if let Some(b) = options.budget_secs {
                         deadline_after(now, &format!("{name}: budget_secs"), b)?;
+                    }
+                    let production = match options.mode.as_deref() {
+                        None | Some("steady_state") => false,
+                        Some("production") => true,
+                        Some(m) => {
+                            return Err(format!(
+                                "{name}: mode must be steady_state or production, got {m:?}"
+                            ))
+                        }
+                    };
+                    let proof = test == "prp" && options.proof_power.is_some();
+                    if production && test == "prp" && !proof {
+                        return Err(format!("{name}: production PRP entries need proof_power"));
+                    }
+                    if production && options.verify_proof == Some(false) {
+                        return Err(format!(
+                            "{name}: production entries keep proof self verification"
+                        ));
+                    }
+                    if let Some(v) = &options.verify_with {
+                        if !proof {
+                            return Err(format!(
+                                "{name}: verify_with needs a PRP entry with proof_power"
+                            ));
+                        }
+                        if v.argv.is_empty() || !v.argv.iter().any(|a| a.contains("{proof}")) {
+                            return Err(format!("{name}: verify_with argv must name {{proof}}"));
+                        }
+                        if v.accept_text.is_empty() {
+                            return Err(format!("{name}: verify_with accept_text is empty"));
+                        }
+                        if let Some(t) = v.timeout_secs {
+                            deadline_after(now, &format!("{name}: verify_with timeout_secs"), t)?;
+                        }
                     }
                 }
                 Entry::External {
@@ -162,8 +257,12 @@ pub struct Observation {
     /// "external process timing; result not verified" for external ones,
     /// whose exit status says nothing about the correctness of their output.
     pub result_source: String,
-    /// Engine runs start from iteration 0 with checkpointing disabled.
+    /// Engine runs start from iteration 0; this says whether checkpoints
+    /// were written (production) or not (steady state).
     pub start: String,
+    /// Engine runs: "steady_state" or "production".
+    #[serde(default)]
+    pub mode: Option<String>,
     /// Position in the executed sequence.
     pub sequence: usize,
     pub repeat: u32,
@@ -192,8 +291,20 @@ pub struct Observation {
     /// External runs: files holding the captured standard output and error.
     pub stdout: Option<PathBuf>,
     pub stderr: Option<PathBuf>,
+    /// Device or system energy over the sampled span, from `power`; null
+    /// when there is no sensor or a reading is missing.
     pub energy_joules: Option<f64>,
     pub telemetry: String,
+    /// Engine runs: wall time not attributed to any timed activity.
+    #[serde(default)]
+    pub unclassified_secs: Option<f64>,
+    #[serde(default)]
+    pub power: Option<crate::evidence::PowerRecord>,
+    /// Retained (or hashed) files of the run.
+    #[serde(default)]
+    pub artifacts: Vec<crate::evidence::Artifact>,
+    #[serde(default)]
+    pub external_verification: Option<ExternalVerification>,
 }
 
 impl Observation {
@@ -226,12 +337,20 @@ impl Observation {
             stderr: None,
             energy_joules: None,
             telemetry: "unavailable".into(),
+            mode: None,
+            unclassified_secs: None,
+            power: None,
+            artifacts: Vec::new(),
+            external_verification: None,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchOutput {
+    /// 2 for this format; outputs without the field are version 1.
+    #[serde(default = "schema_v1")]
+    pub schema_version: u32,
     pub plan: Plan,
     /// SHA3-256 of the plan as recorded in `plan` (compact JSON).
     pub plan_sha3: String,
@@ -243,8 +362,18 @@ pub struct BenchOutput {
     pub crate_version: String,
     pub os: String,
     pub arch: String,
+    /// Absent in version 1 outputs.
+    #[serde(default)]
+    pub provenance: Option<crate::evidence::Provenance>,
     pub observations: Vec<Observation>,
 }
+
+fn schema_v1() -> u32 {
+    1
+}
+
+/// Output format version written by this build.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// SplitMix64: a small, fully specified generator, so a recorded seed
 /// reproduces the order on any platform.
@@ -298,6 +427,9 @@ pub fn schedule(plan: &Plan) -> (Vec<(usize, u32, bool)>, Option<u64>) {
     (seq, seed_used)
 }
 
+/// An engine observation, the proof file it wrote (if any), and its report.
+type EngineResult = (Observation, Option<PathBuf>, serde_json::Value);
+
 fn engine_run(
     test: &str,
     p: u32,
@@ -305,7 +437,9 @@ fn engine_run(
     o: &EngineOptions,
     work: &Path,
     stop: Option<&AtomicBool>,
-) -> Result<Observation, String> {
+) -> Result<EngineResult, String> {
+    let production = o.mode.as_deref() == Some("production");
+    let checkpoint = production.then(|| work.join("ckpt").join(format!("M{p}-{test}.ckpt")));
     let kind = BackendKind::parse(backend).ok_or_else(|| format!("unknown backend {backend}"))?;
     if kind.is_device() && o.budget_secs.is_none() {
         return Err(format!("{backend} entries need budget_secs"));
@@ -330,7 +464,7 @@ fn engine_run(
                 proof_power: o.proof_power,
                 proof_dir: o.proof_power.map(|_| work.join("proof")),
                 verify_proof: o.verify_proof.unwrap_or(true),
-                checkpoint: None,
+                checkpoint: checkpoint.clone(),
                 max_batch: 1000,
             };
             run_prp(&mut be, p, &cfg, serde_json::json!({}), None, &mut ctl)
@@ -343,7 +477,7 @@ fn engine_run(
                 } else {
                     JacobiCadence::Auto
                 },
-                checkpoint: None,
+                checkpoint: checkpoint.clone(),
                 max_batch: 1000,
             };
             run_ll(&mut be, p, &cfg, serde_json::json!({}), None, &mut ctl)
@@ -365,6 +499,17 @@ fn engine_run(
     };
     let mut timings = report.timings.clone();
     timings.init += init;
+    let wall = start.elapsed().as_secs_f64();
+    let t = &timings;
+    let attributed = t.init
+        + t.iterations
+        + t.checks
+        + t.checkpoint_io
+        + t.proof_points
+        + t.proof_generation
+        + t.proof_verification;
+    let proof_file = report.evidence.proof.as_ref().map(|e| e.path.clone());
+    let report_json = serde_json::to_value(&report).expect("report serializes");
     let stage = report.evidence.proof_stage;
     let status = match (&report.process, stage) {
         (ProcessState::Completed, ProofStage::Failed | ProofStage::Rejected) => "failed",
@@ -372,10 +517,11 @@ fn engine_run(
         (ProcessState::Completed, _) => "completed",
         _ => "incomplete",
     };
-    Ok(Observation {
+    let obs = Observation {
         status: status.into(),
         error: (status == "failed").then(|| format!("proof stage {}", stage.name())),
-        wall_secs: start.elapsed().as_secs_f64(),
+        wall_secs: wall,
+        unclassified_secs: Some((wall - attributed).max(0.0)),
         timings: Some(timings),
         verdict: report.result.as_ref().map(|r| format!("{:?}", r.verdict)),
         res64: report.result.map(|r| r.res64),
@@ -385,7 +531,99 @@ fn engine_run(
         reliability: Some(reliability),
         diagnostics,
         ..Observation::failed("engine", String::new(), 0.0)
+    };
+    Ok((obs, proof_file, report_json))
+}
+
+/// Run the external verifier on `proof`, then on an altered copy of it.
+/// One verifier invocation: argv, exit code, accepted, stdout and stderr paths.
+type VerifierRun = (Vec<String>, Option<i32>, bool, PathBuf, PathBuf);
+
+fn verify_externally(
+    v: &ExternalVerifier,
+    proof: &Path,
+    scratch: &Path,
+    captures: &Path,
+    stop: Option<&AtomicBool>,
+) -> Result<ExternalVerification, String> {
+    let start = Instant::now();
+    let altered = scratch.join("altered.proof");
+    let mut bytes = fs::read(proof).map_err(|e| format!("{}: {e}", proof.display()))?;
+    // Flip the lowest bit of a byte in the last residue (the proof ends with
+    // residues; the final byte may hold high bits that must stay zero).
+    let at = bytes
+        .len()
+        .checked_sub(2)
+        .ok_or("proof file is too short")?;
+    bytes[at] ^= 1;
+    fs::write(&altered, &bytes).map_err(|e| format!("{}: {e}", altered.display()))?;
+    let run = |file: &Path, tag: &str| -> Result<VerifierRun, String> {
+        let argv: Vec<String> = v
+            .argv
+            .iter()
+            .map(|a| a.replace("{proof}", &file.display().to_string()))
+            .collect();
+        let (out, err) = (
+            captures.with_extension(format!("{tag}.stdout")),
+            captures.with_extension(format!("{tag}.stderr")),
+        );
+        let obs = external_run(&argv, None, v.timeout_secs, stop, (&out, &err))?;
+        let text = fs::read_to_string(&out).unwrap_or_default()
+            + &fs::read_to_string(&err).unwrap_or_default();
+        let accepted = obs.status == "completed" && text.contains(&v.accept_text);
+        Ok((argv, obs.exit_code, accepted, out, err))
+    };
+    let (argv, exit_code, accepted, stdout, stderr) = run(proof, "verify")?;
+    let (_, altered_exit_code, altered_accepted, altered_stdout, altered_stderr) =
+        run(&altered, "verify-altered")?;
+    let ok = accepted && !altered_accepted;
+    Ok(ExternalVerification {
+        verifier_sha3: crate::evidence::file_sha3(Path::new(&v.argv[0]))
+            .unwrap_or_else(|_| "unknown".into()),
+        argv,
+        exit_code,
+        accepted,
+        altered_exit_code,
+        altered_rejected: !altered_accepted,
+        stdout,
+        stderr,
+        altered_stdout,
+        altered_stderr,
+        secs: start.elapsed().as_secs_f64(),
+        status: if ok { "verified" } else { "failed" }.into(),
     })
+}
+
+/// Hash `src` and copy it into `dir` as `name` when the quota allows.
+fn retain(
+    src: &Path,
+    dir: &Path,
+    name: &str,
+    left: &mut u64,
+) -> Result<crate::evidence::Artifact, String> {
+    let bytes = fs::metadata(src)
+        .map_err(|e| format!("{}: {e}", src.display()))?
+        .len();
+    let sha3 = crate::evidence::file_sha3(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    let mut a = crate::evidence::Artifact {
+        name: name.into(),
+        path: None,
+        bytes,
+        sha3,
+        not_retained: None,
+    };
+    if bytes > *left {
+        a.not_retained = Some(format!(
+            "retention quota: {bytes} bytes needed, {left} left"
+        ));
+        return Ok(a);
+    }
+    fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let dst = dir.join(name);
+    fs::copy(src, &dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+    *left -= bytes;
+    a.path = Some(dst);
+    Ok(a)
 }
 
 fn external_run(
@@ -442,6 +680,23 @@ fn external_run(
         stderr: Some(capture.1.to_path_buf()),
         ..Observation::failed("external", String::new(), 0.0)
     })
+}
+
+/// Render a recorded JSON output again, as JSON or CSV by the extension of
+/// `output`, without running anything. Version 1 outputs are read too.
+pub fn render(input: &Path, output: &Path) -> Result<BenchOutput, String> {
+    let text = fs::read_to_string(input).map_err(|e| format!("{}: {e}", input.display()))?;
+    let out: BenchOutput = serde_json::from_str(&text)
+        .map_err(|e| format!("{}: not a benchmark JSON output: {e}", input.display()))?;
+    if out.schema_version > SCHEMA_VERSION {
+        return Err(format!(
+            "{}: schema version {} is newer than this build reads ({SCHEMA_VERSION})",
+            input.display(),
+            out.schema_version
+        ));
+    }
+    write_output(output, &out)?;
+    Ok(out)
 }
 
 /// Write the output as JSON, or CSV when the extension is `.csv`.
@@ -504,7 +759,9 @@ pub fn run_plan(
         .open(&manifest)
         .and_then(|mut f| std::io::Write::write_all(&mut f, &plan_json))
         .map_err(|e| format!("{}: {e}", manifest.display()))?;
+    let mut left = plan.retain_max_bytes.unwrap_or(DEFAULT_RETAIN_MAX_BYTES);
     let mut out = BenchOutput {
+        schema_version: SCHEMA_VERSION,
         plan: plan.clone(),
         plan_sha3: crate::proof::sha3_256(&[&plan_json])
             .iter()
@@ -516,6 +773,7 @@ pub fn run_plan(
         crate_version: env!("CARGO_PKG_VERSION").into(),
         os: std::env::consts::OS.into(),
         arch: std::env::consts::ARCH.into(),
+        provenance: Some(crate::evidence::Provenance::collect()),
         observations: Vec::new(),
     };
     for (n, &(i, repeat, warmup)) in seq.iter().enumerate() {
@@ -526,6 +784,7 @@ pub fn run_plan(
         };
         let dir = work.join(format!("run-{n}"));
         let start = Instant::now();
+        let sampler = plan.telemetry.as_ref().map(crate::evidence::Sampler::start);
         let res = match fs::create_dir(&dir) {
             Err(e) => Err(format!(
                 "cannot create the scratch directory {}: {e}",
@@ -539,7 +798,61 @@ pub fn run_plan(
                         backend,
                         options,
                         ..
-                    } => engine_run(test, *exponent, backend, options, &dir, stop),
+                    } => engine_run(test, *exponent, backend, options, &dir, stop).map(
+                        |(mut obs, proof, report)| {
+                            let adir = work.join("artifacts").join(n.to_string());
+                            let keep = options.retain == Some(true);
+                            let after = || -> Result<(), String> {
+                                if keep {
+                                    let rp = dir.join("report.json");
+                                    fs::write(
+                                        &rp,
+                                        serde_json::to_vec_pretty(&report).expect("json"),
+                                    )
+                                    .map_err(|e| format!("{}: {e}", rp.display()))?;
+                                    obs.artifacts.push(retain(
+                                        &rp,
+                                        &adir,
+                                        "report.json",
+                                        &mut left,
+                                    )?);
+                                }
+                                let Some(pf) = proof.filter(|p| p.is_file()) else {
+                                    return Ok(());
+                                };
+                                if keep {
+                                    let name = pf.file_name().map_or("proof".into(), |f| {
+                                        f.to_string_lossy().into_owned()
+                                    });
+                                    obs.artifacts.push(retain(&pf, &adir, &name, &mut left)?);
+                                }
+                                if let Some(v) = options.verify_with.as_ref() {
+                                    if obs.status == "completed" {
+                                        let ev = verify_externally(
+                                            v,
+                                            &pf,
+                                            &dir,
+                                            &work.join(n.to_string()),
+                                            stop,
+                                        )?;
+                                        if ev.status != "verified" {
+                                            obs.status = "failed".into();
+                                            obs.error = Some("external verification failed".into());
+                                        }
+                                        obs.external_verification = Some(ev);
+                                    }
+                                }
+                                Ok(())
+                            };
+                            // A failure here keeps the measured run and marks
+                            // the observation failed with the reason.
+                            if let Err(e) = after() {
+                                obs.status = "failed".into();
+                                obs.error = Some(format!("evidence: {e}"));
+                            }
+                            obs
+                        },
+                    ),
                     Entry::External {
                         argv,
                         cwd,
@@ -562,14 +875,42 @@ pub fn run_plan(
         };
         let mut obs =
             res.unwrap_or_else(|e| Observation::failed(kind, e, start.elapsed().as_secs_f64()));
+        if let (Some(s), Some(t)) = (sampler, &plan.telemetry) {
+            let rec = s.finish();
+            obs.energy_joules = rec.energy_joules;
+            obs.telemetry = format!(
+                "{} ({} power, sampled every {} ms)",
+                t.sensor, t.scope, t.interval_ms
+            );
+            obs.power = Some(rec);
+        }
         obs.entry = entry.name().to_string();
         obs.entry_index = i;
         match entry {
-            Entry::Engine { test, exponent, .. } => {
+            Entry::Engine {
+                test,
+                exponent,
+                options,
+                ..
+            } => {
                 obs.test = Some(test.clone());
                 obs.exponent = Some(*exponent);
                 obs.result_source = "engine checked run".into();
-                obs.start = "clean, checkpointing disabled".into();
+                let production = options.mode.as_deref() == Some("production");
+                obs.mode = Some(
+                    if production {
+                        "production"
+                    } else {
+                        "steady_state"
+                    }
+                    .into(),
+                );
+                obs.start = if production {
+                    "clean, checkpoints written at every passed check"
+                } else {
+                    "clean, checkpointing disabled"
+                }
+                .into();
             }
             Entry::External { argv, .. } => {
                 obs.argv = Some(argv.clone());
@@ -613,6 +954,7 @@ pub fn to_csv(out: &BenchOutput) -> String {
         "options",
         "argv",
         "result_source",
+        "mode",
         "start",
         "sequence",
         "repeat",
@@ -624,8 +966,10 @@ pub fn to_csv(out: &BenchOutput) -> String {
         "iterations",
         "checks",
         "checkpoint_io",
+        "proof_points",
         "proof_generation",
         "proof_verification",
+        "unclassified_secs",
         "verdict",
         "res64",
         "backend",
@@ -646,7 +990,11 @@ pub fn to_csv(out: &BenchOutput) -> String {
         "stdout",
         "stderr",
         "energy_joules",
+        "energy_scope",
         "telemetry",
+        "external_verification",
+        "artifacts",
+        "schema_version",
     ];
     let mut s = COLUMNS.join(",") + "\n";
     for o in &out.observations {
@@ -688,6 +1036,7 @@ pub fn to_csv(out: &BenchOutput) -> String {
                     .unwrap_or_default(),
             ),
             String::from(&o.result_source),
+            o.mode.clone().unwrap_or_default(),
             String::from(&o.start),
             o.sequence.to_string(),
             o.repeat.to_string(),
@@ -699,8 +1048,10 @@ pub fn to_csv(out: &BenchOutput) -> String {
             f(t.map(|t| t.iterations)),
             f(t.map(|t| t.checks)),
             f(t.map(|t| t.checkpoint_io)),
+            f(t.map(|t| t.proof_points)),
             f(t.map(|t| t.proof_generation)),
             f(t.map(|t| t.proof_verification)),
+            f(o.unclassified_secs),
             o.verdict.clone().unwrap_or_default(),
             o.res64.clone().unwrap_or_default(),
             b.map(|b| b.kind.clone()).unwrap_or_default(),
@@ -727,7 +1078,21 @@ pub fn to_csv(out: &BenchOutput) -> String {
             path(&o.stdout),
             path(&o.stderr),
             o.energy_joules.map(|e| e.to_string()).unwrap_or_default(),
+            o.power
+                .as_ref()
+                .map(|p| p.scope.clone())
+                .unwrap_or_default(),
             o.telemetry.clone(),
+            o.external_verification
+                .as_ref()
+                .map(|v| v.status.clone())
+                .unwrap_or_default(),
+            o.artifacts
+                .iter()
+                .map(|a| format!("{}={}", a.name, a.sha3))
+                .collect::<Vec<_>>()
+                .join(";"),
+            out.schema_version.to_string(),
         ];
         debug_assert_eq!(row.len(), COLUMNS.len());
         // Every field is quoted (RFC 4180), so commas, quotes, CR, and
@@ -762,6 +1127,8 @@ mod tests {
                     timeout_secs: None,
                 })
                 .collect(),
+            telemetry: None,
+            retain_max_bytes: None,
         }
     }
 

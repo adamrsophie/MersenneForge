@@ -13,7 +13,9 @@ MersenneForge is one Rust crate with a library and a CLI. Rust owns protocol sta
 | `proof` | Proof schedules, durable residue storage, version 2 generation, parsing, and verification |
 | `checkpoint` | Bounded, hashed project files, atomic writes, previous-file rotation, and directory durability |
 | `run` | Stop control, fault injection, process state, mathematical results, evidence, and timings |
-| `bench` | Declared workload plans, engine and external observations, incremental JSON or CSV output |
+| `bench` | Declared workload plans, engine and external observations, incremental JSON or CSV output, steady state and production modes, retention, external proof verification |
+| `evidence` | Benchmark provenance, power telemetry sampling and energy, paired analysis with a bootstrap interval |
+| `worktodo` | Assignment lines, result lines in the upstream JSON form, proof MD5, disk preflight, factor checks |
 | `main` | CLI parsing, checkpoint locks, Ctrl-C handling, JSON output, and exit codes |
 
 Backends allocate instance-owned register handles and expose import, export, copy, squaring, multiplication, LL steps, equality, and synchronization. Only canonical `Residue` values cross this boundary. Transform words and device memory stay inside the backend. Recoverable backend faults trigger protocol rollback; unsupported operations and execution failures never become composite verdicts.

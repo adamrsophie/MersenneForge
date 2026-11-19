@@ -133,6 +133,7 @@ struct Counters {
     t_iter: f64,
     t_check: f64,
     t_ckpt: f64,
+    t_proof_points: f64,
 }
 
 enum End {
@@ -304,6 +305,8 @@ impl<'b, B: Backend> Engine<'b, B> {
             self.final_x = Some(v);
         }
         if let Some(store) = spec.proof.filter(|s| s.schedule.contains(k)) {
+            // Export, durable write, and read back of the proof point.
+            let sw = Stopwatch::start();
             let v = match &self.final_x {
                 Some(v) if k == spec.kend => v.clone(),
                 _ => self.be.export(self.x)?,
@@ -323,6 +326,7 @@ impl<'b, B: Backend> Engine<'b, B> {
                     message: e.to_string(),
                 })
             })?;
+            cnt.t_proof_points += sw.secs();
         }
         if ctl.halt_at == Some(k) {
             return Ok(Step::Halted);
@@ -868,6 +872,7 @@ pub fn run_prp<B: Backend>(
     timings.iterations = cnt.t_iter;
     timings.checks = cnt.t_check;
     timings.checkpoint_io = cnt.t_ckpt;
+    timings.proof_points = cnt.t_proof_points;
     evidence.gerbicz_passed = cnt.passed;
     evidence.gerbicz_failed = cnt.failed;
     evidence.backend_faults = cnt.faults;
