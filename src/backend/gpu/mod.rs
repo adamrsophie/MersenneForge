@@ -42,6 +42,9 @@ pub struct GpuOptions {
     pub device: Option<u32>,
     /// Fused radix 4 stages (also enabled by MERSENNE_FORGE_GPU_RADIX4=1).
     pub radix4: bool,
+    /// Two words per element and a half length transform (also enabled by
+    /// MERSENNE_FORGE_GPU_PACKED=1); see `weight_packed` in the kernels.
+    pub packed: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -69,6 +72,11 @@ pub fn supported_exponents() -> (u32, u32) {
 /// Whether fused radix 4 stages were asked for (MERSENNE_FORGE_GPU_RADIX4=1).
 fn radix4_requested() -> bool {
     std::env::var("MERSENNE_FORGE_GPU_RADIX4").is_ok_and(|v| v == "1")
+}
+
+/// Whether the packed transform was asked for (MERSENNE_FORGE_GPU_PACKED=1).
+fn packed_requested() -> bool {
+    std::env::var("MERSENNE_FORGE_GPU_PACKED").is_ok_and(|v| v == "1")
 }
 
 fn plan_name(n: u32) -> String {
@@ -214,6 +222,10 @@ struct Pipes {
     sqr: wgpu::ComputePipeline,
     pmul: wgpu::ComputePipeline,
     unweight: wgpu::ComputePipeline,
+    weight_packed: wgpu::ComputePipeline,
+    sqr_packed: wgpu::ComputePipeline,
+    pmul_packed: wgpu::ComputePipeline,
+    unweight_packed: wgpu::ComputePipeline,
     carry: wgpu::ComputePipeline,
     #[cfg_attr(not(test), allow(dead_code))]
     mulmod_test: wgpu::ComputePipeline,
@@ -241,6 +253,8 @@ pub struct GpuBackend {
     /// Opt-in fused stages: (radix 4, bind group) per pass, forward and
     /// inverse. None: one pass per stage.
     fused: Option<(Vec<(bool, wgpu::BindGroup)>, Vec<(bool, wgpu::BindGroup)>)>,
+    /// Packed transform: the NTT runs at length n / 2.
+    packed: bool,
     bg_carry: [wgpu::BindGroup; 2],
     regs: HashMap<u32, RegBuf>,
     /// First uncaptured device error or device loss. Sticky.
@@ -385,6 +399,10 @@ impl GpuBackend {
             sqr: pipe("sqr"),
             pmul: pipe("pmul"),
             unweight: pipe("unweight"),
+            weight_packed: pipe("weight_packed"),
+            sqr_packed: pipe("sqr_packed"),
+            pmul_packed: pipe("pmul_packed"),
+            unweight_packed: pipe("unweight_packed"),
             carry: pipe("carry"),
             mulmod_test: pipe("mulmod_test"),
         };
@@ -438,17 +456,22 @@ impl GpuBackend {
         };
         let base = sh.params([plan.n, 0, 0, 0]);
         let ll = sh.params([plan.n, 0, 0, 2]);
+        // Transform length: n, or n / 2 when packed. The twiddle stride
+        // stays n / (2 m): a length L stage with half block m uses w_L^j =
+        // w_n^(j n / L), and the table holds powers of w_n.
+        let packed = opts.packed || packed_requested();
+        let tlen = if packed { plan.n / 2 } else { plan.n };
         let mut bg_dif = Vec::new();
         let mut bg_dit = Vec::new();
-        let mut m = plan.n / 2;
+        let mut m = tlen / 2;
         while m >= 1 {
-            let params = sh.params([plan.n, m, plan.n / (2 * m), 0]);
+            let params = sh.params([tlen, m, plan.n / (2 * m), 0]);
             bg_dif.push(sh.bind(&params, &s[1], &s[0]));
             m /= 2;
         }
         let mut m = 1;
-        while m < plan.n {
-            let params = sh.params([plan.n, m, plan.n / (2 * m), 0]);
+        while m < tlen {
+            let params = sh.params([tlen, m, plan.n / (2 * m), 0]);
             bg_dit.push(sh.bind(&params, &s[1], &s[0]));
             m *= 2;
         }
@@ -457,18 +480,18 @@ impl GpuBackend {
         // DIT stage).
         let fused = (opts.radix4 || radix4_requested()).then(|| {
             let mut f = Vec::new();
-            let mut m = plan.n / 2;
+            let mut m = tlen / 2;
             while m >= 1 {
-                let params = sh.params([plan.n, m, plan.n / (2 * m), 0]);
+                let params = sh.params([tlen, m, plan.n / (2 * m), 0]);
                 let four = m >= 2;
                 f.push((four, sh.bind(&params, &s[1], &s[0])));
                 m /= if four { 4 } else { 2 };
             }
             let mut i = Vec::new();
             let mut h = 1;
-            while h < plan.n {
-                let params = sh.params([plan.n, h, plan.n / (2 * h), 0]);
-                let four = 4 * h <= plan.n;
+            while h < tlen {
+                let params = sh.params([tlen, h, plan.n / (2 * h), 0]);
+                let four = 4 * h <= tlen;
                 i.push((four, sh.bind(&params, &s[1], &s[0])));
                 h *= if four { 4 } else { 2 };
             }
@@ -483,6 +506,7 @@ impl GpuBackend {
             bg_dif,
             bg_dit,
             fused,
+            packed,
             base,
             s,
             sh,
@@ -526,8 +550,12 @@ impl GpuBackend {
 
     /// Weight `load`'s register into T and transform it.
     fn encode_forward(&self, pass: &mut wgpu::ComputePass, load: &wgpu::BindGroup) {
-        let n = self.plan.n;
-        self.dispatch(pass, &self.pipes.weight, load, n);
+        let n = self.tlen();
+        if self.packed {
+            self.dispatch(pass, &self.pipes.weight_packed, load, n);
+        } else {
+            self.dispatch(pass, &self.pipes.weight, load, n);
+        }
         if let Some((fwd, _)) = &self.fused {
             for (four, bg) in fwd {
                 if *four {
@@ -544,8 +572,28 @@ impl GpuBackend {
     }
 
     /// Inverse transform T, unweight, carry, and store into `dst`.
+    /// Transform length: n, or n / 2 when packed.
+    fn tlen(&self) -> u32 {
+        if self.packed {
+            self.plan.n / 2
+        } else {
+            self.plan.n
+        }
+    }
+
+    /// Pointwise square of T, or product with T2.
+    fn encode_pointwise(&self, pass: &mut wgpu::ComputePass, product: bool) {
+        let (pipe, count) = match (self.packed, product) {
+            (false, false) => (&self.pipes.sqr, self.plan.n),
+            (false, true) => (&self.pipes.pmul, self.plan.n),
+            (true, false) => (&self.pipes.sqr_packed, self.plan.n / 4 + 1),
+            (true, true) => (&self.pipes.pmul_packed, self.plan.n / 4 + 1),
+        };
+        self.dispatch(pass, pipe, &self.bg_base, count);
+    }
+
     fn encode_back(&self, pass: &mut wgpu::ComputePass, unweight: &wgpu::BindGroup, dst: &RegBuf) {
-        let n = self.plan.n;
+        let n = self.tlen();
         match &self.fused {
             Some((_, inv)) => {
                 for (four, bg) in inv {
@@ -562,7 +610,12 @@ impl GpuBackend {
                 }
             }
         }
-        self.dispatch(pass, &self.pipes.unweight, unweight, n);
+        let n = self.plan.n;
+        if self.packed {
+            self.dispatch(pass, &self.pipes.unweight_packed, unweight, n / 2);
+        } else {
+            self.dispatch(pass, &self.pipes.unweight, unweight, n);
+        }
         for t in 1..self.plan.passes {
             self.dispatch(
                 pass,
@@ -606,7 +659,7 @@ impl GpuBackend {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 for _ in 0..k {
                     self.encode_forward(&mut pass, &reg.load);
-                    self.dispatch(&mut pass, &self.pipes.sqr, &self.bg_base, self.plan.n);
+                    self.encode_pointwise(&mut pass, false);
                     self.encode_back(&mut pass, if ll { &self.bg_ll } else { &self.bg_base }, reg);
                 }
             }
@@ -672,10 +725,15 @@ impl Backend for GpuBackend {
                 crate::build_identity(),
                 kernel_source_hash()
             ),
-            plan: if self.fused.is_some() {
-                format!("{} radix4", plan_name(self.plan.n))
-            } else {
-                plan_name(self.plan.n)
+            plan: {
+                let mut name = plan_name(self.plan.n);
+                if self.packed {
+                    name.push_str(" packed");
+                }
+                if self.fused.is_some() {
+                    name.push_str(" radix4");
+                }
+                name
             },
             device: self.device_name.clone(),
         }
@@ -770,7 +828,7 @@ impl Backend for GpuBackend {
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
             self.encode_forward(&mut pass, &d.load);
-            self.dispatch(&mut pass, &self.pipes.pmul, &self.bg_base, self.plan.n);
+            self.encode_pointwise(&mut pass, true);
             self.encode_back(&mut pass, &self.bg_base, d);
         }
         self.submit(enc.finish())
@@ -836,6 +894,40 @@ mod tests {
             a.square(ra, 40).unwrap();
             b.square(rb, 40).unwrap();
             assert_eq!(a.export(ra).unwrap(), b.export(rb).unwrap(), "p = {p}");
+        }
+    }
+
+    /// The packed transform gives the same residues as the unpacked one,
+    /// for squaring and for multiplication, alone and with fused stages.
+    #[test]
+    fn packed_transform_matches_unpacked() {
+        for radix4 in [false, true] {
+            let opts = GpuOptions {
+                packed: true,
+                radix4,
+                ..GpuOptions::default()
+            };
+            for p in [127u32, 521, 4423, 86243] {
+                let mut a = backend(p);
+                let mut b = GpuBackend::new(p, &opts).unwrap();
+                assert!(b.identity().plan.contains(" packed"));
+                let x = Residue::from_u64(p, 3);
+                let (ra, rb) = (a.alloc().unwrap(), b.alloc().unwrap());
+                let (sa, sb) = (a.alloc().unwrap(), b.alloc().unwrap());
+                a.import(ra, &x).unwrap();
+                b.import(rb, &x).unwrap();
+                a.square(ra, 40).unwrap();
+                b.square(rb, 40).unwrap();
+                a.copy(sa, ra).unwrap();
+                b.copy(sb, rb).unwrap();
+                a.square(ra, 3).unwrap();
+                b.square(rb, 3).unwrap();
+                a.mul(ra, sa).unwrap();
+                b.mul(rb, sb).unwrap();
+                b.ll_step(rb, 2).unwrap();
+                a.ll_step(ra, 2).unwrap();
+                assert_eq!(a.export(ra).unwrap(), b.export(rb).unwrap(), "p = {p}");
+            }
         }
     }
 

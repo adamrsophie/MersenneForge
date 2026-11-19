@@ -180,6 +180,115 @@ fn dit4(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw
     }
 }
 
+// Packed transform (opt-in, MERSENNE_FORGE_GPU_PACKED=1). Words 2j and
+// 2j + 1 share element j as its real and imaginary part, and the transform
+// has length m = n / 2. Twiddles of order n lie on the norm 1 circle (see
+// model.rs), so conjugation inverts them and the length n transform X of
+// the real words is Hermitian: X[n - k] = conj(X[k]). From Z = the length m
+// transform of the packed words:
+//   E = (Z[k] + conj Z[m - k]) / 2, O = (Z[k] - conj Z[m - k]) / (2i),
+//   X[k] = E + w^k O, X[k + m] = E - w^k O   (w = w_n).
+// After the pointwise product Y (Hermitian too), the inverse input is
+//   Z'[j] = (Y[j] + Y[j + m]) + i (Y[j] - Y[j + m]) w^-j,
+// which is twice the usual (E' + i O'), so the length m inverse gives
+// 2 m y = n y, the same scale as the unpacked inverse; unweight is the same
+// rotation. Thread k handles the pair k, m - k, reading and writing only
+// those two elements, so the pass is in place without races. P.n is the
+// word count n in these kernels.
+// ponytail: the packed path has no imaginary part fault check (both parts
+// carry words) and keeps the full size buffers; memory halving is the
+// upgrade.
+
+fn half(a: vec2<u32>) -> vec2<u32> {
+    return vec2<u32>(rot(a.x, 30u), rot(a.y, 30u));
+}
+
+fn neg(a: vec2<u32>) -> vec2<u32> {
+    return vec2<u32>(fsub(0u, a.x), fsub(0u, a.y));
+}
+
+fn times_i(a: vec2<u32>) -> vec2<u32> {
+    return vec2<u32>(fsub(0u, a.y), a.x);
+}
+
+fn times_neg_i(a: vec2<u32>) -> vec2<u32> {
+    return vec2<u32>(a.y, fsub(0u, a.x));
+}
+
+// (X[k], X[k + m]) from Z[k], conj Z[m - k], and w^k.
+fn untangle(zk: vec2<u32>, zc: vec2<u32>, w: vec2<u32>) -> array<vec2<u32>, 2> {
+    let e = half(cadd(zk, zc));
+    let t = cmul(w, half(times_neg_i(csub(zk, zc))));
+    return array<vec2<u32>, 2>(cadd(e, t), csub(e, t));
+}
+
+// Z'[j] from Y[j], Y[j + m], and w^-j.
+fn retangle(ya: vec2<u32>, yb: vec2<u32>, winv: vec2<u32>) -> vec2<u32> {
+    return cadd(cadd(ya, yb), times_i(cmul(csub(ya, yb), winv)));
+}
+
+@compute @workgroup_size(256)
+fn weight_packed(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    for (var j = g.x; j < P.n / 2u; j += nw.x * WG) {
+        let a = 2u * j;
+        T[j] = vec2<u32>(
+            rot(to_field(WIN[a]), (WT[a] >> 8u) & 31u),
+            rot(to_field(WIN[a + 1u]), (WT[a + 1u] >> 8u) & 31u),
+        );
+    }
+}
+
+fn pointwise_packed(k: u32, m: u32, product: bool) {
+    let j = (m - k) % m;
+    let w = TW[k];
+    let x = untangle(T[k], conj(T[j]), w);
+    var y0: vec2<u32>;
+    var y1: vec2<u32>;
+    if (product) {
+        let x2 = untangle(T2[k], conj(T2[j]), w);
+        y0 = cmul(x[0], x2[0]);
+        y1 = cmul(x[1], x2[1]);
+    } else {
+        y0 = csqr(x[0]);
+        y1 = csqr(x[1]);
+    }
+    T[k] = retangle(y0, y1, conj(w));
+    // Y[m - k] = conj Y[k + m], Y[n - k] = conj Y[k], w^-(m - k) = -w^k.
+    if (k != 0u && j != k) {
+        T[j] = retangle(conj(y1), conj(y0), neg(w));
+    }
+}
+
+@compute @workgroup_size(256)
+fn sqr_packed(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    let m = P.n / 2u;
+    for (var k = g.x; k <= m / 2u; k += nw.x * WG) {
+        pointwise_packed(k, m, false);
+    }
+}
+
+@compute @workgroup_size(256)
+fn pmul_packed(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    let m = P.n / 2u;
+    for (var k = g.x; k <= m / 2u; k += nw.x * WG) {
+        pointwise_packed(k, m, true);
+    }
+}
+
+@compute @workgroup_size(256)
+fn unweight_packed(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    for (var j = g.x; j < P.n / 2u; j += nw.x * WG) {
+        let t = T[j];
+        let a = 2u * j;
+        var z = balanced(rot(t.x, (WT[a] >> 16u) & 31u));
+        if (j == 0u) {
+            z -= i32(P.sub);
+        }
+        WOUT[a] = z;
+        WOUT[a + 1u] = balanced(rot(t.y, (WT[a + 1u] >> 16u) & 31u));
+    }
+}
+
 @compute @workgroup_size(256)
 fn sqr(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
     for (var i = g.x; i < P.n; i += nw.x * WG) {

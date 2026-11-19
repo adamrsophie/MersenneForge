@@ -1868,24 +1868,60 @@ fn cmd_tune(p: u32, kind: BackendKind, device: Option<u32>, iters: u64) -> Resul
     let mut variants: Vec<(&str, Box<dyn Backend>)> = vec![("", open(kind, p, device)?)];
     match kind {
         BackendKind::Dwt => {
-            let mut b = mersenne_forge::backend::dwt::DwtBackend::new(p).map_err(unsupported)?;
+            use mersenne_forge::backend::dwt::DwtBackend;
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+            let mut b = DwtBackend::new(p).map_err(unsupported)?;
             b.use_packed();
             if b.is_packed() {
                 variants.push(("MERSENNE_FORGE_DWT_PACKED=1", Box::new(b)));
+            }
+            if threads >= 2 {
+                for packed in [false, true] {
+                    let mut b = DwtBackend::new(p).map_err(unsupported)?;
+                    if packed {
+                        b.use_packed();
+                    }
+                    b.use_threads(threads);
+                    if b.threads() > 1 && (!packed || b.is_packed()) {
+                        let setting: &'static str = Box::leak(
+                            format!(
+                                "{}MERSENNE_FORGE_DWT_THREADS={threads}",
+                                if packed {
+                                    "MERSENNE_FORGE_DWT_PACKED=1 "
+                                } else {
+                                    ""
+                                }
+                            )
+                            .into_boxed_str(),
+                        );
+                        variants.push((setting, Box::new(b)));
+                    }
+                }
             }
         }
         #[cfg(feature = "gpu")]
         BackendKind::Gpu => {
             use mersenne_forge::backend::gpu::{GpuBackend, GpuOptions};
-            let b = GpuBackend::new(
-                p,
-                &GpuOptions {
-                    device,
-                    radix4: true,
-                },
-            )
-            .map_err(unsupported)?;
-            variants.push(("MERSENNE_FORGE_GPU_RADIX4=1", Box::new(b)));
+            for (radix4, packed, setting) in [
+                (true, false, "MERSENNE_FORGE_GPU_RADIX4=1"),
+                (false, true, "MERSENNE_FORGE_GPU_PACKED=1"),
+                (
+                    true,
+                    true,
+                    "MERSENNE_FORGE_GPU_PACKED=1 MERSENNE_FORGE_GPU_RADIX4=1",
+                ),
+            ] {
+                let b = GpuBackend::new(
+                    p,
+                    &GpuOptions {
+                        device,
+                        radix4,
+                        packed,
+                    },
+                )
+                .map_err(unsupported)?;
+                variants.push((setting, Box::new(b)));
+            }
         }
         _ => {}
     }
