@@ -655,7 +655,8 @@ pub struct FactorLine {
 }
 
 /// Bounds for a `Pfactor=` line and for P-1 before a PRP test: stage 1
-/// only (B2 = B1), since stage 2 runs on the host. ponytail: a fixed rule,
+/// only (B2 = B1): stage 2 pays a host round trip per prime and saves no
+/// progress, so `work` does not run it. ponytail: a fixed rule,
 /// B1 = p / 10 between 1,000 and 1,000,000; upstream's cost model
 /// (probability of a factor against tests saved) is the upgrade path.
 pub fn pfactor_bounds(p: u32) -> (u64, u64) {
