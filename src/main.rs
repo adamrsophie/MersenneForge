@@ -308,6 +308,20 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Time the default transform of a backend against its opt-in variants
+    /// (dwt: packed real transform; gpu: fused radix 4 stages), check that
+    /// every variant gives the same residue, and print the fastest with the
+    /// environment setting that selects it.
+    Tune {
+        #[arg(long)]
+        exponent: u32,
+        #[arg(long, value_enum, default_value = "dwt")]
+        backend: BackendArg,
+        #[arg(long)]
+        device: Option<u32>,
+        #[arg(long, default_value_t = 200)]
+        iters: u64,
+    },
     /// Check that a reported factor divides 2^p - 1. Exit 0 when it does.
     CheckFactor {
         #[arg(long)]
@@ -1844,6 +1858,77 @@ fn cmd_primenet(
     })
 }
 
+fn cmd_tune(p: u32, kind: BackendKind, device: Option<u32>, iters: u64) -> Result<u8, Failure> {
+    use mersenne_forge::backend::Backend;
+    let unsupported =
+        |e: mersenne_forge::backend::BackendError| fail(EXIT_UNSUPPORTED, e.to_string());
+    let mut variants: Vec<(&str, Box<dyn Backend>)> = vec![("", open(kind, p, device)?)];
+    match kind {
+        BackendKind::Dwt => {
+            let mut b = mersenne_forge::backend::dwt::DwtBackend::new(p).map_err(unsupported)?;
+            b.use_packed();
+            if b.is_packed() {
+                variants.push(("MERSENNE_FORGE_DWT_PACKED=1", Box::new(b)));
+            }
+        }
+        #[cfg(feature = "gpu")]
+        BackendKind::Gpu => {
+            use mersenne_forge::backend::gpu::{GpuBackend, GpuOptions};
+            let b = GpuBackend::new(
+                p,
+                &GpuOptions {
+                    device,
+                    radix4: true,
+                },
+            )
+            .map_err(unsupported)?;
+            variants.push(("MERSENNE_FORGE_GPU_RADIX4=1", Box::new(b)));
+        }
+        _ => {}
+    }
+    let x0 = mersenne_forge::residue::Residue::from_u64(p, 3);
+    let mut rows = Vec::new();
+    let mut reference = None;
+    for (setting, be) in variants.iter_mut() {
+        let r = be.alloc().map_err(unsupported)?;
+        be.import(r, &x0).map_err(unsupported)?;
+        be.square(r, iters.min(10)).map_err(unsupported)?;
+        be.sync().map_err(unsupported)?;
+        let t = Instant::now();
+        be.square(r, iters).map_err(unsupported)?;
+        be.sync().map_err(unsupported)?;
+        let secs = t.elapsed().as_secs_f64();
+        let out = be.export(r).map_err(unsupported)?;
+        be.free(r).map_err(unsupported)?;
+        let agrees = *reference.get_or_insert_with(|| out.clone()) == out;
+        rows.push(json!({
+            "plan": be.identity().plan,
+            "setting": if setting.is_empty() { "(default)" } else { *setting },
+            "ms_per_iteration": 1e3 * secs / iters.max(1) as f64,
+            "agrees_with_default": agrees,
+        }));
+    }
+    let best = rows
+        .iter()
+        .filter(|r| r["agrees_with_default"] == true)
+        .min_by(|a, b| {
+            a["ms_per_iteration"]
+                .as_f64()
+                .partial_cmp(&b["ms_per_iteration"].as_f64())
+                .expect("finite times")
+        })
+        .cloned();
+    let disagree = rows.iter().any(|r| r["agrees_with_default"] == false);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(
+            &json!({"exponent": p, "iterations": iters, "variants": rows, "fastest": best})
+        )
+        .expect("serializable")
+    );
+    Ok(if disagree { EXIT_REJECTED } else { 0 })
+}
+
 /// One worker of `supervise`: the `work` arguments for one device.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2297,6 +2382,7 @@ fn main() -> ExitCode {
         | Cmd::BenchAnalyze { .. }
         | Cmd::Work { .. }
         | Cmd::Supervise { .. }
+        | Cmd::Tune { .. }
         | Cmd::Status { .. }
         | Cmd::Power { .. }
         | Cmd::CheckpointExport { .. }
@@ -2485,6 +2571,12 @@ fn main() -> ExitCode {
             config,
             max_restarts,
         } => cmd_supervise(&config, max_restarts),
+        Cmd::Tune {
+            exponent,
+            backend,
+            device,
+            iters,
+        } => cmd_tune(exponent, backend.kind(), device, iters),
         Cmd::Status {
             worktodo,
             results,

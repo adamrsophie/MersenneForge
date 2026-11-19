@@ -1370,3 +1370,27 @@ fn bench_analyze_pairs_by_repeat() {
     assert_eq!(run("0", "0").status.code(), Some(2));
     assert_eq!(run("0", "9").status.code(), Some(2));
 }
+
+#[test]
+fn tune_compares_dwt_variants_and_they_agree() {
+    let o = cli(&[
+        "tune",
+        "--exponent",
+        "21701",
+        "--backend",
+        "dwt",
+        "--iters",
+        "20",
+    ]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let rows = v["variants"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r["agrees_with_default"] == true));
+    assert!(v["fastest"]["ms_per_iteration"].as_f64().unwrap() > 0.0);
+}
