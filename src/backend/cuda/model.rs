@@ -129,6 +129,8 @@ pub struct Plan {
     pub word_bound: u64,
     /// 2 n W^2, the bound on every convolution coefficient.
     pub coeff_bound: u128,
+    /// Registers hold 32-bit words, two per 64-bit element (opt-in).
+    pub narrow: bool,
 }
 
 /// The plan for exponent p at transform length 2^log_n, if the capacity bound
@@ -178,6 +180,7 @@ pub fn plan_for_len(p: u32, log_n: u32) -> Option<Plan> {
         slack: m / 2,
         word_bound,
         coeff_bound,
+        narrow: false,
     })
 }
 
@@ -341,6 +344,45 @@ pub fn k_carry_a(a: &mut [u64], z: &[u64], n: u64, p: u64, log_n: u64, pieces: u
     }
 }
 
+/// Word i of a narrow register: the i-th 32-bit int of the 64-bit elements,
+/// little endian (word 2j in the low half of element j).
+pub fn narrow_get(x: &[u64], i: u64) -> i64 {
+    let e = x[(i / 2) as usize];
+    i64::from((if i % 2 == 0 { e } else { e >> 32 }) as u32 as i32)
+}
+
+pub fn narrow_set(x: &mut [u64], i: u64, v: i64) {
+    let e = &mut x[(i / 2) as usize];
+    let bits = u64::from(v as i32 as u32);
+    *e = if i % 2 == 0 {
+        (*e & !0xffff_ffff) | bits
+    } else {
+        (*e & 0xffff_ffff) | (bits << 32)
+    };
+}
+
+pub fn k_weight32(t: &mut [u64], x: &[u64], n: u64, p: u64, kinv: u64) {
+    for i in 0..n {
+        let v = narrow_get(x, i);
+        let m = if v < 0 {
+            (v + Q as i64) as u64
+        } else {
+            v as u64
+        };
+        t[2 * i as usize] = rotl(m, weight_shift(n, p, kinv, i));
+        t[2 * i as usize + 1] = 0;
+    }
+}
+
+pub fn k_carry_b32(x: &mut [u64], a: &[u64], n: u64, p: u64, log_n: u64) {
+    for k in 0..n {
+        let prev = k.wrapping_sub(1) & (n - 1);
+        let d = low(a[k as usize] as i64, width(p, log_n, k));
+        let c = carry(a[prev as usize] as i64, width(p, log_n, prev));
+        narrow_set(x, k, d + c);
+    }
+}
+
 pub fn k_carry_b(x: &mut [u64], a: &[u64], n: u64, p: u64, log_n: u64) {
     for k in 0..n {
         let prev = k.wrapping_sub(1) & (n - 1);
@@ -363,6 +405,8 @@ pub enum Kernel {
     Unweight,
     CarryA,
     CarryB,
+    Weight32,
+    CarryB32,
 }
 
 /// Kind of a kernel parameter: a pointer to 64-bit elements or a 64-bit scalar.
@@ -373,7 +417,7 @@ pub enum Param {
 }
 
 impl Kernel {
-    pub const ALL: [Kernel; 8] = [
+    pub const ALL: [Kernel; 10] = [
         Kernel::Weight,
         Kernel::FwdStage,
         Kernel::InvStage,
@@ -382,6 +426,8 @@ impl Kernel {
         Kernel::Unweight,
         Kernel::CarryA,
         Kernel::CarryB,
+        Kernel::Weight32,
+        Kernel::CarryB32,
     ];
 
     /// The `extern "C"` name in `kernels.cu`.
@@ -395,6 +441,8 @@ impl Kernel {
             Kernel::Unweight => "mf_unweight",
             Kernel::CarryA => "mf_carry_a",
             Kernel::CarryB => "mf_carry_b",
+            Kernel::Weight32 => "mf_weight32",
+            Kernel::CarryB32 => "mf_carry_b32",
         }
     }
 
@@ -403,13 +451,13 @@ impl Kernel {
     pub fn params(self) -> &'static [Param] {
         use Param::{Ptr, Scalar};
         match self {
-            Kernel::Weight => &[Ptr, Ptr, Scalar, Scalar, Scalar],
+            Kernel::Weight | Kernel::Weight32 => &[Ptr, Ptr, Scalar, Scalar, Scalar],
             Kernel::FwdStage | Kernel::InvStage => &[Ptr, Ptr, Scalar, Scalar, Scalar],
             Kernel::Sqr => &[Ptr, Scalar],
             Kernel::Mul => &[Ptr, Ptr, Scalar],
             Kernel::Unweight => &[Ptr, Ptr, Scalar, Scalar, Scalar, Scalar],
             Kernel::CarryA => &[Ptr, Ptr, Scalar, Scalar, Scalar, Scalar, Scalar],
-            Kernel::CarryB => &[Ptr, Ptr, Scalar, Scalar, Scalar],
+            Kernel::CarryB | Kernel::CarryB32 => &[Ptr, Ptr, Scalar, Scalar, Scalar],
         }
     }
 }
@@ -447,6 +495,7 @@ impl Plan {
     pub fn buf_len(&self, b: Buf) -> usize {
         let n = self.n as usize;
         match b {
+            Buf::X | Buf::Src if self.narrow => n.div_ceil(2),
             Buf::X | Buf::Src | Buf::Tw | Buf::Z | Buf::A => n,
             Buf::T | Buf::T2 => 2 * n,
         }
@@ -469,7 +518,11 @@ impl Plan {
         let (n, p) = (self.n, u64::from(self.p));
         let src = if buf == Buf::T { Buf::X } else { Buf::Src };
         out.push(Launch {
-            kernel: Kernel::Weight,
+            kernel: if self.narrow {
+                Kernel::Weight32
+            } else {
+                Kernel::Weight
+            },
             threads: n,
             args: vec![
                 Arg::Buf(buf),
@@ -539,7 +592,11 @@ impl Plan {
             ],
         });
         out.push(Launch {
-            kernel: Kernel::CarryB,
+            kernel: if self.narrow {
+                Kernel::CarryB32
+            } else {
+                Kernel::CarryB
+            },
             threads: n,
             args: vec![
                 Arg::Buf(Buf::X),
@@ -576,6 +633,35 @@ impl Plan {
         });
         self.back(0, &mut v);
         v
+    }
+
+    /// This plan with narrow registers. Every word fits: w_max <= 30 bounds
+    /// every stored word by 2^29 + slack < 2^31.
+    pub fn with_narrow(mut self) -> Plan {
+        debug_assert!(self.word_bound < 1 << 31);
+        self.narrow = true;
+        self
+    }
+
+    /// Register contents for `words` (one word per u64): unchanged, or two
+    /// 32-bit words per element when narrow.
+    pub fn pack(&self, words: &[u64]) -> Vec<u64> {
+        if !self.narrow {
+            return words.to_vec();
+        }
+        let mut out = vec![0u64; self.buf_len(Buf::X)];
+        for (i, &w) in words.iter().enumerate() {
+            narrow_set(&mut out, i as u64, w as i64);
+        }
+        out
+    }
+
+    /// Inverse of [`Plan::pack`].
+    pub fn unpack(&self, reg: &[u64]) -> Vec<u64> {
+        if !self.narrow {
+            return reg.to_vec();
+        }
+        (0..self.n).map(|i| narrow_get(reg, i) as u64).collect()
     }
 
     // ------------------------------------------- exact host conversions ----
@@ -724,6 +810,8 @@ pub fn execute(l: &Launch, bufs: &mut Buffers) {
         Kernel::Unweight => k_unweight(&mut out, &inp, s[0], s[1], s[2], s[3]),
         Kernel::CarryA => k_carry_a(&mut out, &inp, s[0], s[1], s[2], s[3], s[4]),
         Kernel::CarryB => k_carry_b(&mut out, &inp, s[0], s[1], s[2]),
+        Kernel::Weight32 => k_weight32(&mut out, &inp, s[0], s[1], s[2]),
+        Kernel::CarryB32 => k_carry_b32(&mut out, &inp, s[0], s[1], s[2]),
     }
     if let Some(&b) = ptrs.get(1) {
         *bufs.get_mut(b) = inp;
@@ -824,6 +912,29 @@ mod tests {
             }
             assert_eq!(add(a, Q - 1 - a.min(Q - 1)), Q - 1);
             assert_eq!(sub(a, a), 0);
+        }
+    }
+
+    /// Narrow registers give the same squarings and products as wide ones.
+    #[test]
+    fn narrow_registers_match_wide_ones() {
+        for p in [127u32, 4423, 86243] {
+            let wide = plan(p).unwrap();
+            let narrow = wide.clone().with_narrow();
+            let x = Residue::from_u64(p, 3);
+            let run = |pl: &Plan| {
+                let mut b = Buffers::new(pl);
+                b.x = pl.pack(&pl.to_words(&x));
+                execute_all(&pl.square_launches(0), &mut b);
+                b.src = b.x.clone();
+                execute_all(&pl.square_launches(-2), &mut b);
+                execute_all(&pl.mul_launches(), &mut b);
+                pl.from_words(&pl.unpack(&b.x)).unwrap()
+            };
+            assert_eq!(run(&wide), run(&narrow), "p = {p}");
+            let words = wide.to_words(&x);
+            assert_eq!(narrow.unpack(&narrow.pack(&words)), words);
+            assert_eq!(narrow.buf_len(Buf::X), (wide.n as usize).div_ceil(2));
         }
     }
 

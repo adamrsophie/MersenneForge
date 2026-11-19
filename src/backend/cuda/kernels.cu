@@ -105,6 +105,22 @@ extern "C" __global__ void mf_weight(u64* t, const u64* x, u64 n, u64 p, u64 kin
     t[2 * i + 1] = 0;
 }
 
+// Narrow registers (opt-in, MERSENNE_FORGE_CUDA_NARROW=1): the residue
+// buffers X and Src hold each balanced word as a 32-bit int, two per 64-bit
+// element (word 2j in the low half). Words are bounded by
+// 2^(w_max - 1) + slack < 2^30 (w_max <= 30), so they fit. This is the one
+// exception to the 64-bit element rule: the pointer still addresses 64-bit
+// elements at the interface and is viewed as int inside the kernel. Only
+// the register traffic of the weight and the last carry pass shrinks.
+extern "C" __global__ void mf_weight32(u64* t, const u64* x, u64 n, u64 p, u64 kinv) {
+    u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    i64 v = (i64)((const int*)x)[i];
+    u64 m = v < 0 ? (u64)(v + (i64)MF_Q) : (u64)v;
+    t[2 * i] = mf_rotl(m, mf_weight_shift(n, p, kinv, i));
+    t[2 * i + 1] = 0;
+}
+
 // One decimation-in-frequency radix-2 stage (Gentleman-Sande), natural order
 // in, bit-reversed order out after all stages. h is the half span; stride is
 // n / (2 h), so tw[stride * j] = w_(2h)^j. n / 2 threads, one butterfly each;
@@ -216,4 +232,15 @@ extern "C" __global__ void mf_carry_b(u64* x, const u64* a, u64 n, u64 p, u64 lo
     i64 d = mf_low((i64)a[k], mf_width(p, log_n, k));
     i64 c = mf_carry((i64)a[prev], mf_width(p, log_n, prev));
     x[k] = (u64)(d + c);
+}
+
+// mf_carry_b writing a narrow register (see mf_weight32). Each thread writes
+// its own 32-bit half of a 64-bit element.
+extern "C" __global__ void mf_carry_b32(u64* x, const u64* a, u64 n, u64 p, u64 log_n) {
+    u64 k = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    u64 prev = (k - 1) & (n - 1);
+    i64 d = mf_low((i64)a[k], mf_width(p, log_n, k));
+    i64 c = mf_carry((i64)a[prev], mf_width(p, log_n, prev));
+    ((int*)x)[k] = (int)(d + c);
 }

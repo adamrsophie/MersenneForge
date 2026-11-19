@@ -53,6 +53,7 @@ fn open(p: u32) -> CudaBackend {
         p,
         &CudaOptions {
             device: Some(ordinal()),
+            ..CudaOptions::default()
         },
     )
     .unwrap_or_else(|e| panic!("CUDA backend for p={p} failed to open: {e}"))
@@ -285,12 +286,24 @@ fn error_paths() {
     require_device();
     for p in [lo - 1, hi + 1] {
         assert!(matches!(
-            CudaBackend::new(p, &CudaOptions { device: None }),
+            CudaBackend::new(
+                p,
+                &CudaOptions {
+                    device: None,
+                    ..CudaOptions::default()
+                }
+            ),
             Err(BackendError::Unsupported(_))
         ));
     }
     assert!(matches!(
-        CudaBackend::new(127, &CudaOptions { device: Some(9999) }),
+        CudaBackend::new(
+            127,
+            &CudaOptions {
+                device: Some(9999),
+                ..CudaOptions::default()
+            }
+        ),
         Err(BackendError::Unsupported(_))
     ));
 

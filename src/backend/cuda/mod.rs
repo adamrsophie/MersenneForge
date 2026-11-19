@@ -99,9 +99,13 @@ pub fn nvrtc_options(major: i32, minor: i32) -> Vec<String> {
 /// Squarings per captured CUDA graph (opt-in graph replay).
 const GRAPH_ITERS: u64 = 32;
 
+#[derive(Debug, Clone, Default)]
 pub struct CudaOptions {
     /// CUDA device ordinal as listed by probe(). None: device 0.
     pub device: Option<u32>,
+    /// Narrow registers (also enabled by MERSENNE_FORGE_CUDA_NARROW=1): two
+    /// 32-bit words per 64-bit element in the residue buffers.
+    pub narrow: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -329,11 +333,14 @@ pub struct CudaBackend {
 impl CudaBackend {
     pub fn new(p: u32, opts: &CudaOptions) -> BackendResult<CudaBackend> {
         let (lo, hi) = supported_exponents();
-        let plan = model::plan(p).ok_or_else(|| {
+        let mut plan = model::plan(p).ok_or_else(|| {
             BackendError::Unsupported(format!(
                 "exponent {p} is outside the CUDA range {lo}..={hi}"
             ))
         })?;
+        if opts.narrow || std::env::var("MERSENNE_FORGE_CUDA_NARROW").is_ok_and(|v| v == "1") {
+            plan = plan.with_narrow();
+        }
         let ordinal = opts.device.unwrap_or(0);
         match catch_unwind(AssertUnwindSafe(|| Self::open(plan, ordinal))) {
             Ok(r) => r,
@@ -551,7 +558,7 @@ impl CudaBackend {
 
     fn read_residue(&mut self, r: Reg) -> BackendResult<Residue> {
         let words = self.read_words(r);
-        let words = self.note(words)?;
+        let words = self.plan.unpack(&self.note(words)?);
         self.plan
             .from_words(&words)
             .map_err(|e| BackendError::Fault(format!("export: {e}")))
@@ -576,10 +583,15 @@ impl Backend for CudaBackend {
         BackendIdentity {
             kind: "cuda".into(),
             build: self.build.clone(),
-            plan: if self.graphs.is_some() {
-                format!("{} graphs", plan_name(self.plan.n))
-            } else {
-                plan_name(self.plan.n)
+            plan: {
+                let mut name = plan_name(self.plan.n);
+                if self.plan.narrow {
+                    name.push_str(" narrow");
+                }
+                if self.graphs.is_some() {
+                    name.push_str(" graphs");
+                }
+                name
             },
             device: self.device.clone(),
         }
@@ -615,7 +627,7 @@ impl Backend for CudaBackend {
             )));
         }
         self.reg(r)?;
-        let words = self.plan.to_words(x);
+        let words = self.plan.pack(&self.plan.to_words(x));
         let mut dst = self
             .regs
             .remove(&r.0)
@@ -759,9 +771,15 @@ mod tests {
     fn out_of_range_exponent_is_unsupported_without_a_driver() {
         let (lo, hi) = supported_exponents();
         for p in [2, 7, lo - 1, hi + 1] {
-            let e = CudaBackend::new(p, &CudaOptions { device: None })
-                .err()
-                .unwrap();
+            let e = CudaBackend::new(
+                p,
+                &CudaOptions {
+                    device: None,
+                    ..CudaOptions::default()
+                },
+            )
+            .err()
+            .unwrap();
             assert!(
                 matches!(e, BackendError::Unsupported(ref m) if m.contains("outside")),
                 "{p}: {e}"

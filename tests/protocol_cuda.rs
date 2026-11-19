@@ -11,8 +11,14 @@ use mersenne_forge::backend::cpu::CpuBackend;
 use mersenne_forge::backend::cuda::{CudaBackend, CudaOptions};
 
 fn mk(p: u32) -> CudaBackend {
-    CudaBackend::new(p, &CudaOptions { device: None })
-        .expect("a CUDA device is required for these tests")
+    CudaBackend::new(
+        p,
+        &CudaOptions {
+            device: None,
+            ..CudaOptions::default()
+        },
+    )
+    .expect("a CUDA device is required for these tests")
 }
 
 protocol_suite!(mk);

@@ -129,7 +129,13 @@ fn open_gpu(_p: u32, _device: Option<u32>) -> BackendResult<Box<dyn Backend>> {
 #[cfg(feature = "cuda")]
 fn open_cuda(p: u32, device: Option<u32>) -> BackendResult<Box<dyn Backend>> {
     use crate::backend::cuda::{CudaBackend, CudaOptions};
-    Ok(Box::new(CudaBackend::new(p, &CudaOptions { device })?))
+    Ok(Box::new(CudaBackend::new(
+        p,
+        &CudaOptions {
+            device,
+            ..CudaOptions::default()
+        },
+    )?))
 }
 
 #[cfg(not(feature = "cuda"))]
