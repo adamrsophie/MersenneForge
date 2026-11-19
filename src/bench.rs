@@ -706,19 +706,36 @@ fn external_run(
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = cmd.spawn().map_err(|e| format!("{prog}: {e}"))?;
+    // A waiter thread blocks in `wait` and stamps the exit time itself, so
+    // the measured time has no polling delay; this thread only watches for
+    // a stop request or the timeout.
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let r = child.wait();
+        let _ = tx.send(Instant::now());
+        r
+    });
     let mut stopped = false;
-    let status = loop {
-        if let Some(s) = child.try_wait().map_err(|e| e.to_string())? {
-            break Some(s);
+    let mut killed = false;
+    let end = loop {
+        match rx.recv_timeout(Duration::from_millis(5)) {
+            Ok(t) => break t,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break Instant::now(),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
         stopped = stop.is_some_and(|s| s.load(Ordering::SeqCst));
-        if stopped || deadline.is_some_and(|d| Instant::now() >= d) {
-            kill_tree(&mut child);
-            break None;
+        if !killed && (stopped || deadline.is_some_and(|d| Instant::now() >= d)) {
+            kill_group(pid);
+            killed = true;
         }
-        std::thread::sleep(Duration::from_millis(5));
     };
-    let wall = start.elapsed().as_secs_f64();
+    let waited = waiter
+        .join()
+        .map_err(|_| "the waiter thread panicked".to_string())?
+        .map_err(|e| e.to_string())?;
+    let status = (!killed).then_some(waited);
+    let wall = end.duration_since(start).as_secs_f64();
     let (st, code, error) = match status {
         Some(s) if s.success() => ("completed", s.code(), None),
         Some(s) => ("failed", s.code(), Some("nonzero exit".to_string())),
@@ -736,20 +753,16 @@ fn external_run(
     })
 }
 
-/// Kill a child started as a process group leader and its whole group, then
-/// reap the child.
-fn kill_tree(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        // `kill -KILL -<pgid>` signals every process in the group.
+/// Kill the process group led by `pid` (a child started as a group leader),
+/// and the leader itself; the waiter thread then reaps it.
+fn kill_group(pid: u32) {
+    for target in [format!("-{pid}"), pid.to_string()] {
         let _ = std::process::Command::new("kill")
-            .args(["-KILL", &format!("-{}", child.id())])
+            .args(["-KILL", &target])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
     }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// Render a recorded JSON output again, as JSON or CSV by the extension of
