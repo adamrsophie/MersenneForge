@@ -254,12 +254,12 @@ fn an_interrupted_assignment_resumes_in_the_next_session() {
 fn an_unrunnable_assignment_does_not_block_the_queue() {
     let dir = tempfile::tempdir().unwrap();
     let todo = dir.path().join("worktodo.txt");
-    std::fs::write(&todo, "PRP=1,2,1279,-1,75,0,3,5\nTest=127\n").unwrap();
+    std::fs::write(&todo, "PRP=1,2,1279,-1,75,0,3,2\nTest=127\n").unwrap();
     let o = work(dir.path(), &[]);
     assert!(String::from_utf8_lossy(&o.stderr).contains("residue type"));
     assert_eq!(
         std::fs::read_to_string(&todo).unwrap(),
-        "PRP=1,2,1279,-1,75,0,3,5\n"
+        "PRP=1,2,1279,-1,75,0,3,2\n"
     );
     assert_eq!(results(dir.path())[0]["exponent"], 127);
 }
@@ -422,4 +422,40 @@ fn supervise_runs_one_worker_per_queue() {
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(2));
+}
+
+/// A CERT line runs from the start value file next to the worktodo file,
+/// reports the hash of the squared value, and removes the file; a cofactor
+/// PRP line reports type 5 with its known factors.
+#[test]
+fn cert_and_cofactor_lines_run() {
+    use mersenne_forge::residue::Residue;
+    let dir = tempfile::tempdir().unwrap();
+    let todo = dir.path().join("worktodo.txt");
+    let start = Residue::from_u64(127, 0xdead_beef);
+    let cert = dir.path().join("M127.cert");
+    std::fs::write(&cert, start.to_proof_bytes()).unwrap();
+    std::fs::write(
+        &todo,
+        "PRP=1,2,23,-1,60,0,\"47\"\nCert=0123456789ABCDEF0123456789ABCDEF,1,2,127,-1,500\n",
+    )
+    .unwrap();
+    let o = work(dir.path(), &[]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let r = results(dir.path());
+    // CERT first.
+    assert_eq!(r[0]["worktype"], "Cert");
+    let want = mersenne_forge::cert::hash(&mersenne_forge::oracle::square_n(&start, 500));
+    assert_eq!(r[0]["sha3-hash"].as_str(), Some(want.as_str()));
+    assert!(!cert.exists());
+    assert_eq!(r[1]["worktype"], "PRP-3");
+    assert_eq!(r[1]["status"], "P", "M23 / 47 = 178481 is prime");
+    assert_eq!(r[1]["residue-type"], 5);
+    assert_eq!(r[1]["known-factors"][0], "47");
+    assert_eq!(std::fs::read_to_string(&todo).unwrap(), "");
 }

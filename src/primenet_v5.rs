@@ -245,6 +245,19 @@ pub fn assignment_line(r: &BTreeMap<String, String>) -> Result<String, String> {
         return Err(format!("bad assignment key {aid:?}"));
     }
     let n = get("n")?;
+    // Bit depths and tests saved come as decimals ("72.0"); written as
+    // AutoPrimeNet writes them: whole bits for TF and LL lines, the
+    // shortest form otherwise.
+    let num = |k: &str| -> Result<f64, String> {
+        get(k)?
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|x| x.is_finite() && *x >= 0.0)
+            .ok_or_else(|| format!("bad {k} in the assignment reply"))
+    };
+    let whole = |k: &str| num(k).map(|x| format!("{x:.0}"));
+    let short = |k: &str| num(k).map(|x| format!("{x}"));
     let kbnc = || -> Result<String, String> {
         Ok(format!("{},{},{n},{}", get("A")?, get("b")?, get("c")?))
     };
@@ -253,7 +266,7 @@ pub fn assignment_line(r: &BTreeMap<String, String>) -> Result<String, String> {
         100 | 101 => format!(
             "{}={aid},{n},{},{}",
             if w == 100 { "Test" } else { "DoubleCheck" },
-            get("sf")?,
+            whole("sf")?,
             get("p1")?
         ),
         150 => {
@@ -262,15 +275,15 @@ pub fn assignment_line(r: &BTreeMap<String, String>) -> Result<String, String> {
                 if r.contains_key("dc") { "PRPDC" } else { "PRP" },
                 kbnc()?
             );
-            if let (Some(sf), Some(saved)) = (r.get("sf"), r.get("saved")) {
-                s += &format!(",{sf},{saved}");
+            if r.contains_key("sf") && r.contains_key("saved") {
+                s += &format!(",{},{}", short("sf")?, short("saved")?);
                 if let (Some(base), Some(rt)) = (r.get("base"), r.get("rt")) {
                     s += &format!(",{base},{rt}");
                 }
             }
             s + &kf
         }
-        2 => format!("Factor={aid},{n},{},{}{kf}", get("sf")?, get("ef")?),
+        2 => format!("Factor={aid},{n},{},{}{kf}", whole("sf")?, whole("ef")?),
         3 => format!(
             "Pminus1={aid},{},{},{}{kf}",
             kbnc()?,
@@ -280,8 +293,8 @@ pub fn assignment_line(r: &BTreeMap<String, String>) -> Result<String, String> {
         4 => format!(
             "Pfactor={aid},{},{},{}{kf}",
             kbnc()?,
-            get("sf")?,
-            get("saved")?
+            short("sf")?,
+            short("saved")?
         ),
         5 => format!(
             "ECM2={aid},{},{},{},{}{kf}",
@@ -561,7 +574,7 @@ mod tests {
         let l = assignment_line(&reply(&[
             ("w", "2"),
             ("n", "4423"),
-            ("sf", "60"),
+            ("sf", "60.0"),
             ("ef", "61"),
         ]))
         .unwrap();

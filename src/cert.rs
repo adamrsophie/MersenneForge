@@ -89,7 +89,11 @@ pub fn result_line(
         "sha3-hash": hash,
         "squarings": c.squarings,
         "shift-count": 0,
-        "error-code": format!("{:08X}", errors.min(0xFFFF_FFFF)),
+        // Prime95 packs several error counters into error-code; this
+        // program has no such counters, so it writes zero and reports the
+        // Gerbicz check failures (all rolled back) the way its PRP lines do.
+        "error-code": "00000000",
+        "errors": {"gerbicz": errors},
         "program": {
             "name": "mersenne-forge",
             "version": env!("CARGO_PKG_VERSION"),

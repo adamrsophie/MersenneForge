@@ -302,9 +302,10 @@ pub struct PrpOutcome {
 ///   probable prime when a^(N-1) = a^(F-1) mod C (Fermat's test of C to
 ///   base a, since a^(N-1) = a^(F(C-1)) * a^(F-1)).
 ///
-/// ponytail: type 5 runs on the host with BigUint (one reduction and a
-/// power with an exponent of F's size); move it to a backend when p is
-/// large enough for that to matter.
+/// ponytail: type 5 runs on the host: one squaring of a p-bit number per
+/// bit of F (BigUint multiplication, reduced modulo 2^p - 1 by shifts) and
+/// one division by C, whose quotient is below F. Minutes at wavefront exponents; move the power to
+/// a backend if that matters.
 pub fn prp_outcome(a: &Assignment, x: &crate::residue::Residue) -> PrpOutcome {
     let p = a.exponent;
     let type1 = x.div3().div3();
@@ -322,9 +323,27 @@ pub fn prp_outcome(a: &Assignment, x: &crate::residue::Residue) -> PrpOutcome {
             if c <= BigUint::one() {
                 false
             } else {
-                let lhs = type1.to_biguint() % &c;
-                let rhs = BigUint::from(3u32).modpow(&(&f - 1u32), &c);
-                lhs == rhs
+                // w = 3^(F-1) mod N by squarings modulo N (cheap reduction)
+                // and multiplications by 3; then C | (v - w), since C | N.
+                let fold = |x: BigUint| {
+                    // x mod 2^p - 1 for x < 2^(2p + 2), by shifts and adds.
+                    let mut r = (&x & &n) + (x >> p);
+                    while r >= n {
+                        r -= &n;
+                    }
+                    r
+                };
+                let e = &f - 1u32;
+                let mut w = BigUint::one();
+                for i in (0..e.bits()).rev() {
+                    w = fold(&w * &w);
+                    if e.bit(i) {
+                        w = fold(w * 3u32);
+                    }
+                }
+                let v = type1.to_biguint();
+                let diff = if v >= w { v - w } else { v + &n - w };
+                (diff % &c).is_zero()
             }
         }
         _ => type1 == crate::residue::Residue::from_u64(p, 1),

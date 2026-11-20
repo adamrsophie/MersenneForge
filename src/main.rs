@@ -1332,6 +1332,16 @@ fn run_cert_line(
 ) -> Result<bool, Failure> {
     use mersenne_forge::cert;
     let p = c.exponent;
+    // A result already made durable (a crash after the commit) is not
+    // computed and reported again.
+    let done_before = std::fs::read_to_string(journal_path(&w.results))
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l == c.line);
+    if done_before {
+        replace_line(&w.worktodo, &c.line, None)?;
+        return Ok(true);
+    }
     let dir = w
         .worktodo
         .parent()
@@ -1793,7 +1803,10 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
                     println!("M{}: P-1 not finished; the line stays", a.exponent);
                     return Ok(EXIT_INCOMPLETE);
                 }
-                Ok(o) => {
+                Ok(mut o) => {
+                    // A factor the line already names is not new: the
+                    // cofactor test still has to run.
+                    o.factor = o.factor.and_then(|x| fl.new_part(&x));
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0, |d| d.as_secs());
@@ -1844,7 +1857,15 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
             if resumed {
                 let (ck, _) =
                     Checkpoint::load_latest(&ckpt).map_err(|e| fail(EXIT_STATE, e.to_string()))?;
-                if ck.meta.requested.get("assignment") != Some(&json!(a)) {
+                // Compared as parsed assignments, so a checkpoint written
+                // before a field was added (it takes its default) still
+                // matches its line.
+                let stored = ck
+                    .meta
+                    .requested
+                    .get("assignment")
+                    .and_then(|v| serde_json::from_value::<wt::Assignment>(v.clone()).ok());
+                if stored.as_ref() != Some(&a) {
                     return Err(fail(
                         EXIT_STATE,
                         format!(

@@ -1,7 +1,9 @@
 # Upstream feature map
 
-This page maps what the GIMPS programs do to what this program does. It was
-written from their source: Prime95 30.19 (`commonc.c`, `commonb.c`,
+This page maps what the GIMPS programs do to what this program does. The
+programs are the ones the GIMPS download page lists: Prime95 (mprime),
+PRPLL (gpuowl), mfaktc, mfakto, Mlucas, and AutoPrimeNet. It was written
+from their source: Prime95 30.19 (`commonc.c`, `commonb.c`,
 `cert.c`, `ecm.cpp`, `primenet.c`, `primenet.h`, `proof_getdata.c`),
 gpuowl/PRPLL, mfaktc, mfakto, Mlucas, and AutoPrimeNet. Prime95's source is
 under the GIMPS license and was read for behavior and file formats only;
@@ -48,13 +50,15 @@ no code was copied. Status words are those of [STATUS.md](STATUS.md):
 | Upstream feature | Where | Here |
 |---|---|---|
 | Gerbicz checked PRP, proofs (version 2), LL with Jacobi check | Prime95, gpuowl | done |
+| Wavefront exponents (above 100,000,000) on a GPU | gpuowl | not yet: the wgpu backend's transform tops out a little above p = 10,000,000 (see `doctor`); the CPU backends and the CUDA backend reach further, CUDA unrun |
+| Speed comparable to gpuowl and Prime95 | gpuowl, Prime95 | not measured: no tuned baseline has been run (STATUS F16) |
 | CERT squarings with SHA3-256 hash | Prime95, gpuowl | written |
 | GPU trial factoring to 2^95 | mfaktc, mfakto | written (WGSL, three word Montgomery); no CUDA or OpenCL kernel |
 | GPU sieving, 4620 class split, `MoreClasses` | mfaktc, mfakto | not planned: the host sieves and batches candidates |
 | P-1 stage 2 with prime pairing and polynomial multiplication | Prime95, gpuowl | not planned now: stage 2 here is one prime at a time |
 | ECM on Edwards curves, GMP-ECM param 3, big stage 2 | Prime95 | not planned now: Montgomery curves, Suyama sigma, standard continuation |
 | P+1 stage 2 | Prime95 | written (one Lucas ladder per prime) |
-| Self test (mfaktc `-st`, Prime95 torture test) | mfaktc, Prime95 | written: `selftest` |
+| Self test (mfaktc `-st`, Prime95 torture test) | mfaktc, Prime95 | written: `selftest` checks correctness; it is not a stress test with heat and memory load |
 | FFT tuning (`-tune`, `-ctune`) | gpuowl | written: `tune` over the opt-in variants |
 | Several workers, one per device (`-workers`, `-pool`) | gpuowl | written: `supervise` runs one `work` per device; a shared pool file is not planned |
 
