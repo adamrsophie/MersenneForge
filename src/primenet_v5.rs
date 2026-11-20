@@ -107,6 +107,41 @@ pub fn send(params: &[(&str, String)]) -> Result<BTreeMap<String, String>, Strin
     parse_reply(&text)
 }
 
+/// Download the CERT start value of assignment `aid` to `dest`, as
+/// AutoPrimeNet does: the reply is 32 hex digits of MD5 followed by the
+/// value, and the value is kept only when its MD5 matches.
+pub fn download_cert(aid: &str, dest: &std::path::Path) -> Result<(), String> {
+    if aid.len() != 32 || !aid.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("bad assignment ID {aid:?}"));
+    }
+    let tmp = dest.with_extension("cert.part");
+    crate::primenet::curl(&[
+        "--output".into(),
+        tmp.display().to_string(),
+        "--url".into(),
+        format!("{}proof_get_data/?aid={aid}", crate::primenet::BASE_URL),
+    ])?;
+    let bytes = std::fs::read(&tmp).map_err(|e| format!("{}: {e}", tmp.display()));
+    let _ = std::fs::remove_file(&tmp);
+    let bytes = bytes?;
+    if bytes.len() <= 32 {
+        return Err("the CERT start value reply is too short".into());
+    }
+    let (sum, value) = bytes.split_at(32);
+    let want = String::from_utf8_lossy(sum).to_ascii_lowercase();
+    let got: String = crate::worktodo::md5(value)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if want != got {
+        return Err(format!(
+            "MD5 of the start value is {got}, the server said {want}"
+        ));
+    }
+    crate::checkpoint::write_atomic(dest, value, false)
+        .map_err(|e| format!("{}: {e}", dest.display()))
+}
+
 /// A new computer GUID: 32 lowercase hex digits from the system's random
 /// source.
 pub fn new_guid() -> Result<String, String> {

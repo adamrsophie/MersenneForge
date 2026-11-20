@@ -2203,6 +2203,16 @@ fn cmd_primenet_v5(dir: &Path, action: V5Action) -> Result<u8, Failure> {
             for _ in 0..count {
                 let r = v5::send(&v5::assignment_params(&guid, worker, cert)).map_err(net)?;
                 let line = v5::assignment_line(&r).map_err(net)?;
+                // A CERT line needs its start value next to the worktodo file.
+                if let Some(c) = mersenne_forge::cert::parse_cert_line(&line).map_err(net)? {
+                    let wdir = worktodo
+                        .parent()
+                        .filter(|d| !d.as_os_str().is_empty())
+                        .unwrap_or(Path::new("."));
+                    let aid = c.aid.clone().unwrap_or_default();
+                    v5::download_cert(&aid, &mersenne_forge::cert::start_path(wdir, c.exponent))
+                        .map_err(net)?;
+                }
                 pn::append_line(&worktodo, &line).map_err(state)?;
                 println!("{line}");
             }
