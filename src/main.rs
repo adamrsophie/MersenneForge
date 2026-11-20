@@ -78,6 +78,66 @@ enum JacobiArg {
 }
 
 #[derive(Subcommand)]
+enum V5Action {
+    /// Register (or update) this computer, creating its GUID when needed.
+    Register {
+        /// PrimeNet user ID; none registers anonymously.
+        #[arg(long)]
+        user: Option<String>,
+        #[arg(long)]
+        computer: Option<String>,
+        #[arg(long, default_value = "unknown")]
+        cpu: String,
+        #[arg(long, default_value_t = 3000)]
+        mhz: u32,
+        #[arg(long, default_value_t = 8192)]
+        memory_mib: u64,
+        #[arg(long, default_value_t = 1024)]
+        l2_kib: u32,
+        #[arg(long, default_value_t = 24)]
+        hours: u32,
+        /// Work preference (PRP, PRP_DC, LL_DC, ... or a number).
+        #[arg(long)]
+        worktype: Option<String>,
+    },
+    /// Get assignments and append them to the worktodo file.
+    Fetch {
+        #[arg(long, default_value = "worktodo.txt")]
+        worktodo: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        count: u32,
+        #[arg(long, default_value_t = 0)]
+        worker: u32,
+        /// CERT work only.
+        #[arg(long)]
+        cert: bool,
+    },
+    /// Send the result lines not sent yet.
+    Submit {
+        #[arg(long, default_value = "results.txt")]
+        results: PathBuf,
+    },
+    /// Report progress on one assignment.
+    Progress {
+        #[arg(long)]
+        aid: String,
+        /// Percent done.
+        #[arg(long)]
+        percent: f64,
+        /// Hours to completion.
+        #[arg(long)]
+        eta_hours: f64,
+        #[arg(long, default_value_t = 0)]
+        worker: u32,
+    },
+    /// Give one assignment back.
+    Unreserve {
+        #[arg(long)]
+        aid: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// Report backends, build identity, supported ranges, and (with
     /// --exponent) per backend memory figures.
@@ -266,6 +326,16 @@ enum Cmd {
         /// Holds the session cookies and the sent and refused logs.
         #[arg(long, default_value = "primenet")]
         state_dir: PathBuf,
+    },
+    /// The PrimeNet v5 API, the protocol Prime95 and AutoPrimeNet speak:
+    /// register this computer, fetch assignments, send results, report
+    /// progress, unreserve. NOT TESTED against the PrimeNet server.
+    PrimenetV5 {
+        /// Holds the computer GUID and the log of results sent.
+        #[arg(long, default_value = "primenet")]
+        state_dir: PathBuf,
+        #[command(subcommand)]
+        action: V5Action,
     },
     /// Trial factor 2^p - 1 between 2^from and 2^to on the CPU. Exit 0 with
     /// or without a factor; factors are checked before they are printed.
@@ -2066,6 +2136,138 @@ fn tf_on_gpu(
     ))
 }
 
+fn cmd_primenet_v5(dir: &Path, action: V5Action) -> Result<u8, Failure> {
+    use mersenne_forge::primenet as pn;
+    use mersenne_forge::primenet_v5 as v5;
+    let state = |e: String| fail(EXIT_STATE, e);
+    let net = |e: String| fail(EXIT_EXECUTION, e);
+    create_dir_all_durable(dir).map_err(|e| state(format!("{}: {e}", dir.display())))?;
+    // A GUID file holds one line; it is created once and kept.
+    let id = |name: &str| -> Result<String, Failure> {
+        let path = dir.join(name);
+        if let Ok(t) = std::fs::read_to_string(&path) {
+            return Ok(t.trim().to_string());
+        }
+        let g = v5::new_guid().map_err(state)?;
+        pn::append_line(&path, &g).map_err(state)?;
+        Ok(g)
+    };
+    let guid = id("guid")?;
+    match action {
+        V5Action::Register {
+            user,
+            computer,
+            cpu,
+            mhz,
+            memory_mib,
+            l2_kib,
+            hours,
+            worktype,
+        } => {
+            let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
+            let m = v5::Machine {
+                guid: guid.clone(),
+                hardware_guid: id("hardware-guid")?,
+                cpu_brand: cpu,
+                cpu_features: String::new(),
+                l1_kib: 32,
+                l2_kib,
+                cores,
+                threads_per_core: 1,
+                memory_mib,
+                mhz,
+                hours_per_day: hours,
+                user,
+                computer_name: computer,
+            };
+            let r = v5::send(&v5::register_params(&m)).map_err(net)?;
+            println!(
+                "registered {guid} as user {:?}, computer {:?}",
+                r.get("u").map_or("", String::as_str),
+                r.get("cn").map_or("", String::as_str)
+            );
+            if let Some(w) = worktype {
+                let code = pn::worktype_code(&w)
+                    .ok_or_else(|| fail(2, format!("unknown work type {w:?}")))?;
+                v5::send(&v5::options_params(&guid, 0, code)).map_err(net)?;
+                println!("work preference {code}");
+            }
+            Ok(0)
+        }
+        V5Action::Fetch {
+            worktodo,
+            count,
+            worker,
+            cert,
+        } => {
+            for _ in 0..count {
+                let r = v5::send(&v5::assignment_params(&guid, worker, cert)).map_err(net)?;
+                let line = v5::assignment_line(&r).map_err(net)?;
+                pn::append_line(&worktodo, &line).map_err(state)?;
+                println!("{line}");
+            }
+            Ok(0)
+        }
+        V5Action::Submit { results } => {
+            let log = dir.join("v5-sent.txt");
+            let sent = std::fs::read_to_string(&log).unwrap_or_default();
+            let text = std::fs::read_to_string(&results)
+                .map_err(|e| state(format!("{}: {e}", results.display())))?;
+            let mut failed = 0;
+            for line in text.lines().filter(|l| l.trim_start().starts_with('{')) {
+                if sent.lines().any(|s| s == line) {
+                    continue;
+                }
+                let params = match v5::result_params(&guid, line) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("not sent: {e}: {line}");
+                        continue;
+                    }
+                };
+                match v5::send(&params) {
+                    Ok(r) => {
+                        pn::append_line(&log, line).map_err(state)?;
+                        println!(
+                            "sent: {}",
+                            r.get("pnErrorDetail").map_or("", String::as_str)
+                        );
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("refused or failed: {e}: {line}");
+                    }
+                }
+            }
+            Ok(if failed == 0 { 0 } else { EXIT_EXECUTION })
+        }
+        V5Action::Progress {
+            aid,
+            percent,
+            eta_hours,
+            worker,
+        } => {
+            let eta = (eta_hours.max(0.0) * 3600.0) as u64;
+            v5::send(&v5::progress_params(
+                &guid,
+                &aid,
+                worker,
+                percent / 100.0,
+                eta,
+                86_400,
+            ))
+            .map_err(net)?;
+            println!("progress sent for {aid}");
+            Ok(0)
+        }
+        V5Action::Unreserve { aid } => {
+            v5::send(&v5::unreserve_params(&guid, &aid)).map_err(net)?;
+            println!("unreserved {aid}");
+            Ok(0)
+        }
+    }
+}
+
 fn cmd_tune(p: u32, kind: BackendKind, device: Option<u32>, iters: u64) -> Result<u8, Failure> {
     use mersenne_forge::backend::Backend;
     let unsupported =
@@ -2651,7 +2853,8 @@ fn main() -> ExitCode {
         | Cmd::Status { .. }
         | Cmd::Power { .. }
         | Cmd::CheckpointExport { .. }
-        | Cmd::Primenet { .. } => false,
+        | Cmd::Primenet { .. }
+        | Cmd::PrimenetV5 { .. } => false,
     };
     let _ = ctrlc::set_handler(|| {
         if STOP.swap(true, Ordering::SeqCst) {
@@ -2948,6 +3151,7 @@ fn main() -> ExitCode {
             }
             Ok(0)
         }
+        Cmd::PrimenetV5 { state_dir, action } => cmd_primenet_v5(&state_dir, action),
         Cmd::Primenet {
             user,
             password_file,

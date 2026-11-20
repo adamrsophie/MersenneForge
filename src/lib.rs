@@ -16,6 +16,7 @@ pub mod factor;
 pub mod ll;
 pub mod oracle;
 pub mod primenet;
+pub mod primenet_v5;
 pub mod proof;
 pub mod prp;
 pub mod residue;
@@ -73,6 +74,7 @@ const BUILD_SOURCES: &[(&str, &[u8])] = &[
     ("src/main.rs", include_bytes!("main.rs")),
     ("src/oracle.rs", include_bytes!("oracle.rs")),
     ("src/primenet.rs", include_bytes!("primenet.rs")),
+    ("src/primenet_v5.rs", include_bytes!("primenet_v5.rs")),
     ("src/proof.rs", include_bytes!("proof.rs")),
     ("src/prp.rs", include_bytes!("prp.rs")),
     ("src/residue.rs", include_bytes!("residue.rs")),

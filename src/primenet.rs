@@ -52,7 +52,7 @@ fn private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     o.open(path)?.write_all(bytes)
 }
 
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
@@ -80,7 +80,7 @@ fn primenet_url(url: &str) -> Result<String, String> {
 /// Run curl with `args`; return its stdout. Every URL goes after `--url`
 /// so it can never be read as an option. `--fail` is not used, because
 /// PrimeNet reports errors in the page body.
-fn curl(args: &[String]) -> Result<String, String> {
+pub(crate) fn curl(args: &[String]) -> Result<String, String> {
     let o = std::process::Command::new("curl")
         .args([
             "--silent",
