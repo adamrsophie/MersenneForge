@@ -2005,9 +2005,8 @@ fn tf_on_gpu(
     let tf = GpuTf::new(device).map_err(|e| fail(EXIT_UNSUPPORTED, e))?;
     mersenne_forge::factor::trial_factor_with(p, from, to, None, stop, &mut |_| {}, &mut |p, qs| {
         let (small, big): (Vec<u128>, Vec<u128>) = qs.iter().partition(|&&q| q < Q_LIMIT);
-        let small64: Vec<u64> = small.iter().map(|&q| q as u64).collect();
-        let mut hits: Vec<u128> = match tf.test(p, &small64)? {
-            Some(h) => h.into_iter().map(u128::from).collect(),
+        let mut hits: Vec<u128> = match tf.test(p, &small)? {
+            Some(h) => h,
             // More hits than slots: the host tests this batch.
             None => small
                 .iter()

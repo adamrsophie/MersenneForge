@@ -1,8 +1,9 @@
 // Copyright (C) 2026 Adam R Sophie. GPL-3.0-only.
 //
-// Trial factoring of 2^p - 1: for each candidate q < 2^63 (odd), decide
-// whether 2^p = 1 mod q. Montgomery arithmetic with R = 2^64 on two 32-bit
-// words (CIOS), 32 x 32 bit products from 16-bit limbs. Every hit is checked
+// Trial factoring of 2^p - 1: for each candidate q < 2^95 (odd), decide
+// whether 2^p = 1 mod q. Montgomery arithmetic with R = 2^96 on three
+// 32-bit words (CIOS), 32 x 32 bit products from 16-bit limbs. The 2^95
+// bound is mfaktc's and mfakto's (bit_max 95). Every hit is checked
 // again on the host before it is reported, so a kernel error can lose a
 // factor but never report a false one.
 
@@ -14,7 +15,8 @@ struct Params {
 }
 
 @group(0) @binding(0) var<uniform> P: Params;
-@group(0) @binding(1) var<storage, read> Q: array<vec2<u32>>;
+// Candidates as three words each, low word first.
+@group(0) @binding(1) var<storage, read> Q: array<u32>;
 @group(0) @binding(2) var<storage, read_write> HITS: array<atomic<u32>>;
 
 const WG: u32 = 256u;
@@ -47,64 +49,77 @@ fn mac(t: u32, a: u32, b: u32, c: u32) -> vec2<u32> {
     return vec2<u32>(s2, h);
 }
 
-fn ge(a: vec2<u32>, b: vec2<u32>) -> bool {
-    return a.y > b.y || (a.y == b.y && a.x >= b.x);
-}
-
-fn sub64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
-    let borrow = select(0u, 1u, a.x < b.x);
-    return vec2<u32>(a.x - b.x, a.y - b.y - borrow);
-}
-
-// 2 x mod q for x < q < 2^63 (2 x < 2^64 does not overflow).
-fn dbl(x: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
-    let d = vec2<u32>(x.x << 1u, (x.y << 1u) | (x.x >> 31u));
-    return select(d, sub64(d, q), ge(d, q));
-}
-
-// a b R^-1 mod q (CIOS, two words); ninv = -q^-1 mod 2^32.
-fn mont_mul(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>, ninv: u32) -> vec2<u32> {
-    var t0 = 0u;
-    var t1 = 0u;
-    var t2 = 0u;
-    var t3 = 0u;
-    for (var i = 0u; i < 2u; i++) {
-        let bi = select(b.x, b.y, i == 1u);
-        var r = mac(t0, a.x, bi, 0u);
-        t0 = r.x;
-        r = mac(t1, a.y, bi, r.y);
-        t1 = r.x;
-        let s = t2 + r.y;
-        t3 = select(0u, 1u, s < t2);
-        t2 = s;
-        let m = t0 * ninv;
-        r = mac(t0, m, q.x, 0u);
-        r = mac(t1, m, q.y, r.y);
-        t0 = r.x;
-        let s2 = t2 + r.y;
-        t1 = s2;
-        t2 = t3 + select(0u, 1u, s2 < t2);
+fn ge(a: vec3<u32>, b: vec3<u32>) -> bool {
+    if (a.z != b.z) {
+        return a.z > b.z;
     }
-    let t = vec2<u32>(t0, t1);
-    if (t2 != 0u || ge(t, q)) {
-        return sub64(t, q);
+    if (a.y != b.y) {
+        return a.y > b.y;
     }
-    return t;
+    return a.x >= b.x;
+}
+
+fn sub96(a: vec3<u32>, b: vec3<u32>) -> vec3<u32> {
+    let x = a.x - b.x;
+    let b0 = select(0u, 1u, a.x < b.x);
+    let y0 = a.y - b.y;
+    let y = y0 - b0;
+    let b1 = select(0u, 1u, a.y < b.y || y0 < b0);
+    return vec3<u32>(x, y, a.z - b.z - b1);
+}
+
+// 2 x mod q for x < q < 2^95 (2 x < 2^96 does not overflow).
+fn dbl(x: vec3<u32>, q: vec3<u32>) -> vec3<u32> {
+    let d = vec3<u32>(x.x << 1u, (x.y << 1u) | (x.x >> 31u), (x.z << 1u) | (x.y >> 31u));
+    return select(d, sub96(d, q), ge(d, q));
+}
+
+// a b R^-1 mod q (CIOS, three words); ninv = -q^-1 mod 2^32.
+fn mont_mul(a: vec3<u32>, b: vec3<u32>, q: vec3<u32>, ninv: u32) -> vec3<u32> {
+    var t = array<u32, 5>(0u, 0u, 0u, 0u, 0u);
+    for (var i = 0u; i < 3u; i++) {
+        let bi = b[i];
+        var c = 0u;
+        for (var j = 0u; j < 3u; j++) {
+            let r = mac(t[j], a[j], bi, c);
+            t[j] = r.x;
+            c = r.y;
+        }
+        let s = t[3] + c;
+        t[4] = select(0u, 1u, s < c);
+        t[3] = s;
+        let m = t[0] * ninv;
+        var r = mac(t[0], m, q.x, 0u);
+        c = r.y;
+        for (var j = 1u; j < 3u; j++) {
+            r = mac(t[j], m, q[j], c);
+            t[j - 1u] = r.x;
+            c = r.y;
+        }
+        let s2 = t[3] + c;
+        t[2] = s2;
+        t[3] = t[4] + select(0u, 1u, s2 < c);
+    }
+    let v = vec3<u32>(t[0], t[1], t[2]);
+    if (t[3] != 0u || ge(v, q)) {
+        return sub96(v, q);
+    }
+    return v;
 }
 
 @compute @workgroup_size(256)
 fn tf(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
     for (var i = g.x; i < P.count; i += nw.x * WG) {
-        let q = Q[i];
+        let q = vec3<u32>(Q[3u * i], Q[3u * i + 1u], Q[3u * i + 2u]);
         // -q^-1 mod 2^32 by Newton's iteration (q odd: q q = 1 mod 8).
         var x = q.x;
         for (var j = 0u; j < 4u; j++) {
             x = x * (2u - q.x * x);
         }
         let ninv = 0u - x;
-        // R mod q = 2^64 mod q by 64 doublings of 1.
-        var one = vec2<u32>(1u, 0u);
-        for (var j = 0u; j < 64u; j++) {
+        // R mod q = 2^96 mod q by 96 doublings of 1.
+        var one = vec3<u32>(1u, 0u, 0u);
+        for (var j = 0u; j < 96u; j++) {
             one = dbl(one, q);
         }
         // Montgomery form throughout: v = 2^e R mod q, from the top bit.
@@ -115,7 +130,7 @@ fn tf(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: 
                 v = dbl(v, q);
             }
         }
-        if (v.x == one.x && v.y == one.y) {
+        if (all(v == one)) {
             let slot = atomicAdd(&HITS[0], 1u);
             if (slot < P.cap) {
                 atomicStore(&HITS[slot + 1u], i);

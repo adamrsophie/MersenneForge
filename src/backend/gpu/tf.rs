@@ -1,9 +1,9 @@
 // Copyright (C) 2026 Adam R Sophie. GPL-3.0-only.
 
 //! Trial factoring on the GPU: the kernel in `tf.wgsl` tests a batch of
-//! candidate divisors q < 2^63 of 2^p - 1, and the host sieves the
-//! candidates (see [`crate::factor::trial_factor_with`]) and checks every
-//! hit again exactly. Candidates at or above 2^63 are tested on the host.
+//! candidate divisors q < 2^95 of 2^p - 1 (mfaktc's bound), and the host
+//! sieves the candidates (see [`crate::factor::trial_factor_with`]) and
+//! checks every hit again exactly. Larger candidates are tested on the host.
 
 use wgpu::util::DeviceExt;
 
@@ -11,7 +11,7 @@ use wgpu::util::DeviceExt;
 pub const TF_KERNEL: &str = include_str!("tf.wgsl");
 
 /// Largest candidate the kernel takes (exclusive).
-pub const Q_LIMIT: u128 = 1 << 63;
+pub const Q_LIMIT: u128 = 1 << 95;
 
 /// Hit slots per batch; a batch with more hits is tested on the host.
 const CAP: u32 = 64;
@@ -97,17 +97,17 @@ impl GpuTf {
     /// The candidates in `qs` (odd, below [`Q_LIMIT`]) for which
     /// 2^p = 1 mod q, by the kernel. None when the hit slots overflowed;
     /// the caller then tests the batch on the host.
-    pub fn test(&self, p: u32, qs: &[u64]) -> Result<Option<Vec<u64>>, String> {
+    pub fn test(&self, p: u32, qs: &[u128]) -> Result<Option<Vec<u128>>, String> {
         if qs.is_empty() {
             return Ok(Some(Vec::new()));
         }
-        if qs.iter().any(|&q| u128::from(q) >= Q_LIMIT || q & 1 == 0) {
-            return Err("GPU trial factoring takes odd candidates below 2^63".into());
+        if qs.iter().any(|&q| q >= Q_LIMIT || q & 1 == 0) {
+            return Err("GPU trial factoring takes odd candidates below 2^95".into());
         }
         let count = u32::try_from(qs.len()).map_err(|_| "batch too large".to_string())?;
         let words: Vec<u32> = qs
             .iter()
-            .flat_map(|&q| [q as u32, (q >> 32) as u32])
+            .flat_map(|&q| [q as u32, (q >> 32) as u32, (q >> 64) as u32])
             .collect();
         let init = |label, contents: &[u8], usage| {
             self.device
@@ -213,27 +213,37 @@ mod tests {
     use super::*;
 
     /// Known factors are hits and their neighbors are not, against the
-    /// host's exact test, across both words and near 2^63.
+    /// host's exact test, across all three words and near 2^95.
     #[test]
     fn kernel_matches_the_host_test() {
         let tf = GpuTf::new(None).expect("a hardware GPU adapter is required");
-        // 2^67 - 1 = 193707721 * 761838257287; 2^11 - 1 = 23 * 89.
-        let cases: [(u32, &[u64]); 2] = [(67, &[193707721, 761838257287]), (11, &[23, 89])];
+        // 2^67 - 1 = 193707721 * 761838257287; 2^11 - 1 = 23 * 89;
+        // 2^83 - 1 has the factor 167 and 57912614113275649087721 (76 bits).
+        let cases: [(u32, &[u128]); 3] = [
+            (67, &[193707721, 761838257287]),
+            (11, &[23, 89]),
+            (83, &[167, 57912614113275649087721]),
+        ];
         for (p, factors) in cases {
-            let mut qs: Vec<u64> = Vec::new();
+            let mut qs: Vec<u128> = Vec::new();
             for &f in factors {
-                for d in [0u64, 2, 4, 2 * u64::from(p)] {
+                for d in [0u128, 2, 4, 2 * u128::from(p)] {
                     qs.push(f + d);
                 }
             }
-            // Large odd candidates in the high word.
-            let two_p = 2 * u64::from(p);
-            for k in [(1u64 << 61) / two_p, (1u64 << 62) / two_p - 7] {
+            // Large odd candidates in the second and third words.
+            let two_p = 2 * u128::from(p);
+            for k in [
+                (1u128 << 61) / two_p,
+                (1u128 << 62) / two_p - 7,
+                (1u128 << 80) / two_p + 3,
+                (1u128 << 94) / two_p - 1,
+            ] {
                 qs.push(two_p * k + 1);
             }
             let got = tf.test(p, &qs).unwrap().unwrap();
-            let want: Vec<u64> = {
-                let mut w: Vec<u64> = qs
+            let want: Vec<u128> = {
+                let mut w: Vec<u128> = qs
                     .iter()
                     .copied()
                     .filter(|&q| {
