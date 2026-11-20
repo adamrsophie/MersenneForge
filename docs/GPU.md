@@ -239,6 +239,6 @@ Only this machine: **Apple M2, Metal backend** (macOS arm64, Rust 1.100.0,
   untangle, pointwise, and retangle pass (`sqr_packed`, `pmul_packed`; the
   derivation is in `kernels.wgsl`). The packed path cannot use the
   imaginary part fault check. `tf.wgsl` is a separate trial factoring
-  kernel. No speed claims are made.
+  kernel for candidates below 2^95 (three word Montgomery arithmetic). No speed claims are made.
 * Long-run behavior under device resets, thermal throttling, or driver
   timeouts beyond what the error paths above report.
