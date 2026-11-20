@@ -8,6 +8,7 @@
 
 pub mod backend;
 pub mod bench;
+pub mod cert;
 pub mod checkpoint;
 pub mod evidence;
 pub mod exponent;
@@ -61,6 +62,7 @@ const BUILD_SOURCES: &[(&str, &[u8])] = &[
     ),
     ("src/backend/mod.rs", include_bytes!("backend/mod.rs")),
     ("src/bench.rs", include_bytes!("bench.rs")),
+    ("src/cert.rs", include_bytes!("cert.rs")),
     ("src/checkpoint.rs", include_bytes!("checkpoint.rs")),
     ("src/evidence.rs", include_bytes!("evidence.rs")),
     ("src/exponent.rs", include_bytes!("exponent.rs")),

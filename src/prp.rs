@@ -737,6 +737,57 @@ fn final_result(p: u32, x: &Residue) -> MathResult {
     }
 }
 
+/// `start` squared `squarings` times modulo 2^p - 1, with the Gerbicz
+/// check over the whole chain (a failed check rolls back, as in a PRP
+/// test). Used by CERT work. Ok(None) when stopped first. ponytail: no
+/// checkpoint, so a stopped run starts over; CERT chains are about p / 100
+/// squarings long, so a checkpoint would rarely pay.
+pub fn gerbicz_squarings<B: Backend>(
+    be: &mut B,
+    start: &Residue,
+    squarings: u64,
+    ctl: &mut Control,
+) -> Result<(Option<Residue>, Evidence), ProtocolError> {
+    let p = be.exponent();
+    let mut evidence = Evidence {
+        backend: Some(be.identity()),
+        ..Evidence::default()
+    };
+    if start.exponent() != p || squarings == 0 {
+        return Err(ProtocolError::Config(
+            "a start value for this exponent and at least one squaring are needed".into(),
+        ));
+    }
+    let block = 1000u32;
+    let spec = Spec {
+        block: u64::from(block),
+        kend: squarings,
+        rule: StepRule {
+            base: upstream_check_step(block).expect("1000 is an upstream block"),
+            scale_for: Some(squarings),
+        },
+        max_batch: 1000,
+        proof: None,
+        completed: None,
+    };
+    let from = VerifiedState {
+        k: 0,
+        c_old: Residue::from_u64(p, 1),
+        x: start.clone(),
+    };
+    let mut cnt = Counters::default();
+    let end = run_engine(be, start, from, 0, &spec, ctl, None, &mut cnt)?;
+    evidence.gerbicz_passed = cnt.passed;
+    evidence.gerbicz_failed = cnt.failed;
+    evidence.backend_faults = cnt.faults;
+    evidence.rollbacks = cnt.rollbacks;
+    evidence.errors_total = u64::from(cnt.n_errors);
+    Ok(match end {
+        End::Done { final_x } => (Some(final_x), evidence),
+        _ => (None, evidence),
+    })
+}
+
 /// Run (or resume) a base-3 PRP test of M_p.
 pub fn run_prp<B: Backend>(
     be: &mut B,

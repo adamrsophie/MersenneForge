@@ -1222,6 +1222,52 @@ fn work_pm1(
     Ok(o)
 }
 
+/// Run one CERT line: square the start value from `M<p>.cert` (next to
+/// the worktodo file) and report the hash. Ok(true): reported, the line
+/// and the start value file removed (gpuowl removes it too); Ok(false):
+/// stopped, the line stays.
+fn run_cert_line(
+    w: &WorkArgs,
+    c: &mersenne_forge::cert::CertLine,
+    deadline: Option<Instant>,
+) -> Result<bool, Failure> {
+    use mersenne_forge::cert;
+    let p = c.exponent;
+    let dir = w
+        .worktodo
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let path = cert::start_path(dir, p);
+    let start = cert::read_start(&path, p).map_err(|e| fail(EXIT_STATE, e))?;
+    let mut be = open(w.kind, p, w.device)?;
+    let mut ctl = Control {
+        stop: Some(&STOP),
+        deadline,
+        ..Control::default()
+    };
+    let (x, ev) =
+        prp::gerbicz_squarings(&mut be, &start, c.squarings, &mut ctl).map_err(protocol_failure)?;
+    let Some(x) = x else {
+        return Ok(false);
+    };
+    let h = cert::hash(&x);
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let line = cert::result_line(
+        c,
+        &h,
+        ev.errors_total,
+        be.identity().kind.as_str(),
+        &mersenne_forge::worktodo::utc_timestamp(secs),
+    );
+    commit_line(w, &c.line, &c.line, &line.to_string(), None)?;
+    let _ = std::fs::remove_file(&path);
+    println!("M{p}: CERT of {} squarings, hash {h}", c.squarings);
+    Ok(true)
+}
+
 /// Run one factoring line. Ok(true): reported and removed; Ok(false):
 /// stopped by the budget or a stop request, the line stays.
 fn run_factor_line(
@@ -1498,9 +1544,45 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
         }
         let text = std::fs::read_to_string(&w.worktodo)
             .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", w.worktodo.display())))?;
+        // CERT lines first, as gpuowl does: they are short and the
+        // server waits on them.
+        let next_cert =
+            text.lines()
+                .find_map(|raw| match mersenne_forge::cert::parse_cert_line(raw) {
+                    Ok(Some(c)) if !skipped.contains(&c.line) => Some(c),
+                    Err(e) => {
+                        if warned.insert(e.clone()) {
+                            eprintln!("left in place: {e}");
+                        }
+                        None
+                    }
+                    _ => None,
+                });
+        if let Some(c) = next_cert {
+            w.status(
+                "running",
+                Some(&c.line),
+                json!({"done": done, "skipped": skipped.len()}),
+            );
+            match run_cert_line(w, &c, deadline) {
+                Ok(true) => done += 1,
+                Ok(false) => {
+                    println!("M{}: CERT not finished; the line stays", c.exponent);
+                    return Ok(EXIT_INCOMPLETE);
+                }
+                Err(e) => {
+                    eprintln!("left in place: M{}: {}", c.exponent, e.message);
+                    skipped.insert(c.line.clone());
+                }
+            }
+            continue;
+        }
         let mut next = None;
         let mut next_factor = None;
         for raw in text.lines() {
+            if mersenne_forge::cert::parse_cert_line(raw).is_ok_and(|c| c.is_some()) {
+                continue;
+            }
             match mersenne_forge::factor::parse_factor_line(raw) {
                 Ok(Some(f)) if f.exponent > mersenne_forge::factor::work_max_p(&f.work) => {
                     let e = format!(
