@@ -655,6 +655,122 @@ pub fn ecm(
     Ok(out)
 }
 
+/// The outcome of a P+1 run.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Pp1Outcome {
+    pub exponent: u32,
+    pub b1: u64,
+    pub b2: u64,
+    /// The start value P0 = numerator / denominator, as Prime95 reports it.
+    pub start: (u32, u32),
+    /// A checked proper factor, when one was found (it may be composite).
+    pub factor: Option<String>,
+    /// The stage that found it (1 or 2).
+    pub stage: Option<u8>,
+    /// Both stages ran to their bounds.
+    pub complete: bool,
+    pub notes: Vec<String>,
+}
+
+/// The P+1 start value for Prime95's `nth_run` field: 2/7 for the first
+/// run and 6/5 for the second, the two values Prime95 uses (each finds a
+/// factor q with q - (D/q) smooth for a different discriminant D). Later
+/// runs use (2n + 1)/(2n - 1). ponytail: Prime95 picks those at random;
+/// any value works, and a fixed one makes a run repeatable.
+pub fn pp1_start(nth_run: u32) -> (u32, u32) {
+    match nth_run {
+        0 | 1 => (2, 7),
+        2 => (6, 5),
+        n => (2 * n + 1, 2 * n - 1),
+    }
+}
+
+/// V_k(P) of the Lucas sequence V_0 = 2, V_1 = P, V_(n+1) = P V_n - V_(n-1),
+/// by the ladder on (V_m, V_(m+1)).
+fn lucas_v(m: &ModN, pv: &BigUint, k: &BigUint) -> BigUint {
+    let two = BigUint::from(2u32);
+    if k.is_zero() {
+        return two;
+    }
+    let (mut a, mut b) = (pv.clone(), m.sub(&m.mul(pv, pv), &two));
+    for i in (0..k.bits() - 1).rev() {
+        let ab = m.sub(&m.mul(&a, &b), pv);
+        if k.bit(i) {
+            a = ab;
+            b = m.sub(&m.mul(&b, &b), &two);
+        } else {
+            b = ab;
+            a = m.sub(&m.mul(&a, &a), &two);
+        }
+    }
+    a
+}
+
+/// Williams' P+1 on 2^p - 1 on the host: stage 1 computes W = V_E(P0) with
+/// E the stage 1 exponent for `b1` and tests gcd(W - 2, N); stage 2 tests
+/// gcd(prod (V_q(W) - 2), N) over primes b1 < q <= b2. Practical for small
+/// exponents only. ponytail: stage 2 runs one Lucas ladder per prime; a
+/// prime-gap continuation (as ECM's) and a device implementation are the
+/// upgrade path. `stop` is polled every few thousand primes.
+pub fn pp1(
+    p: u32,
+    b1: u64,
+    b2: u64,
+    nth_run: u32,
+    stop: &dyn Fn() -> bool,
+) -> Result<Pp1Outcome, String> {
+    crate::exponent::validate(p).map_err(|e| e.to_string())?;
+    if b1 < 2 {
+        return Err("B1 must be at least 2".into());
+    }
+    let n = modulus(p);
+    let m = ModN(&n);
+    let start = pp1_start(nth_run);
+    let mut out = Pp1Outcome {
+        exponent: p,
+        b1,
+        b2: b2.max(b1),
+        start,
+        factor: None,
+        stage: None,
+        complete: false,
+        notes: Vec::new(),
+    };
+    let den = BigUint::from(start.1) % &n;
+    let Some(inv) = mod_inverse_big(&den, &n) else {
+        return Err(format!("{} shares a factor with N", start.1));
+    };
+    let p0 = m.mul(&BigUint::from(start.0), &inv);
+    let w = lucas_v(&m, &p0, &stage1_exponent(p, b1));
+    let two = BigUint::from(2u32);
+    if let Some(f) = factor_from(p, &m.sub(&w, &two), &n, &mut out.notes) {
+        out.factor = Some(f);
+        out.stage = Some(1);
+        out.complete = true;
+        return Ok(out);
+    }
+    if b2 > b1 {
+        let mut acc = BigUint::one();
+        for (i, q) in primes_below(b2 + 1)
+            .into_iter()
+            .filter(|&q| q > b1)
+            .enumerate()
+        {
+            if i % 4096 == 4095 && stop() {
+                out.notes.push(format!("stopped in stage 2 before q = {q}"));
+                return Ok(out);
+            }
+            acc = m.mul(&acc, &m.sub(&lucas_v(&m, &w, &BigUint::from(q)), &two));
+        }
+        if let Some(f) = factor_from(p, &acc, &n, &mut out.notes) {
+            out.factor = Some(f);
+            out.stage = Some(2);
+        }
+    }
+    out.complete = true;
+    Ok(out)
+}
+
 /// a^-1 mod n, when gcd(a, n) = 1, by the extended Euclidean algorithm.
 fn mod_inverse_big(a: &BigUint, n: &BigUint) -> Option<BigUint> {
     use num_bigint::BigInt;
@@ -669,11 +785,22 @@ fn mod_inverse_big(a: &BigUint, n: &BigUint) -> Option<BigUint> {
 /// What a factoring line asks for.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum FactorWork {
-    /// `Factor=[AID,]p,bit_lo,bit_hi`
+    /// `Factor=[AID,][M]p,bit_lo,bit_hi[,"known factors"]`
     Tf { bit_lo: u32, bit_hi: u32 },
-    /// `Pminus1=[AID,]1,2,p,-1,B1,B2` or `Pfactor=[AID,]1,2,p,-1,tf_bits,tests_saved`
-    /// (Pfactor bounds are chosen here from the line's fields).
+    /// `Pminus1=[AID,]1,2,p,-1,B1,B2[,tf_bits][,B2_start][,"factors"]` or
+    /// `Pfactor=[AID,]1,2,p,-1,tf_bits,tests_saved[,"factors"]` (also the
+    /// old `Pfactor=[AID,]p,tf_bits,double_check`). Pfactor bounds are
+    /// chosen here.
     Pm1 { b1: u64, b2: u64 },
+    /// `Pplus1=[AID,]1,2,p,-1,B1,B2,nth_run[,tf_bits][,"factors"]`
+    Pp1 { b1: u64, b2: u64, nth_run: u32 },
+    /// `ECM2=` or `ECM=[AID,]1,2,p,-1,B1[,B2][,curves][,sigma][,"factors"]`
+    Ecm {
+        b1: u64,
+        b2: u64,
+        curves: u32,
+        sigma: Option<u64>,
+    },
 }
 
 /// One factoring assignment.
@@ -683,6 +810,29 @@ pub struct FactorLine {
     pub exponent: u32,
     pub aid: Option<String>,
     pub line: String,
+    /// Known factors from the line. Factors found that are among them (or
+    /// products of them) are not reported as new.
+    pub known_factors: Vec<String>,
+}
+
+impl FactorLine {
+    /// `f` with every known factor divided out, or None when nothing new
+    /// is left (f was a product of known factors).
+    pub fn new_part(&self, f: &str) -> Option<String> {
+        let mut g = BigUint::parse_bytes(f.as_bytes(), 10)?;
+        for k in &self.known_factors {
+            let Some(k) = BigUint::parse_bytes(k.as_bytes(), 10) else {
+                continue;
+            };
+            if k <= BigUint::one() {
+                continue;
+            }
+            while (&g % &k).is_zero() {
+                g /= &k;
+            }
+        }
+        (!g.is_one()).then(|| g.to_string())
+    }
 }
 
 /// Bounds for a `Pfactor=` line and for P-1 before a PRP test: stage 1
@@ -700,30 +850,46 @@ pub fn pfactor_bounds(p: u32) -> (u64, u64) {
 /// stays in place for another program.
 pub const WORK_PM1_MAX_P: u32 = 10_000_000;
 
-/// Parse a `Factor=`, `Pminus1=`, or `Pfactor=` line. `Ok(None)` for any
+/// Largest exponent `work` runs P+1 or ECM for: both run entirely on the
+/// host with arbitrary precision arithmetic.
+pub const WORK_HOST_MAX_P: u32 = 1_000_000;
+
+/// Largest exponent `work` takes a line of this kind for. Larger lines
+/// stay in place for another program.
+pub fn work_max_p(w: &FactorWork) -> u32 {
+    match w {
+        FactorWork::Tf { .. } => u32::MAX,
+        FactorWork::Pm1 { .. } => WORK_PM1_MAX_P,
+        FactorWork::Pp1 { .. } | FactorWork::Ecm { .. } => WORK_HOST_MAX_P,
+    }
+}
+
+/// Parse a `Factor=`, `Pminus1=`, `Pfactor=`, `Pplus1=`, `ECM=`, or
+/// `ECM2=` line in Prime95's forms (see `FactorWork`). `Ok(None)` for any
 /// other line (including comments), so callers try this parser first.
+/// Only Mersenne numbers (1,2,p,-1) are accepted; known factors must each
+/// divide 2^p - 1.
 pub fn parse_factor_line(raw: &str) -> Result<Option<FactorLine>, String> {
     let line = raw.trim_end_matches(['\r', '\n']);
-    let Some((kind, rest)) = line.split_once('=') else {
+    let t = match crate::worktodo::tokenize(raw) {
+        Ok(Some(t)) => t,
+        Ok(None) => return Ok(None),
+        // Not a factoring line unless it names a factoring work type.
+        Err(e) => {
+            let head = line.split(['=', ';']).next().unwrap_or("");
+            let ours = ["Factor", "Pminus1", "Pfactor", "Pplus1", "ECM", "ECM2"]
+                .iter()
+                .any(|k| head.trim().eq_ignore_ascii_case(k));
+            return if ours { Err(e) } else { Ok(None) };
+        }
+    };
+    let kind = ["Factor", "Pminus1", "Pfactor", "Pplus1", "ECM", "ECM2"]
+        .into_iter()
+        .find(|k| t.is(k));
+    let Some(kind) = kind else {
         return Ok(None);
     };
-    if !matches!(kind, "Factor" | "Pminus1" | "Pfactor") {
-        return Ok(None);
-    }
-    if line.len() > crate::worktodo::MAX_LINE || rest.contains('=') {
-        return Err(format!("malformed line: {line:?}"));
-    }
-    let mut parts: Vec<&str> = rest.split(',').map(str::trim).collect();
-    if parts.first().is_some_and(|f| f.is_empty() || *f == "N/A") {
-        parts.remove(0);
-    }
-    let mut aid = None;
-    if parts
-        .first()
-        .is_some_and(|f| f.len() == 32 && f.chars().all(|c| c.is_ascii_hexdigit()))
-    {
-        aid = Some(parts.remove(0).to_string());
-    }
+    let parts = &t.fields;
     let bad = || format!("malformed {kind} line: {line:?}");
     let int = |s: &str| -> Result<u64, String> {
         s.bytes()
@@ -732,11 +898,13 @@ pub fn parse_factor_line(raw: &str) -> Result<Option<FactorLine>, String> {
             .flatten()
             .ok_or_else(bad)
     };
+    let mersenne = parts.len() >= 4 && parts[..2] == ["1", "2"] && parts[3] == "-1";
     let (p, work) = match kind {
         "Factor" => {
             let [p, lo, hi] = parts[..] else {
                 return Err(bad());
             };
+            let p = p.strip_prefix('M').unwrap_or(p);
             let (lo, hi) = (int(lo)? as u32, int(hi)? as u32);
             (
                 int(p)?,
@@ -746,24 +914,79 @@ pub fn parse_factor_line(raw: &str) -> Result<Option<FactorLine>, String> {
                 },
             )
         }
-        _ => {
-            if parts.len() < 6 || parts[..2] != ["1", "2"] || parts[3] != "-1" {
+        "Pfactor" if !mersenne => {
+            // The old form: p,tf_bits,double_check.
+            let [p, _, _] = parts[..] else {
+                return Err(bad());
+            };
+            let p = int(p)?;
+            let (b1, b2) = pfactor_bounds(u32::try_from(p).map_err(|_| bad())?);
+            (p, FactorWork::Pm1 { b1, b2 })
+        }
+        _ if !mersenne => {
+            return Err(format!(
+                "only Mersenne numbers (1,2,p,-1) are supported: {line:?}"
+            ))
+        }
+        "Pfactor" => {
+            if parts.len() != 6 {
                 return Err(bad());
             }
             let p = int(parts[2])?;
-            if kind == "Pminus1" {
-                if parts.len() > 6 {
-                    return Err(format!(
-                        "known factors or extra fields are not supported: {line:?}"
-                    ));
-                }
-                let b1 = int(parts[4])?;
-                let b2 = int(parts[5])?;
-                (p, FactorWork::Pm1 { b1, b2 })
-            } else {
-                let (b1, b2) = pfactor_bounds(u32::try_from(p).map_err(|_| bad())?);
-                (p, FactorWork::Pm1 { b1, b2 })
+            let (b1, b2) = pfactor_bounds(u32::try_from(p).map_err(|_| bad())?);
+            (p, FactorWork::Pm1 { b1, b2 })
+        }
+        "Pminus1" => {
+            // Optional tf_bits and B2_start: stage 2 here always starts
+            // at B1, which covers any later start.
+            if !(6..=8).contains(&parts.len()) {
+                return Err(bad());
             }
+            let b1 = int(parts[4])?;
+            let b2 = int(parts[5])?;
+            (int(parts[2])?, FactorWork::Pm1 { b1, b2 })
+        }
+        "Pplus1" => {
+            if !(7..=8).contains(&parts.len()) {
+                return Err(bad());
+            }
+            let nth_run = u32::try_from(int(parts[6])?).map_err(|_| bad())?;
+            if nth_run == 0 {
+                return Err(bad());
+            }
+            (
+                int(parts[2])?,
+                FactorWork::Pp1 {
+                    b1: int(parts[4])?,
+                    b2: int(parts[5])?,
+                    nth_run,
+                },
+            )
+        }
+        _ => {
+            // ECM and ECM2.
+            if !(5..=8).contains(&parts.len()) {
+                return Err(bad());
+            }
+            let b1 = int(parts[4])?;
+            let b2 = parts.get(5).map(|x| int(x)).transpose()?.unwrap_or(0);
+            let curves = match parts.get(6) {
+                Some(x) => u32::try_from(int(x)?).map_err(|_| bad())?,
+                None => 100,
+            };
+            let sigma = parts.get(7).map(|x| int(x)).transpose()?;
+            // ponytail: B2 = 100 B1 when the line gives none; Prime95
+            // chooses its own B2 from a cost model.
+            let b2 = if b2 == 0 { b1.saturating_mul(100) } else { b2 };
+            (
+                int(parts[2])?,
+                FactorWork::Ecm {
+                    b1,
+                    b2,
+                    curves,
+                    sigma,
+                },
+            )
         }
     };
     let p = u32::try_from(p).map_err(|_| bad())?;
@@ -773,11 +996,18 @@ pub fn parse_factor_line(raw: &str) -> Result<Option<FactorLine>, String> {
             return Err(format!("bad bit range: {line:?}"));
         }
     }
+    for f in &t.known_factors {
+        let c = crate::worktodo::check_factor(p, f).map_err(|e| format!("{e}: {line:?}"))?;
+        if !c.accepted() {
+            return Err(format!("{f} is not a proper factor of 2^{p} - 1: {line:?}"));
+        }
+    }
     Ok(Some(FactorLine {
         work,
         exponent: p,
-        aid,
+        aid: t.aid,
         line: line.to_string(),
+        known_factors: t.known_factors,
     }))
 }
 
@@ -839,6 +1069,63 @@ pub fn pm1_result_line(a: &FactorLine, o: &Pm1Outcome, timestamp: &str) -> serde
     if let Some(aid) = &a.aid {
         v["aid"] = aid.clone().into();
     }
+    v
+}
+
+/// Known factors, as Prime95 adds them to a result line.
+fn put_known(v: &mut serde_json::Value, a: &FactorLine) {
+    if !a.known_factors.is_empty() {
+        v["known-factors"] = serde_json::json!(a.known_factors);
+    }
+    if let Some(aid) = &a.aid {
+        v["aid"] = aid.clone().into();
+    }
+}
+
+/// The JSON result line for a P+1 run, with Prime95's keys (`worktype`
+/// "P+1", `b1`, `b2` when stage 2 ran, `start` as "n/d"), the ones
+/// AutoPrimeNet reads.
+pub fn pp1_result_line(a: &FactorLine, o: &Pp1Outcome, timestamp: &str) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "status": if o.factor.is_some() { "F" } else { "NF" },
+        "exponent": o.exponent,
+        "worktype": "P+1",
+        "b1": o.b1,
+        "start": format!("{}/{}", o.start.0, o.start.1),
+        "program": program(),
+        "timestamp": timestamp,
+    });
+    if o.b2 > o.b1 {
+        v["b2"] = o.b2.into();
+    }
+    if let Some(f) = &o.factor {
+        v["factors"] = serde_json::json!([f]);
+    }
+    put_known(&mut v, a);
+    v
+}
+
+/// The JSON result line for an ECM run, with Prime95's keys (`worktype`
+/// "ECM", `b1`, `b2`, `curves`, and `sigma` of the curve that found a
+/// factor), the ones AutoPrimeNet reads.
+pub fn ecm_result_line(a: &FactorLine, o: &EcmOutcome, timestamp: &str) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "status": if o.factor.is_some() { "F" } else { "NF" },
+        "exponent": o.exponent,
+        "worktype": "ECM",
+        "b1": o.b1,
+        "b2": o.b2.max(o.b1),
+        "curves": o.curves,
+        "program": program(),
+        "timestamp": timestamp,
+    });
+    if let Some(f) = &o.factor {
+        v["factors"] = serde_json::json!([f]);
+    }
+    if let Some(s) = o.found_sigma {
+        v["sigma"] = s.into();
+    }
+    put_known(&mut v, a);
     v
 }
 
@@ -967,6 +1254,38 @@ mod tests {
     }
 
     #[test]
+    fn pp1_finds_a_factor_with_smooth_q_plus_1() {
+        // M29 = 233 * 1103 * 2089. With B1 = 13 (E includes 2^3, 3^2, 13,
+        // and 2 * 29), both 233 - 1 = 2^3 * 29 and 233 + 1 = 2 * 3^2 * 13
+        // divide E, so 233 is found whatever the sign of (D/233); 1103 is
+        // smooth on neither side, so the gcd is never N.
+        let mut found = false;
+        for run in 1..=2 {
+            let o = pp1(29, 13, 13, run, &|| false).unwrap();
+            if let Some(f) = &o.factor {
+                assert!(crate::worktodo::check_factor(29, f).unwrap().accepted());
+                found = true;
+            }
+            assert!(o.complete);
+        }
+        assert!(found);
+        let o = pp1(67, 100, 100, 1, &|| false).unwrap();
+        assert_eq!(o.start, (2, 7));
+        assert_eq!(pp1_start(2), (6, 5));
+        // V_n(P) mod a large modulus matches the recurrence.
+        let n = modulus(61);
+        let m = ModN(&n);
+        let pv = BigUint::from(5u32);
+        let (mut v0, mut v1) = (BigUint::from(2u32), pv.clone());
+        for k in 1..40u32 {
+            assert_eq!(lucas_v(&m, &pv, &BigUint::from(k)), v1, "k = {k}");
+            let v2 = m.sub(&m.mul(&pv, &v1), &v0);
+            v0 = v1;
+            v1 = v2;
+        }
+    }
+
+    #[test]
     fn factoring_lines_parse() {
         let a = parse_factor_line("Factor=0123456789ABCDEF0123456789ABCDEF,67,20,40")
             .unwrap()
@@ -989,7 +1308,50 @@ mod tests {
         assert_eq!(parse_factor_line("PRP=1,2,67,-1").unwrap(), None);
         assert!(parse_factor_line("Factor=67,40,20").is_err());
         assert!(parse_factor_line("Factor=68,20,40").is_err());
-        assert!(parse_factor_line("Pminus1=1,2,67,-1,1000,3000,\"193707721\"").is_err());
+        // M67 = 193707721 * 761838257287.
+        let a = parse_factor_line("Pminus1=1,2,67,-1,1000,3000,\"193707721\"")
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.known_factors, ["193707721"]);
+        assert_eq!(a.new_part("193707721"), None);
+        assert_eq!(
+            a.new_part(&(193_707_721u128 * 761_838_257_287).to_string()),
+            Some("761838257287".into())
+        );
+        assert!(parse_factor_line("Pminus1=1,2,67,-1,1000,3000,\"7\"").is_err());
+        assert!(parse_factor_line("Pminus1=1,2,67,1,1000,3000").is_err());
+        assert_eq!(
+            parse_factor_line("B1=50000,B2=5000000;Pplus1=N/A,1,2,67,-1,1000,3000,2")
+                .unwrap()
+                .unwrap()
+                .work,
+            FactorWork::Pp1 {
+                b1: 1000,
+                b2: 3000,
+                nth_run: 2
+            }
+        );
+        assert_eq!(
+            parse_factor_line("ECM2=1,2,67,-1,1000")
+                .unwrap()
+                .unwrap()
+                .work,
+            FactorWork::Ecm {
+                b1: 1000,
+                b2: 100_000,
+                curves: 100,
+                sigma: None
+            }
+        );
+        assert_eq!(
+            parse_factor_line("factor=M67,20,40")
+                .unwrap()
+                .unwrap()
+                .exponent,
+            67
+        );
+        assert!(parse_factor_line("Pfactor=67,60,1").unwrap().is_some());
+        assert_eq!(parse_factor_line("// mfaktc comment").unwrap(), None);
         assert_eq!(
             with_pm1_done(
                 "PRP=ABCDEF0123456789ABCDEF0123456789,1,2,1279,-1,70,1.3",

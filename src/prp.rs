@@ -733,6 +733,7 @@ fn final_result(p: u32, x: &Residue) -> MathResult {
         res64: format!("{:016x}", type1.res64()),
         res2048: type1.res2048_hex(),
         special_case: None,
+        final_residue: Some(x.clone()),
     }
 }
 
@@ -771,6 +772,7 @@ pub fn run_prp<B: Backend>(
                 res64: format!("{:016x}", 0),
                 res2048: Residue::zero(2).res2048_hex(),
                 special_case: Some("p = 2".into()),
+                final_residue: None,
             }),
             evidence,
             timings,

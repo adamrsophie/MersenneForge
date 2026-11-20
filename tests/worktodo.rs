@@ -32,7 +32,29 @@ fn upstream_line_forms() {
     assert_eq!((a.tf_bits, a.tests_saved), (Some(60.0), Some(1.3)));
     assert!(a.wants_pm1());
     assert!(!ok("PRP=1,2,4423,-1,60,0,3,1").wants_pm1());
-    for skip in ["", "   ", "# comment"] {
+    // Cofactor lines, as PrimeNet and AutoPrimeNet write them.
+    let a = ok("PRP=N/A,1,2,23,-1,75,0,3,5,\"47\"");
+    assert_eq!(
+        (a.residue_type, a.known_factors.clone()),
+        (5, vec!["47".to_string()])
+    );
+    let a = ok("PRP=1,2,29,-1,75,0,\"233,1103\"");
+    assert_eq!(a.residue_type, 5);
+    assert_eq!(a.known_factors, ["233", "1103"]);
+    assert_eq!(ok("PRP=1,2,31,-1,75,0,3,3").residue_type, 3);
+    assert_eq!(
+        ok("B1=50000,B2=5000000;PRP=1,2,4423,-1,75,0").exponent,
+        4423
+    );
+    assert_eq!(ok("prp=1,2,4423,-1").exponent, 4423);
+    for skip in [
+        "",
+        "   ",
+        "# comment",
+        "; comment",
+        "[Worker #1]",
+        "// comment",
+    ] {
         assert_eq!(parse_line(skip).unwrap(), None);
     }
     for bad in [
@@ -47,7 +69,10 @@ fn upstream_line_forms() {
         "Test=3,2,1279,-1",              // 3*2^1279-1
         "PRPDC=1,2,1279,-1,75,0,2,1",    // base 2
         "PRP=1,2,1279,-1,75,0,3,5",      // residue type 5
-        "PRP=1,2,23,-1,75,0,3,5,\"47\"", // known factors
+        "PRP=1,2,23,-1,75,0,3,2",        // residue type 2
+        "PRP=1,2,23,-1,75,0,3,1,\"47\"", // known factors, type 1
+        "PRP=1,2,23,-1,75,0,3,5,\"7\"",  // 7 does not divide M23
+        "Test=23,\"47\"",                // LL has no known factors
         "PRP=2",                         // base 3 needs p >= 3
         "PRP=+127",                      // signed exponent
         "Test=127,=x",                   // second '='

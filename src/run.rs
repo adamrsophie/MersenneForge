@@ -281,6 +281,10 @@ pub struct MathResult {
     pub res2048: String,
     /// Trivial case decided without the recurrence (p = 2).
     pub special_case: Option<String>,
+    /// PRP: the final x_p = 3^(2^p) mod N, kept in memory (never written
+    /// out) so a result line can report other residue types.
+    #[serde(skip)]
+    pub final_residue: Option<crate::residue::Residue>,
 }
 
 /// Evidence supporting the result, recorded separately from it.

@@ -1260,7 +1260,7 @@ fn run_factor_line(
                 .and_then(|t| t.trim().parse::<u128>().ok());
             let mut last_save = Instant::now();
             let mut save_err = None;
-            let o = factor::trial_factor(p, bit_lo, bit_hi, from, &stop, &mut |k| {
+            let mut o = factor::trial_factor(p, bit_lo, bit_hi, from, &stop, &mut |k| {
                 if last_save.elapsed() >= Duration::from_secs(30) {
                     last_save = Instant::now();
                     if let Err(e) = mersenne_forge::checkpoint::write_atomic(
@@ -1287,6 +1287,8 @@ fn run_factor_line(
             }
             // ponytail: a factor found early in the range does not end it, so
             // the whole range is reported as searched (rangecomplete).
+            // Factors the line already named are not new.
+            o.factors = o.factors.iter().filter_map(|x| f.new_part(x)).collect();
             let line = factor::tf_result_line(f, &o, &now());
             commit_line(w, &f.line, &f.line, &line.to_string(), None)?;
             let _ = std::fs::remove_file(&state);
@@ -1295,13 +1297,56 @@ fn run_factor_line(
         }
         FactorWork::Pm1 { b1, b2 } => {
             let key = line_key(f.aid.as_deref(), &f.line);
-            let o = work_pm1(w, p, &key, b1, b2, deadline)?;
+            let mut o = work_pm1(w, p, &key, b1, b2, deadline)?;
             if !o.complete {
                 return Ok(false);
             }
+            o.factor = o.factor.and_then(|x| f.new_part(&x));
             let line = factor::pm1_result_line(f, &o, &now());
             commit_line(w, &f.line, &f.line, &line.to_string(), None)?;
             println!("M{p}: P-1 B1={b1} B2={b2} factor {:?}", o.factor);
+            Ok(true)
+        }
+        // P+1 and ECM run on the host in one go with no saved progress:
+        // a stop loses the run, and the line stays.
+        FactorWork::Pp1 { b1, b2, nth_run } => {
+            let mut o =
+                factor::pp1(p, b1, b2, nth_run, &stop).map_err(|e| fail(EXIT_EXECUTION, e))?;
+            if !o.complete {
+                return Ok(false);
+            }
+            o.factor = o.factor.and_then(|x| f.new_part(&x));
+            let line = factor::pp1_result_line(f, &o, &now());
+            commit_line(w, &f.line, &f.line, &line.to_string(), None)?;
+            println!("M{p}: P+1 B1={b1} B2={b2} factor {:?}", o.factor);
+            Ok(true)
+        }
+        FactorWork::Ecm {
+            b1,
+            b2,
+            curves,
+            sigma,
+        } => {
+            // ponytail: without a sigma on the line, one from the clock;
+            // Prime95 also picks a random one.
+            let sigma = sigma.unwrap_or_else(|| {
+                let t = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.subsec_nanos());
+                6 + u64::from(t)
+            });
+            let mut o = factor::ecm(p, b1, b2, curves, sigma, &stop)
+                .map_err(|e| fail(EXIT_EXECUTION, e))?;
+            if o.factor.is_none() && o.curves < curves {
+                return Ok(false);
+            }
+            o.factor = o.factor.and_then(|x| f.new_part(&x));
+            let line = factor::ecm_result_line(f, &o, &now());
+            commit_line(w, &f.line, &f.line, &line.to_string(), None)?;
+            println!(
+                "M{p}: ECM B1={b1} B2={b2} {} curves, factor {:?}",
+                o.curves, o.factor
+            );
             Ok(true)
         }
     }
@@ -1457,14 +1502,12 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
         let mut next_factor = None;
         for raw in text.lines() {
             match mersenne_forge::factor::parse_factor_line(raw) {
-                Ok(Some(f))
-                    if matches!(f.work, mersenne_forge::factor::FactorWork::Pm1 { .. })
-                        && f.exponent > mersenne_forge::factor::WORK_PM1_MAX_P =>
-                {
+                Ok(Some(f)) if f.exponent > mersenne_forge::factor::work_max_p(&f.work) => {
                     let e = format!(
-                        "P-1 of M{} is left to another program (above {})",
+                        "{} of M{} is left to another program (above {})",
+                        f.line.split('=').next().unwrap_or("factoring"),
                         f.exponent,
-                        mersenne_forge::factor::WORK_PM1_MAX_P
+                        mersenne_forge::factor::work_max_p(&f.work)
                     );
                     if warned.insert(e.clone()) {
                         eprintln!("left in place: {e}");
@@ -1551,6 +1594,7 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
                 exponent: a.exponent,
                 aid: a.aid.clone(),
                 line: a.line.clone(),
+                known_factors: a.known_factors.clone(),
             };
             // A P-1 step recorded before a crash: only the rewrite is left.
             let entry = format!("pm1:{}", a.line);

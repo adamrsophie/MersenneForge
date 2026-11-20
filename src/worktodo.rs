@@ -38,6 +38,17 @@ pub struct Assignment {
     /// wants P-1 before the test, as upstream decides from these fields.
     #[serde(default)]
     pub tests_saved: Option<f64>,
+    /// PRP: the residue type to report (1, 3, or 5; see `prp_outcome`).
+    #[serde(default = "type_one")]
+    pub residue_type: u8,
+    /// PRP: known factors of 2^p - 1, decimal. With them the test is of
+    /// the cofactor (2^p - 1) / (their product), residue type 5.
+    #[serde(default)]
+    pub known_factors: Vec<String>,
+}
+
+fn type_one() -> u8 {
+    1
 }
 
 impl Assignment {
@@ -59,46 +70,132 @@ impl Assignment {
 /// assignment always fits checkpoint metadata.
 pub const MAX_LINE: usize = 1024;
 
-/// Parse one worktodo line. `Ok(None)` for blank lines and `#` comments;
-/// `Err` for anything this program cannot run, which stays in the file.
-///
-/// Accepted, as upstream: `PRP=` and `PRPDC=` with
-/// `[AID,]1,2,p,-1[,tf_bits,tests_saved[,base,residue_type]]` or a bare
-/// `[AID,]p`; `Test=` and `DoubleCheck=` with `[AID,]1,2,p,-1[,...]` or
-/// `[AID,]p[,...]`. An empty or `N/A` first field is skipped. Refused and
-/// left in place: other number forms (k*2^n+c), PRP bases other than 3,
-/// residue types other than 1, lines with known factors (cofactor tests),
-/// P-1 and CERT lines, composite exponents, and PRP of M2.
-pub fn parse_line(raw: &str) -> Result<Option<Assignment>, String> {
+/// True for lines no parser runs: blank lines, comments (`#`, `;`, `//`,
+/// `\\`), and `[Worker #n]` section headers. They stay in the file.
+pub fn is_comment(line: &str) -> bool {
+    let t = line.trim_start();
+    t.is_empty() || t.starts_with(['#', ';', '[']) || t.starts_with("//") || t.starts_with("\\\\")
+}
+
+/// One worktodo line split the way Prime95's parser reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tokens<'a> {
+    /// The work type as written (`PRP`, `Factor`, ...).
+    pub work: &'a str,
+    /// `key=value` pairs of a `B1=..,B2=..;` prefix, as AutoPrimeNet writes.
+    pub prefix: Vec<(&'a str, &'a str)>,
+    pub aid: Option<String>,
+    /// The comma separated fields after the work type and the AID.
+    pub fields: Vec<&'a str>,
+    /// Decimal numbers from a quoted tail (`,"f1,f2"`). As upstream, any
+    /// non-digit separates two numbers.
+    pub known_factors: Vec<String>,
+}
+
+impl Tokens<'_> {
+    /// The work type, compared without regard to case (mfaktc's rule).
+    pub fn is(&self, name: &str) -> bool {
+        self.work.eq_ignore_ascii_case(name)
+    }
+}
+
+/// Split a worktodo line into its parts. `Ok(None)` for comments and blank
+/// lines. Shared by every line parser in this crate.
+pub fn tokenize(raw: &str) -> Result<Option<Tokens<'_>>, String> {
     let line = raw.trim_end_matches(['\r', '\n']);
-    if line.trim().is_empty() || line.starts_with('#') {
+    if is_comment(line) {
         return Ok(None);
     }
     if line.len() > MAX_LINE {
         return Err(format!("line longer than {MAX_LINE} bytes"));
     }
-    let (kind, rest) = line
-        .split_once('=')
-        .ok_or_else(|| format!("not an assignment: {line:?}"))?;
-    if rest.contains('=') {
-        return Err(format!("more than one '=': {line:?}"));
-    }
-    let kind = match kind {
-        "PRP" | "PRPDC" => WorkKind::Prp,
-        "Test" | "DoubleCheck" => WorkKind::Ll,
-        other => return Err(format!("unsupported work type {other:?}: {line:?}")),
+    let bad = |why: &str| Err(format!("{why}: {line:?}"));
+    let (head, known_factors) = match line.split_once('"') {
+        None => (line, Vec::new()),
+        Some((h, q)) => {
+            let Some(inner) = q.trim_end().strip_suffix('"') else {
+                return bad("unterminated quoted field");
+            };
+            if inner.contains('"') {
+                return bad("more than one quoted field");
+            }
+            let Some(h) = h.trim_end().strip_suffix(',') else {
+                return bad("a quoted field must follow a comma");
+            };
+            let kf: Vec<String> = inner
+                .split(|c: char| !c.is_ascii_digit())
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect();
+            (h, kf)
+        }
     };
-    let mut parts: Vec<&str> = rest.split(',').map(str::trim).collect();
-    if parts.first().is_some_and(|f| f.is_empty() || *f == "N/A") {
-        parts.remove(0);
+    let (prefix_text, main) = match head.rsplit_once(';') {
+        Some((pre, m)) => (Some(pre), m),
+        None => (None, head),
+    };
+    let mut prefix = Vec::new();
+    for kv in prefix_text.into_iter().flat_map(|t| t.split(',')) {
+        let Some((k, v)) = kv.split_once('=') else {
+            return bad("malformed prefix");
+        };
+        prefix.push((k.trim(), v.trim()));
+    }
+    let Some((work, rest)) = main.split_once('=') else {
+        return bad("not an assignment");
+    };
+    if rest.contains('=') {
+        return bad("more than one '='");
+    }
+    let mut fields: Vec<&str> = rest.split(',').map(str::trim).collect();
+    if fields
+        .first()
+        .is_some_and(|f| f.is_empty() || f.eq_ignore_ascii_case("N/A"))
+    {
+        fields.remove(0);
     }
     let mut aid = None;
-    if parts
+    if fields
         .first()
         .is_some_and(|f| f.len() == 32 && f.chars().all(|c| c.is_ascii_hexdigit()))
     {
-        aid = Some(parts.remove(0).to_string());
+        aid = Some(fields.remove(0).to_string());
     }
+    Ok(Some(Tokens {
+        work: work.trim(),
+        prefix,
+        aid,
+        fields,
+        known_factors,
+    }))
+}
+
+/// Parse one worktodo line. `Ok(None)` for blank lines and comments;
+/// `Err` for anything this parser cannot run, which stays in the file.
+///
+/// Accepted, as upstream: `PRP=` and `PRPDC=` with
+/// `[AID,]1,2,p,-1[,tf_bits,tests_saved[,base,residue_type]][,"factors"]`
+/// or a bare `[AID,]p`; `Test=` and `DoubleCheck=` with
+/// `[AID,]1,2,p,-1[,...]` or `[AID,]p[,...]`. An empty or `N/A` first
+/// field is skipped. PRP residue types 1, 3, and 5 are accepted; known
+/// factors (each must divide 2^p - 1) make the test one of the cofactor,
+/// reported as type 5 as Prime95 does. Refused and left in place: other
+/// number forms (k*b^n+c), PRP bases other than 3, residue types 2 and 4,
+/// known factors with a residue type other than 5, composite exponents,
+/// and PRP of M2.
+pub fn parse_line(raw: &str) -> Result<Option<Assignment>, String> {
+    let Some(t) = tokenize(raw)? else {
+        return Ok(None);
+    };
+    let line = raw.trim_end_matches(['\r', '\n']);
+    let kind = if t.is("PRP") || t.is("PRPDC") {
+        WorkKind::Prp
+    } else if t.is("Test") || t.is("DoubleCheck") {
+        WorkKind::Ll
+    } else {
+        return Err(format!("unsupported work type {:?}: {line:?}", t.work));
+    };
+    let parts = &t.fields;
     let refuse = |why: &str| Err(format!("{why}: {line:?}"));
     let mersenne = parts.len() >= 4 && parts[0] == "1" && parts[1] == "2" && parts[3] == "-1";
     // A k,b,n,c number line that is not 1,2,p,-1 names another number.
@@ -111,7 +208,7 @@ pub fn parse_line(raw: &str) -> Result<Option<Assignment>, String> {
         WorkKind::Ll if !parts.is_empty() && !parts[0].contains('.') => parts[0],
         _ => return refuse("not a Mersenne number line"),
     };
-    let (mut tf_bits, mut tests_saved) = (None, None);
+    let (mut tf_bits, mut tests_saved, mut residue_type) = (None, None, 1u8);
     if kind == WorkKind::Prp && mersenne {
         let num = |i: usize| -> Result<Option<f64>, String> {
             parts
@@ -132,13 +229,33 @@ pub fn parse_line(raw: &str) -> Result<Option<Assignment>, String> {
             }
         }
         if let Some(t) = parts.get(7) {
-            if *t != "1" {
-                return refuse("only PRP residue type 1 is supported");
-            }
+            residue_type = match *t {
+                "1" => 1,
+                "3" => 3,
+                "5" => 5,
+                _ => return refuse("PRP residue types 2 and 4 are not supported"),
+            };
         }
         if parts.len() > 8 {
-            return refuse("PRP of a cofactor (known factors) is not supported");
+            return refuse("too many fields");
         }
+    }
+    if kind == WorkKind::Ll && !t.known_factors.is_empty() {
+        return refuse("an LL test has no known factors");
+    }
+    if kind == WorkKind::Prp && !t.known_factors.is_empty() {
+        // Prime95 reports a cofactor test as type 5 when the line names
+        // none; types 1 and 3 of a cofactor need powers this program does
+        // not compute.
+        if parts.len() <= 7 {
+            residue_type = 5;
+        }
+        if residue_type != 5 {
+            return refuse("known factors need residue type 5");
+        }
+    }
+    if residue_type == 5 && t.known_factors.is_empty() {
+        return refuse("residue type 5 needs known factors");
     }
     let p: u32 = field
         .parse()
@@ -149,14 +266,74 @@ pub fn parse_line(raw: &str) -> Result<Option<Assignment>, String> {
     if kind == WorkKind::Prp && p < 3 {
         return refuse("base 3 PRP needs p >= 3");
     }
+    for f in &t.known_factors {
+        let c = check_factor(p, f).map_err(|e| format!("{e}: {line:?}"))?;
+        if !c.accepted() {
+            return refuse(&format!("{f} is not a proper factor of 2^{p} - 1"));
+        }
+    }
     Ok(Some(Assignment {
         kind,
         exponent: p,
-        aid,
+        aid: t.aid,
         line: line.to_string(),
         tf_bits,
         tests_saved,
+        residue_type,
+        known_factors: t.known_factors,
     }))
+}
+
+/// The reported outcome of a base-3 PRP test, for one residue type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrpOutcome {
+    pub probable_prime: bool,
+    pub res64: String,
+    pub res2048: String,
+}
+
+/// Decide a PRP result from x = 3^(2^p) mod 2^p - 1, for the assignment's
+/// residue type (primenet.h's definitions, with N = 2^p - 1, a = 3):
+///
+/// - type 1: a^(N-1) = x / 9, probable prime when 1;
+/// - type 3: a^(N+1) = x, probable prime when 9;
+/// - type 5 (cofactor C = N / F, F the product of the known factors): the
+///   reported residue is a^(N-1) mod N, as Prime95 reports it, and C is a
+///   probable prime when a^(N-1) = a^(F-1) mod C (Fermat's test of C to
+///   base a, since a^(N-1) = a^(F(C-1)) * a^(F-1)).
+///
+/// ponytail: type 5 runs on the host with BigUint (one reduction and a
+/// power with an exponent of F's size); move it to a backend when p is
+/// large enough for that to matter.
+pub fn prp_outcome(a: &Assignment, x: &crate::residue::Residue) -> PrpOutcome {
+    let p = a.exponent;
+    let type1 = x.div3().div3();
+    let shown = if a.residue_type == 3 { x } else { &type1 };
+    let probable_prime = match a.residue_type {
+        3 => *x == crate::residue::Residue::from_u64(p, 9),
+        5 => {
+            let n = crate::residue::modulus(p);
+            let f = a
+                .known_factors
+                .iter()
+                .filter_map(|s| BigUint::parse_bytes(s.as_bytes(), 10))
+                .fold(BigUint::one(), |acc, q| acc * q);
+            let c = &n / &f;
+            if c <= BigUint::one() {
+                false
+            } else {
+                let lhs = type1.to_biguint() % &c;
+                let rhs = BigUint::from(3u32).modpow(&(&f - 1u32), &c);
+                lhs == rhs
+            }
+        }
+        _ => type1 == crate::residue::Residue::from_u64(p, 1),
+    };
+    PrpOutcome {
+        probable_prime,
+        res64: format!("{:016x}", shown.res64()),
+        res2048: shown.res2048_hex(),
+    }
 }
 
 /// PrimeNet's numeric code for this platform, as upstream writes `port`.
@@ -356,7 +533,17 @@ pub fn result_line(
     backend: &str,
     timestamp: &str,
 ) -> serde_json::Value {
-    let prime = matches!(r.verdict, Verdict::Prime | Verdict::ProbablePrime);
+    // PRP lines report the assignment's residue type, decided from the
+    // final residue; without it (p = 2) the type 1 fields stand.
+    let outcome = match (a.kind, &r.final_residue) {
+        (WorkKind::Prp, Some(x)) => prp_outcome(a, x),
+        _ => PrpOutcome {
+            probable_prime: matches!(r.verdict, Verdict::Prime | Verdict::ProbablePrime),
+            res64: r.res64.clone(),
+            res2048: r.res2048.clone(),
+        },
+    };
+    let prime = outcome.probable_prime;
     let ev = &report.evidence;
     let mut v = serde_json::Map::new();
     let mut put = |k: &str, x: serde_json::Value| {
@@ -367,9 +554,12 @@ pub fn result_line(
     match a.kind {
         WorkKind::Prp => {
             put("worktype", "PRP-3".into());
-            put("res64", r.res64.clone().into());
-            put("res2048", r.res2048.clone().into());
-            put("residue-type", 1.into());
+            if !a.known_factors.is_empty() {
+                put("known-factors", serde_json::json!(a.known_factors));
+            }
+            put("res64", outcome.res64.clone().into());
+            put("res2048", outcome.res2048.clone().into());
+            put("residue-type", a.residue_type.into());
             put("errors", serde_json::json!({"gerbicz": ev.errors_total}));
             if let Some(pr) = proof {
                 // Upstream writes version 1 here for its version 2 files.
@@ -523,6 +713,48 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         assert!(free_bytes(d.path()).unwrap() > 0);
         assert!(proof_disk_need(1279, 2) > crate::proof::disk_usage_bytes(1279, 2));
+    }
+
+    #[test]
+    fn residue_types_and_cofactors() {
+        use crate::residue::{modulus, Residue};
+        let x = |p: u32| {
+            let n = modulus(p);
+            let e = BigUint::one() << p;
+            Residue::from_biguint(p, &BigUint::from(3u32).modpow(&e, &n))
+        };
+        let a = |line: &str| parse_line(line).unwrap().unwrap();
+        // M23 = 47 * 178481, and 178481 is prime.
+        let o = prp_outcome(&a("PRP=1,2,23,-1,75,0,3,5,\"47\""), &x(23));
+        assert!(o.probable_prime);
+        // Type 5 reports a^(N-1) mod N unreduced: the type 1 residue.
+        let t1 = prp_outcome(&a("PRP=1,2,23,-1,75,0"), &x(23));
+        assert!(!t1.probable_prime);
+        assert_eq!(o.res64, t1.res64);
+        // M29 = 233 * 1103 * 2089: the cofactor 1103 * 2089 is composite.
+        assert!(!prp_outcome(&a("PRP=1,2,29,-1,75,0,\"233\""), &x(29)).probable_prime);
+        assert!(prp_outcome(&a("PRP=1,2,29,-1,75,0,\"233,1103\""), &x(29)).probable_prime);
+        // Type 3 is x itself: 9 for a prime M31.
+        let o = prp_outcome(&a("PRP=1,2,31,-1,75,0,3,3"), &x(31));
+        assert!(o.probable_prime);
+        assert_eq!(o.res64, format!("{:016x}", 9));
+        assert!(prp_outcome(&a("PRP=1,2,31,-1,75,0"), &x(31)).probable_prime);
+        assert!(!prp_outcome(&a("PRP=1,2,29,-1,75,0,3,3"), &x(29)).probable_prime);
+    }
+
+    #[test]
+    fn lines_tokenize_as_prime95_reads_them() {
+        let t = tokenize("B1=1000,B2=9000;Pminus1=N/A,1,2,67,-1,1000,3000,\"193707721\"\r\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.work, "Pminus1");
+        assert_eq!(t.prefix, [("B1", "1000"), ("B2", "9000")]);
+        assert_eq!(t.aid, None);
+        assert_eq!(t.fields, ["1", "2", "67", "-1", "1000", "3000"]);
+        assert_eq!(t.known_factors, ["193707721"]);
+        assert!(tokenize("PRP=1,2,23,-1,\"47").is_err());
+        assert!(tokenize("PRP=1,2,23,-1\"47\"").is_err());
+        assert_eq!(tokenize("[Worker #2]").unwrap(), None);
     }
 
     #[test]
