@@ -1139,9 +1139,8 @@ fn program() -> serde_json::Value {
 }
 
 /// Known small factors, as a cross-check that TF misses nothing it should
-/// find: (p, q) with q | 2^p - 1.
-#[cfg(test)]
-const KNOWN: &[(u32, u64)] = &[
+/// find: (p, q) with q | 2^p - 1. Also used by `selftest`.
+pub const KNOWN: &[(u32, u64)] = &[
     (11, 23),
     (11, 89),
     (23, 47),

@@ -21,6 +21,7 @@ pub mod prp;
 pub mod residue;
 pub mod run;
 pub mod select;
+pub mod selftest;
 pub mod worktodo;
 
 // Include source bytes so packaged builds and uncommitted changes have an
@@ -77,6 +78,7 @@ const BUILD_SOURCES: &[(&str, &[u8])] = &[
     ("src/residue.rs", include_bytes!("residue.rs")),
     ("src/run.rs", include_bytes!("run.rs")),
     ("src/select.rs", include_bytes!("select.rs")),
+    ("src/selftest.rs", include_bytes!("selftest.rs")),
     ("src/worktodo.rs", include_bytes!("worktodo.rs")),
 ];
 

@@ -276,7 +276,7 @@ enum Cmd {
         from: u32,
         #[arg(long)]
         to: u32,
-        /// Test candidates below 2^63 on the GPU (needs the gpu feature);
+        /// Test candidates below 2^95 on the GPU (needs the gpu feature);
         /// the sieve and every hit's final check stay on the host.
         #[arg(long)]
         gpu: bool,
@@ -330,6 +330,35 @@ enum Cmd {
         device: Option<u32>,
         #[arg(long, default_value_t = 200)]
         iters: u64,
+    },
+    /// Williams' P+1 on 2^p - 1 (host arithmetic, small exponents only).
+    /// --run picks the start value as Prime95's nth_run does (1: 2/7,
+    /// 2: 6/5).
+    Pp1 {
+        #[arg(long)]
+        exponent: u32,
+        #[arg(long)]
+        b1: u64,
+        #[arg(long, default_value_t = 0)]
+        b2: u64,
+        #[arg(long, default_value_t = 1)]
+        run: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Test a backend and the factoring code against known answers: LL and
+    /// PRP of small exponents, Gerbicz checked squaring chains, trial
+    /// factoring of known factors, and P+1. Exit 0 when every case passes.
+    Selftest {
+        #[arg(long, value_enum, default_value = "dwt")]
+        backend: BackendArg,
+        #[arg(long)]
+        device: Option<u32>,
+        /// Add larger exponents (minutes on a CPU).
+        #[arg(long)]
+        full: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Check that a reported factor divides 2^p - 1. Exit 0 when it does.
     CheckFactor {
@@ -2610,7 +2639,9 @@ fn main() -> ExitCode {
         Cmd::CheckFactor { json, .. }
         | Cmd::Tf { json, .. }
         | Cmd::Pm1 { json, .. }
-        | Cmd::Ecm { json, .. } => *json,
+        | Cmd::Ecm { json, .. }
+        | Cmd::Pp1 { json, .. }
+        | Cmd::Selftest { json, .. } => *json,
         Cmd::Bench { .. }
         | Cmd::BenchRender { .. }
         | Cmd::BenchAnalyze { .. }
@@ -2749,6 +2780,63 @@ fn main() -> ExitCode {
                 );
             }
             Ok(0)
+        }
+        Cmd::Pp1 {
+            exponent,
+            b1,
+            b2,
+            run,
+            json,
+        } => {
+            let stop = || STOP.load(Ordering::SeqCst);
+            let o = mersenne_forge::factor::pp1(exponent, b1, b2, run, &stop)
+                .map_err(|e| fail(2, e))?;
+            if json {
+                println!("{}", serde_json::to_string(&o).expect("serializable"));
+            } else {
+                for n in &o.notes {
+                    println!("note: {n}");
+                }
+                println!(
+                    "M{exponent} P+1 B1={b1} B2={} start {}/{}: factor {:?}",
+                    o.b2, o.start.0, o.start.1, o.factor
+                );
+            }
+            Ok(0)
+        }
+        Cmd::Selftest {
+            backend,
+            device,
+            full,
+            json,
+        } => {
+            let kind = backend.kind();
+            let mut open_one = |p: u32| select::open(kind, p, device).map_err(|e| e.to_string());
+            let stop = || STOP.load(Ordering::SeqCst);
+            let cases = mersenne_forge::selftest::run(&mut open_one, full, &stop);
+            let failed = cases.iter().filter(|c| c.ok == Some(false)).count();
+            if json {
+                println!("{}", serde_json::to_string(&cases).expect("serializable"));
+            } else {
+                for c in &cases {
+                    let mark = match c.ok {
+                        Some(true) => "pass",
+                        Some(false) => "FAIL",
+                        None => "skip",
+                    };
+                    println!(
+                        "{mark} {}{}",
+                        c.name,
+                        if c.detail.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {}", c.detail)
+                        }
+                    );
+                }
+                println!("{} cases, {failed} failed", cases.len());
+            }
+            Ok(if failed == 0 { 0 } else { EXIT_EXECUTION })
         }
         Cmd::CheckpointExport { input, output } => {
             let ck = Checkpoint::load_file(&input)
