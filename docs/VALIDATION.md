@@ -18,6 +18,22 @@ New since 2026-11-19 and covered by these tests: PRP residue types 2 and 4, P-1 
 
 Not covered: no GPU test ran (`tests/gpu_backend.rs`, `tests/protocol_gpu.rs`, the TF kernel tests including `segment_kernel_matches_the_host`, lengths 2^23 and 2^24); no CUDA kernel ran on NVIDIA hardware; no sensor, release workflow, or PrimeNet exchange ran.
 
+## GPU tests on a software Vulkan device (2026-11-24)
+
+The `gpu-software` CI job runs the GPU suites on Mesa llvmpipe (LLVM 21.1.8, Vulkan 1.4.341) with `MERSENNE_FORGE_ALLOW_SOFTWARE_GPU=1`. Run 45489277161 (commit `cedbd28`) passed:
+
+| Command (ubuntu-latest, llvmpipe) | Observed result |
+|---|---|
+| `cargo test --release --features gpu --lib -- --test-threads=1` | 85 passed, 0 failed (169 s) |
+| `cargo test --release --features gpu --test gpu_backend -- --test-threads=1` | 10 passed, 0 failed, 1 ignored (294 s) |
+| `cargo test --release --features gpu --test protocol_gpu -- --test-threads=1` | 11 passed, 0 failed (118 s) |
+
+These include the GF((2^61 - 1)^2) field (host model and `wide_field_matches_bigint` on the device, up to one past the 31-bit field's top), the packed GPU transform against the unpacked one, the fused radix 4 stages against single stages, the trial factoring kernels against the host (`kernel_matches_the_host_test`, `segment_kernel_matches_the_host`), and the shifted arithmetic of shift counts against plain arithmetic.
+
+The first runs found two faults that the Metal runs had not reached. The packed pointwise pass read the bit reversed spectrum in natural order (fixed in `d6d2f22`), and the 31-bit field had no plan for p from 15,503,946 to 16,777,215 and from 26,214,401 to 33,554,431 (the wider field now covers them).
+
+llvmpipe is a CPU rasterizer: these runs show the kernels compute the right values, not that a hardware GPU does, and they say nothing about speed. Lengths 2^23 and 2^24 and the complete LL run of `complete_ll_run_p110503` did not run.
+
 ## Benchmark evidence, work queue, and factor checks (2026-11-19)
 
 Implementation source SHA3-256: `390fa29f7066fc0c46b4e48831a7d1076c4221adc5f7c818157ad7980758c914`; debug executable SHA-256 `79b8d86d8292c0132b8b712310721f1b226d4926860bbdd806144b6f2b40d4af` (Apple M2, macOS 27.2.1, Rust 1.100.0).
@@ -155,7 +171,7 @@ The two ignored DWT stress tests and the external upstream-verifier test were no
 | PRP proof generation and verification (v2) | yes | yes | yes | Metal only | one direction: an upstream generated proof verifies here, and our M786433 proof was byte-identical to it at commit `4042941`; our proofs have NOT been checked by an upstream verifier (`tests/upstream_verifier.rs` exists and has not been run) | no |
 | Bench harness | yes | yes | yes (`bench/cpu-smoke.json`) | no | n/a | no comparison measured |
 
-Continuous integration (`.github/workflows/ci.yml`) runs only the CPU checks; it compiles the `gpu` and `cuda` features but never runs GPU or CUDA tests. Every GPU result in this report was observed by hand on the host above.
+Continuous integration (`.github/workflows/ci.yml`) runs the CPU checks and, since 2026-11-24, the GPU suites on the llvmpipe software device; it never runs CUDA tests. Every hardware GPU result in this report was observed by hand on the host above.
 
 "GPU tested" means the generic protocol suite and the CLI runs below passed on the Apple GPU through Metal. Backend internals and their own tests are documented by the GPU engineer in [GPU.md](GPU.md).
 
