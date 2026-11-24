@@ -189,3 +189,57 @@ fn prp_before_last_matches_the_host_and_flags_primes() {
     )
     .is_err());
 }
+
+/// A shifted PRP run gives the same final residue and verdict as an
+/// unshifted one, its proof verifies, and a shift of p or more is refused.
+#[test]
+fn shifted_prp_matches_the_unshifted_run() {
+    use mersenne_forge::run::ProofStage;
+    for (p, shift) in [(1277u32, 1u32), (1279, 1000), (4423, 4422)] {
+        let plain = PrpConfig {
+            block_size: 16,
+            check_step: Some(64),
+            ..PrpConfig::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let shifted = PrpConfig {
+            shift,
+            proof_power: Some(3),
+            proof_dir: Some(dir.path().to_path_buf()),
+            ..plain.clone()
+        };
+        let run = |cfg: &PrpConfig| {
+            let mut be = DwtBackend::new(p).unwrap();
+            run_prp(
+                &mut be,
+                p,
+                cfg,
+                serde_json::json!({}),
+                None,
+                &mut Control::default(),
+            )
+            .unwrap()
+        };
+        let a = run(&plain);
+        let b = run(&shifted);
+        let (ra, rb) = (a.result.unwrap(), b.result.unwrap());
+        assert_eq!(ra.final_residue, rb.final_residue, "M{p}");
+        assert_eq!(ra.verdict, rb.verdict, "M{p}");
+        assert_eq!(b.evidence.shift, shift);
+        assert_eq!(b.evidence.proof_stage, ProofStage::Verified, "M{p}");
+    }
+    let bad = PrpConfig {
+        shift: 127,
+        ..PrpConfig::default()
+    };
+    let mut be = CpuBackend::new(127).unwrap();
+    assert!(run_prp(
+        &mut be,
+        127,
+        &bad,
+        serde_json::json!({}),
+        None,
+        &mut Control::default()
+    )
+    .is_err());
+}

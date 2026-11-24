@@ -34,6 +34,7 @@ pub fn prp_cfg(dir: &Path, proof_power: Option<u32>) -> PrpConfig {
         checkpoint: Some(dir.join("ckpt").join("prp.ckpt")),
         max_batch: 1000,
         before_last: false,
+        shift: 0,
     }
 }
 

@@ -43,7 +43,7 @@ no code was copied. Status words are those of [STATUS.md](STATUS.md):
 | ECM JSON (`worktype` "ECM", `b1`, `b2`, `curves`, `sigma`) | written |
 | CERT JSON (`worktype` "Cert", `sha3-hash`, `squarings`) | written |
 | Security codes (`security-code`) and mfaktc's checksum | not planned: they are keyed to the upstream programs |
-| Shift counts | not planned: every run here starts unshifted, reported as `shift-count` 0 |
+| Shift counts | written for PRP: `run --shift S` and `work --shift S` hold every value rotated by a tracked per-register shift (squaring doubles it, multiplication adds), with Gerbicz checks, proofs, and checkpoints on the true values; PRP result lines carry `shift-count` when it is not 0; LL is refused with a shift |
 
 ## Algorithms and kernels
 

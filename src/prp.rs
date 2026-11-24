@@ -68,6 +68,15 @@ pub struct PrpConfig {
     /// configuration when false, so older checkpoints still match.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub before_last: bool,
+    /// Prime95's shift count: the backend holds every value rotated (see
+    /// [`crate::backend::shift`]), starting at this many bits. Below p; 0
+    /// is no shift and is left out of the serialized configuration.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub shift: u32,
+}
+
+fn is_zero(x: &u32) -> bool {
+    *x == 0
 }
 
 impl Default for PrpConfig {
@@ -81,6 +90,7 @@ impl Default for PrpConfig {
             checkpoint: None,
             max_batch: 1000,
             before_last: false,
+            shift: 0,
         }
     }
 }
@@ -691,6 +701,12 @@ fn validate(p: u32, cfg: &PrpConfig) -> Result<Option<ProofSchedule>, ProtocolEr
         }
         _ => {}
     }
+    if cfg.shift != 0 && cfg.shift >= p {
+        return Err(ProtocolError::Config(format!(
+            "shift count {} must be below p = {p}",
+            cfg.shift
+        )));
+    }
     if cfg.before_last && (cfg.proof_dir.is_some() || p < 3) {
         return Err(ProtocolError::Config(
             "a run that stops before the last squaring has no proof and needs p >= 3".into(),
@@ -826,6 +842,27 @@ pub fn gerbicz_squarings<B: Backend>(
 
 /// Run (or resume) a base-3 PRP test of M_p.
 pub fn run_prp<B: Backend>(
+    be: &mut B,
+    p: u32,
+    cfg: &PrpConfig,
+    requested: serde_json::Value,
+    resume: Option<&Checkpoint>,
+    ctl: &mut Control,
+) -> Result<RunReport, ProtocolError> {
+    if cfg.shift == 0 {
+        return run_prp_on(be, p, cfg, requested, resume, ctl);
+    }
+    if cfg.shift >= p {
+        validate(p, cfg)?;
+    }
+    let mut sh =
+        crate::backend::shift::Shifted::new(be, cfg.shift).map_err(ProtocolError::Backend)?;
+    let mut r = run_prp_on(&mut sh, p, cfg, requested, resume, ctl)?;
+    r.evidence.shift = cfg.shift;
+    Ok(r)
+}
+
+fn run_prp_on<B: Backend>(
     be: &mut B,
     p: u32,
     cfg: &PrpConfig,

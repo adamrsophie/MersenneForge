@@ -490,6 +490,7 @@ fn engine_run(
                 checkpoint: checkpoint.clone(),
                 max_batch: 1000,
                 before_last: false,
+                shift: 0,
             };
             run_prp(&mut be, p, &cfg, serde_json::json!({}), None, &mut ctl)
         }

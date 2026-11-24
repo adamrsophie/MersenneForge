@@ -594,6 +594,9 @@ pub fn result_line(
             put("res64", outcome.res64.clone().into());
             put("res2048", outcome.res2048.clone().into());
             put("residue-type", a.residue_type.into());
+            if ev.shift != 0 {
+                put("shift-count", ev.shift.into());
+            }
             put("errors", serde_json::json!({"gerbicz": ev.errors_total}));
             if let Some(pr) = proof {
                 // Upstream writes version 1 here for its version 2 files.

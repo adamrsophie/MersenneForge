@@ -25,6 +25,7 @@ pub mod cuda;
 pub mod dwt;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+pub mod shift;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 

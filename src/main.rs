@@ -185,6 +185,10 @@ enum Cmd {
         /// Skip verifying the generated proof.
         #[arg(long)]
         no_proof_verify: bool,
+        /// PRP shift count, below p: the backend works on every value
+        /// rotated by this many bits (Prime95's shift count).
+        #[arg(long, default_value_t = 0)]
+        shift: u32,
         #[arg(long)]
         json: bool,
     },
@@ -261,6 +265,10 @@ enum Cmd {
         proof_dir: Option<PathBuf>,
         #[arg(long)]
         proof_power: Option<u32>,
+        /// Shift count for PRP assignments (see `run --shift`); 0 is none.
+        /// Below every exponent in the queue, or a line fails.
+        #[arg(long, default_value_t = 0)]
+        shift: u32,
         /// JSON health state, rewritten atomically as the session moves on:
         /// pid, state, current line, completed and skipped counts, update
         /// time, and the exit code when the session ends.
@@ -692,6 +700,7 @@ fn cmd_run(
     log_step: u64,
     jacobi: JacobiArg,
     no_proof_verify: bool,
+    shift: u32,
     as_json: bool,
 ) -> Result<u8, Failure> {
     let kind = backend.kind();
@@ -701,7 +710,7 @@ fn cmd_run(
         "proof_dir": proof_dir, "proof_power": proof_power, "checkpoint_dir": checkpoint_dir,
         "block_size": block_size, "check_step": check_step, "log_step": log_step,
         "jacobi": if jacobi == JacobiArg::Auto { "auto" } else { "every_log" },
-        "verify_proof": !no_proof_verify,
+        "verify_proof": !no_proof_verify, "shift": shift,
     });
     let deadline = deadline(&budget, kind)?;
     mersenne_forge::exponent::validate(p).map_err(|e| fail(EXIT_UNSUPPORTED, e.to_string()))?;
@@ -744,6 +753,7 @@ fn cmd_run(
                 checkpoint: ckpt.clone(),
                 max_batch: 1000,
                 before_last: false,
+                shift,
             };
             let eff = prp::effective_config(p, &cfg).map_err(protocol_failure)?;
             let r = prp::run_prp(&mut be, p, &cfg, requested.clone(), None, &mut ctl)
@@ -751,6 +761,9 @@ fn cmd_run(
             (r, serde_json::to_value(eff).expect("serializes"))
         }
         Test::Ll => {
+            if shift != 0 {
+                return Err(fail(EXIT_UNSUPPORTED, "--shift applies to PRP, not LL"));
+            }
             if proof_dir.is_some() || proof_power.is_some() {
                 return Err(fail(
                     EXIT_UNSUPPORTED,
@@ -999,6 +1012,7 @@ struct WorkArgs {
     budget: Option<String>,
     proof_dir: Option<PathBuf>,
     proof_power: Option<u32>,
+    shift: u32,
     status_file: Option<PathBuf>,
 }
 
@@ -1888,6 +1902,7 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
             checkpoint: Some(ckpt.clone()),
             max_batch: 1000,
             before_last,
+            shift: w.shift,
         };
         let mut ctl = Control {
             stop: Some(&STOP),
@@ -3115,6 +3130,7 @@ fn main() -> ExitCode {
                 log_step,
                 jacobi,
                 no_proof_verify,
+                shift,
                 json,
             } => cmd_run(
                 test,
@@ -3130,6 +3146,7 @@ fn main() -> ExitCode {
                 log_step,
                 jacobi,
                 no_proof_verify,
+                shift,
                 json,
             ),
             Cmd::Resume {
@@ -3320,6 +3337,7 @@ fn main() -> ExitCode {
                 budget,
                 proof_dir,
                 proof_power,
+                shift,
                 status_file,
             } => {
                 let w = WorkArgs {
@@ -3331,6 +3349,7 @@ fn main() -> ExitCode {
                     budget,
                     proof_dir,
                     proof_power,
+                    shift,
                     status_file,
                 };
                 let r = cmd_work(&w);

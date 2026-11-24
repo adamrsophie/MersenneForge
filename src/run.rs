@@ -313,6 +313,9 @@ pub struct Evidence {
     /// start (before any halving after an error). Informational output; not
     /// part of the configuration a resume compares.
     pub check_step: Option<u64>,
+    /// PRP: the starting shift count (0: none).
+    #[serde(default)]
+    pub shift: u32,
     pub notes: Vec<String>,
 }
 
