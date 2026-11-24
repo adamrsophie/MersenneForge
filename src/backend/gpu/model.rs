@@ -896,8 +896,26 @@ mod tests {
         // The 31-bit field has gaps below its top where the narrowest words
         // of one length hold more than the length allows and the next
         // length needs words of 2 bits (15,503,946 to 16,777,215 and
-        // 26,214,401 to 33,554,431); the wide field covers them. Exhaustive: every p in the range has one of the two plans.
-        assert!((lo..=hi).all(|p| choose_n(p).is_some() || Plan::new_wide(p).is_some()));
+        // 26,214,401 to 33,554,431); the wide field covers them. Every p in
+        // the range has a wide length where the narrow one is missing, and
+        // the full wide plan (which builds O(n) tables) is built at each
+        // gap's two ends.
+        let mut ends = Vec::new();
+        let mut inside = false;
+        for p in lo..=hi {
+            let gap = choose_n(p).is_none();
+            if gap {
+                assert!(super::super::wide::choose_n(p).is_some(), "p={p}");
+            }
+            if gap != inside {
+                ends.push(if gap { p } else { p - 1 });
+                inside = gap;
+            }
+        }
+        assert!(!inside && ends.len() >= 4, "{ends:?}");
+        for &p in &ends {
+            assert!(Plan::new_wide(p).is_some(), "p={p}");
+        }
         assert!(choose_n(30_000_000).is_none() && Plan::new_wide(30_000_000).is_some());
     }
 }
