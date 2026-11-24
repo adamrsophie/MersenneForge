@@ -68,6 +68,7 @@ mersenne-forge pm1 --exponent 67 --b1 1000 --b2 3000
 mersenne-forge ecm --exponent 67 --b1 2000 --curves 40
 mersenne-forge pp1 --exponent 67 --b1 2000 --b2 50000 --run 1
 mersenne-forge selftest --backend dwt
+mersenne-forge policy --exponent 100000007 --tf-bits 77 --tests-saved 2
 mersenne-forge primenet-v5 register --user USER --worktype PRP
 mersenne-forge primenet-v5 fetch --worktodo worktodo.txt --count 2
 mersenne-forge primenet-v5 submit --results results.json.txt

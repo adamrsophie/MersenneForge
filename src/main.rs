@@ -444,6 +444,27 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Suggest how much factoring an exponent deserves before its test:
+    /// P-1 bounds (stage 1 only, and with stage 2) and, given the measured
+    /// cost of one trial factoring candidate in squarings, the bit level to
+    /// trial factor to. Prints JSON.
+    Policy {
+        #[arg(long)]
+        exponent: u32,
+        /// Trial factoring depth already done, in bits.
+        #[arg(long, default_value_t = 0)]
+        tf_bits: u32,
+        /// Primality tests a factor would save (2 for a first test).
+        #[arg(long, default_value_t = 2.0)]
+        tests_saved: f64,
+        /// Stage 2 cost per prime, in squarings.
+        #[arg(long, default_value_t = 1.0)]
+        stage2_cost: f64,
+        /// Cost of one trial factoring candidate, in squarings modulo
+        /// 2^p - 1 (measure it); without it no bit level is suggested.
+        #[arg(long)]
+        tf_cost: Option<f64>,
+    },
     /// Check that a reported factor divides 2^p - 1. Exit 0 when it does.
     CheckFactor {
         #[arg(long)]
@@ -1909,7 +1930,11 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
             // P-1 first, as upstream does; a factor ends the assignment,
             // otherwise the line stays with tests_saved = 0 for the test.
             use mersenne_forge::factor::{self, FactorLine, FactorWork};
-            let (b1, b2) = factor::pfactor_bounds(a.exponent);
+            let (b1, b2) = factor::pfactor_bounds(
+                a.exponent,
+                a.tf_bits.unwrap_or(0.0),
+                a.tests_saved.unwrap_or(1.0),
+            );
             let Some(next_line) = factor::with_pm1_done(&a.line, a.exponent) else {
                 leave(&a, "cannot rewrite the line after P-1", &mut skipped);
                 continue;
@@ -3185,6 +3210,7 @@ fn main() -> ExitCode {
         | Cmd::Tune { .. }
         | Cmd::Status { .. }
         | Cmd::Power { .. }
+        | Cmd::Policy { .. }
         | Cmd::CheckpointExport { .. }
         | Cmd::Primenet { .. }
         | Cmd::PrimenetV5 { .. } => false,
@@ -3535,6 +3561,32 @@ fn main() -> ExitCode {
                         0
                     })
                     .map_err(|e| fail(EXIT_UNSUPPORTED, e))
+            }
+            Cmd::Policy {
+                exponent,
+                tf_bits,
+                tests_saved,
+                stage2_cost,
+                tf_cost,
+            } => {
+                use mersenne_forge::policy;
+                if !(tests_saved.is_finite() && tests_saved >= 0.0) {
+                    Err(fail(2, "--tests-saved must be a nonnegative number"))
+                } else {
+                    let tf_target =
+                        tf_cost.map(|c| policy::tf_target_bits(exponent, tf_bits, tests_saved, c));
+                    let from = f64::from(tf_target.unwrap_or(tf_bits));
+                    let out = json!({
+                        "exponent": exponent,
+                        "tf_bits": tf_bits,
+                        "tests_saved": tests_saved,
+                        "tf_target_bits": tf_target,
+                        "pm1_stage1": policy::pm1_plan(exponent, from, tests_saved, None),
+                        "pm1": policy::pm1_plan(exponent, from, tests_saved, Some(stage2_cost)),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out).expect("json"));
+                    Ok(0)
+                }
             }
             Cmd::CheckFactor {
                 exponent,

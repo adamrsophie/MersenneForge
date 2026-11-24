@@ -1399,14 +1399,14 @@ impl FactorLine {
     }
 }
 
-/// Bounds for a `Pfactor=` line and for P-1 before a PRP test: stage 1
-/// only (B2 = B1): stage 2 pays a host round trip per prime and saves no
-/// progress, so `work` does not run it. ponytail: a fixed rule,
-/// B1 = p / 10 between 1,000 and 1,000,000; upstream's cost model
-/// (probability of a factor against tests saved) is the upgrade path.
-pub fn pfactor_bounds(p: u32) -> (u64, u64) {
-    let b1 = (u64::from(p) / 10).clamp(1000, 1_000_000);
-    (b1, b1)
+/// Bounds for a `Pfactor=` line and for P-1 before a PRP test, from the
+/// cost model of [`crate::policy`]: the B1 that maximizes the chance of a
+/// factor (above 2^tf_bits) times the tests it saves, less its cost.
+/// Stage 1 only (B2 = B1): stage 2 saves no progress, so `work` does not
+/// run it.
+pub fn pfactor_bounds(p: u32, tf_bits: f64, tests_saved: f64) -> (u64, u64) {
+    let plan = crate::policy::pm1_plan(p, tf_bits, tests_saved, None);
+    (plan.b1, plan.b1)
 }
 
 /// Largest exponent `work` runs P-1 for. Above it the final gcd on the
@@ -1491,11 +1491,14 @@ pub fn parse_factor_line(raw: &str) -> Result<Option<FactorLine>, String> {
         }
         "Pfactor" if !mersenne => {
             // The old form: p,tf_bits,double_check.
-            let [p, _, _] = parts[..] else {
+            let [p, tf, dc] = parts[..] else {
                 return Err(bad());
             };
             let p = int(p)?;
-            let (b1, b2) = pfactor_bounds(u32::try_from(p).map_err(|_| bad())?);
+            // A double check saves one test, a first test two.
+            let saved = if int(dc)? == 0 { 2.0 } else { 1.0 };
+            let (b1, b2) =
+                pfactor_bounds(u32::try_from(p).map_err(|_| bad())?, int(tf)? as f64, saved);
             (p, FactorWork::Pm1 { b1, b2 })
         }
         _ if !mersenne => {
@@ -1508,7 +1511,17 @@ pub fn parse_factor_line(raw: &str) -> Result<Option<FactorLine>, String> {
                 return Err(bad());
             }
             let p = int(parts[2])?;
-            let (b1, b2) = pfactor_bounds(u32::try_from(p).map_err(|_| bad())?);
+            let real = |s: &str| -> Result<f64, String> {
+                s.parse::<f64>()
+                    .ok()
+                    .filter(|x| x.is_finite() && *x >= 0.0)
+                    .ok_or_else(bad)
+            };
+            let (b1, b2) = pfactor_bounds(
+                u32::try_from(p).map_err(|_| bad())?,
+                real(parts[4])?,
+                real(parts[5])?,
+            );
             (p, FactorWork::Pm1 { b1, b2 })
         }
         "Pminus1" => {

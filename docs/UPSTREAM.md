@@ -23,7 +23,7 @@ no code was copied. Status words are those of [STATUS.md](STATUS.md):
 | `Cert=` | Prime95, gpuowl | written: run first (gpuowl's order), Gerbicz checked |
 | `Factor=` with optional `M` prefix, `//` comments | mfaktc, mfakto | written |
 | `Pminus1=` with tf_bits, B2_start, known factors | Prime95, Mlucas | written (B2_start is covered: stage 2 starts at B1) |
-| `Pfactor=`, old and new forms | Prime95 | written (bounds from a fixed rule, not Prime95's cost model) |
+| `Pfactor=`, old and new forms | Prime95 | written: B1 from this program's own cost model (`policy`; tf_bits and tests_saved from the line), stage 1 only; not Prime95's numbers |
 | `Pplus1=` with nth_run | Prime95 | written |
 | `ECM=`, `ECM2=` with B2, curves, sigma | Prime95 | written (host arithmetic, small exponents) |
 | `ECMSTAGE2=` with GMP-ECM save files | Prime95 | written: Suyama (PARAM=0) curves, Z normalized, skip and count fields, each N must divide 2^p - 1; `ECMSTAGE2N=` (no number given) is refused |
@@ -54,7 +54,7 @@ no code was copied. Status words are those of [STATUS.md](STATUS.md):
 | Speed comparable to gpuowl and Prime95 | gpuowl, Prime95 | not measured: no tuned baseline has been run (STATUS F16) |
 | CERT squarings with SHA3-256 hash | Prime95, gpuowl | written |
 | GPU trial factoring to 2^95 | mfaktc, mfakto | written (WGSL, three word Montgomery); no CUDA or OpenCL kernel |
-| GPU sieving | mfaktc, mfakto | written: per segment, the device strikes the sieve primes below 2^16 from host computed roots and tests the survivors; k is split into mfaktc's 4620 classes (only the 960 classes whose q is +-1 mod 8 and prime to 3, 5, 7, 11 are sieved, in blocks of 4620 * 2^16 k values); no `MoreClasses` (420 or 4620 is fixed at 4620) |
+| GPU sieving | mfaktc, mfakto | written: per segment, the device strikes the sieve primes below 2^16 from host computed roots and tests the survivors; k is split into mfaktc's 4620 classes (only the 960 classes whose q is +-1 mod 8 and prime to 3, 5, 7, 11 are sieved, in blocks of 4620 * 2^16 k values); no `MoreClasses` switch (always 4620 classes) |
 | P-1 stage 2 with prime pairing and polynomial multiplication | Prime95, gpuowl | prime pairing written: baby step giant step with D = 210 and f(t) = t^2, one subtraction and one multiplication per pair; subtraction is native on the CPU backend and a host round trip elsewhere. Polynomial stage 2 (FFT continuation) written behind `MERSENNE_FORGE_PM1_POLY=1`: D = 2310, F(X) = prod (X - x^(j^2)) evaluated at 240 giant points at a time with a subproduct and remainder tree; host polynomial arithmetic (Kronecker substitution on num-bigint), so B1 >= 11 and p <= 2,000,000 |
 | ECM on Edwards curves, GMP-ECM param 3, big stage 2 | Prime95 | not planned now: Montgomery curves, Suyama sigma, standard continuation |
 | P+1 stage 2 | Prime95 | written (one Lucas ladder per prime) |
