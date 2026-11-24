@@ -460,3 +460,40 @@ fn cert_and_cofactor_lines_run() {
     assert_eq!(r[1]["known-factors"][0], "47");
     assert_eq!(std::fs::read_to_string(&todo).unwrap(), "");
 }
+
+/// k*b^n+c and Fermat number lines run on the host and report Prime95's
+/// k, b, n, c fields; a cofactor line of that form is left in place.
+#[test]
+fn work_runs_generic_and_fermat_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let todo = dir.path().join("worktodo.txt");
+    std::fs::write(
+        &todo,
+        "PRP=3,2,5,1\nPRP=N/A,1,2,32,1,0,0,3,2\nPRP=1,2,16,1,\"65537\"\n",
+    )
+    .unwrap();
+    let o = work(dir.path(), &[]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&todo).unwrap(),
+        "PRP=1,2,16,1,\"65537\"\n"
+    );
+    let r = results(dir.path());
+    assert_eq!(r.len(), 2);
+    assert_eq!(
+        (r[0]["k"].as_u64(), r[0]["status"].as_str()),
+        (Some(3), Some("P"))
+    );
+    assert_eq!(r[0]["c"], 1);
+    assert_eq!(
+        (r[1]["n"].as_u64(), r[1]["status"].as_str()),
+        (Some(32), Some("C"))
+    );
+    assert_eq!(r[1]["residue-type"], 2);
+    assert!(r[0].get("exponent").is_none());
+}

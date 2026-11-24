@@ -1399,6 +1399,52 @@ fn run_cert_line(
 
 /// Run one factoring line. Ok(true): reported and removed; Ok(false):
 /// stopped by the budget or a stop request, the line stays.
+/// Run one k*b^n+c PRP line on the host; Ok(false) when stopped (the
+/// state stays in the checkpoint directory).
+fn run_generic_line(
+    w: &WorkArgs,
+    g: &mersenne_forge::generic::GenericLine,
+    deadline: Option<Instant>,
+) -> Result<bool, Failure> {
+    use mersenne_forge::generic;
+    let stop = || STOP.load(Ordering::SeqCst) || deadline.is_some_and(|d| Instant::now() >= d);
+    let done_before = std::fs::read_to_string(journal_path(&w.results))
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l == g.line);
+    if done_before {
+        replace_line(&w.worktodo, &g.line, None)?;
+        return Ok(true);
+    }
+    create_dir_all_durable(&w.checkpoint_dir)
+        .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", w.checkpoint_dir.display())))?;
+    let ck = w.checkpoint_dir.join(format!(
+        "generic-{}.state",
+        line_key(g.aid.as_deref(), &g.line)
+    ));
+    let o = generic::prp_generic(g, Some(&ck), &stop).map_err(|e| fail(EXIT_EXECUTION, e))?;
+    if !o.complete {
+        return Ok(false);
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let line = generic::result_line(g, &o, &mersenne_forge::worktodo::utc_timestamp(secs));
+    commit_line(w, &g.line, &g.line, &line.to_string(), None)?;
+    let _ = std::fs::remove_file(&ck);
+    println!(
+        "{}: {} (res64 {})",
+        g.name(),
+        if o.probable_prime {
+            "probable prime"
+        } else {
+            "composite"
+        },
+        o.res64
+    );
+    Ok(true)
+}
+
 fn run_factor_line(
     w: &WorkArgs,
     f: &mersenne_forge::factor::FactorLine,
@@ -1743,6 +1789,7 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
         }
         let mut next = None;
         let mut next_factor = None;
+        let mut next_generic = None;
         for raw in text.lines() {
             if mersenne_forge::cert::parse_cert_line(raw).is_ok_and(|c| c.is_some()) {
                 continue;
@@ -1762,6 +1809,20 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
                 }
                 Ok(Some(f)) if !skipped.contains(&f.line) => {
                     next_factor = Some(f);
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                Err(e) => {
+                    if warned.insert(e.clone()) {
+                        eprintln!("left in place: {e}");
+                    }
+                    continue;
+                }
+                Ok(None) => {}
+            }
+            match mersenne_forge::generic::parse_generic_line(raw) {
+                Ok(Some(g)) if !skipped.contains(&g.line) => {
+                    next_generic = Some(g);
                     break;
                 }
                 Ok(Some(_)) => continue,
@@ -1801,6 +1862,25 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
                 Err(e) => {
                     eprintln!("left in place: M{}: {}", f.exponent, e.message);
                     skipped.insert(f.line.clone());
+                }
+            }
+            continue;
+        }
+        if let Some(g) = next_generic {
+            w.status(
+                "running",
+                Some(&g.line),
+                json!({"done": done, "skipped": skipped.len()}),
+            );
+            match run_generic_line(w, &g, deadline) {
+                Ok(true) => done += 1,
+                Ok(false) => {
+                    println!("{}: PRP not finished; the line stays", g.name());
+                    return Ok(EXIT_INCOMPLETE);
+                }
+                Err(e) => {
+                    eprintln!("left in place: {}: {}", g.name(), e.message);
+                    skipped.insert(g.line.clone());
                 }
             }
             continue;
@@ -2635,6 +2715,10 @@ fn status_text(
     let text = std::fs::read_to_string(worktodo).unwrap_or_default();
     let (mut runnable, mut refused) = (Vec::new(), 0usize);
     for l in text.lines() {
+        if let Ok(Some(g)) = mersenne_forge::generic::parse_generic_line(l) {
+            runnable.push(g.line);
+            continue;
+        }
         match (factor::parse_factor_line(l), wt::parse_line(l)) {
             (Ok(Some(f)), _) => runnable.push(f.line),
             (Ok(None), Ok(Some(a))) => runnable.push(a.line),

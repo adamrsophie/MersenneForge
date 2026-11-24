@@ -13,6 +13,7 @@ pub mod checkpoint;
 pub mod evidence;
 pub mod exponent;
 pub mod factor;
+pub mod generic;
 pub mod ll;
 pub mod oracle;
 pub mod primenet;
@@ -63,12 +64,14 @@ const BUILD_SOURCES: &[(&str, &[u8])] = &[
         include_bytes!("backend/gpu/tf.wgsl"),
     ),
     ("src/backend/mod.rs", include_bytes!("backend/mod.rs")),
+    ("src/backend/shift.rs", include_bytes!("backend/shift.rs")),
     ("src/bench.rs", include_bytes!("bench.rs")),
     ("src/cert.rs", include_bytes!("cert.rs")),
     ("src/checkpoint.rs", include_bytes!("checkpoint.rs")),
     ("src/evidence.rs", include_bytes!("evidence.rs")),
     ("src/exponent.rs", include_bytes!("exponent.rs")),
     ("src/factor.rs", include_bytes!("factor.rs")),
+    ("src/generic.rs", include_bytes!("generic.rs")),
     ("src/lib.rs", include_bytes!("lib.rs")),
     ("src/ll.rs", include_bytes!("ll.rs")),
     ("src/main.rs", include_bytes!("main.rs")),

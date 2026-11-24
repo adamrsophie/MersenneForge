@@ -18,7 +18,7 @@ no code was copied. Status words are those of [STATUS.md](STATUS.md):
 | `PRP=`, `PRPDC=` with k,b,n,c, tf_bits, tests_saved, base, residue type | Prime95, gpuowl, Mlucas | done for 1,2,p,-1 base 3 type 1; written for types 3 and 5 |
 | Known factor lists (`"f1,f2"`), cofactor PRP (type 5) | Prime95, Mlucas, PrimeNet | written: each factor checked to divide 2^p - 1, cofactor decided on the host |
 | Residue types 2 and 4 | Prime95 | not planned: they need x_(p-1), which the engine does not keep, and PrimeNet assigns types 1 and 5 |
-| PRP bases other than 3, k*b^n+c numbers | Prime95 | not planned: every backend here is built on arithmetic modulo 2^p - 1 |
+| k*b^n+c numbers | Prime95 | written: `PRP=k,b,n,c` lines (residue types 1 to 4, base 3) run on the host in big integers with a Gerbicz product check over the chain of b-th powers, up to 2^20 bits; result lines carry `k`, `b`, `n`, `c`; no FFT backend, no cofactor tests, no other PRP bases |
 | `Test=`, `DoubleCheck=` (LL) | Prime95, gpuowl, Mlucas | done |
 | `Cert=` | Prime95, gpuowl | written: run first (gpuowl's order), Gerbicz checked |
 | `Factor=` with optional `M` prefix, `//` comments | mfaktc, mfakto | written |
@@ -29,7 +29,7 @@ no code was copied. Status words are those of [STATUS.md](STATUS.md):
 | `ECMSTAGE2=` with GMP-ECM save files | Prime95 | written: Suyama (PARAM=0) curves, Z normalized, skip and count fields, each N must divide 2^p - 1; `ECMSTAGE2N=` (no number given) is refused |
 | `B1=..,B2=..;` prefixes, `[Worker #n]` sections, `;` and `#` comments, case insensitive work types | Prime95, AutoPrimeNet, mfaktc | written |
 | `AdvancedTest=`, `AdvancedFactor=` | Prime95 | not planned: test and debugging forms |
-| Fermat numbers (Pépin test, `Fermat` lines) | Mlucas | not planned: arithmetic modulo 2^(2^m) + 1 needs other backends |
+| Fermat numbers (Pépin test, `Fermat` lines) | Mlucas | written: `Fermat,Test=m` (F1 to F20) and `PRP=1,2,2^m,1` run as the host k*b^n+c test, where residue type 2 is Pépin's test; no negacyclic transform |
 
 ## Result lines
 
