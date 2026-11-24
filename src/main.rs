@@ -3150,6 +3150,7 @@ fn main() -> ExitCode {
         | Cmd::Supervise { .. }
         | Cmd::Tune { .. }
         | Cmd::Status { .. }
+        | Cmd::Ui { .. }
         | Cmd::Power { .. }
         | Cmd::Policy { .. }
         | Cmd::CheckpointExport { .. }
