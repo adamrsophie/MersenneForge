@@ -66,7 +66,7 @@ no code was copied. Status words are those of [STATUS.md](STATUS.md):
 
 | Upstream feature | Where | Here |
 |---|---|---|
-| v5 API: `uc`, `po`, `ga`, `ap`, `au`, `ar` | Prime95, AutoPrimeNet | written: `primenet-v5`, with AutoPrimeNet's placeholder security fields for programs other than Prime95; never run against the server |
+| v5 API: `uc`, `po`, `ga`, `ap`, `au`, `ar` | Prime95, AutoPrimeNet | written: `primenet-v5`, with AutoPrimeNet's placeholder security fields for programs other than Prime95; `uc` (anonymous register) accepted by the server on 2026-11-24 with the v0.1.0 macOS build; `po`, `ga`, `ap`, `au`, `ar` not yet sent |
 | CERT start value download (`proof_get_data`, MD5 checked) | Prime95, AutoPrimeNet | written |
 | Proof upload | Prime95, AutoPrimeNet | written in `primenet` (never run against the server) |
 | Manual web forms | former gpuowl scripts | written: `primenet` |

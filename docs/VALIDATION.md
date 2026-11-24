@@ -18,6 +18,10 @@ New since 2026-11-19 and covered by these tests: PRP residue types 2 and 4, P-1 
 
 Not covered: no GPU test ran (`tests/gpu_backend.rs`, `tests/protocol_gpu.rs`, the TF kernel tests including `segment_kernel_matches_the_host`, lengths 2^23 and 2^24); no CUDA kernel ran on NVIDIA hardware; no sensor, release workflow, or PrimeNet exchange ran.
 
+## PrimeNet v5 registration (2026-11-24)
+
+The v0.1.0 release build for `aarch64-apple-darwin` (CPU, archive SHA-256 `6a42c3e2b731ae699d71c4da5f8b9777e2de3d8e8206255be1df0a459f2e2708`, from release run 45501164294) ran `mersenne-forge primenet-v5 register` with no user ID and no computer name. The server answered `uc` and the program printed `registered <guid> as user "ANONYMOUS", computer ""`, exit 0. This shows the request form, the placeholder security fields, and the reply parser work for `uc`; no other v5 call was sent, no assignment was fetched, and no result was submitted.
+
 ## GPU tests on a software Vulkan device (2026-11-24)
 
 The `gpu-software` CI job runs the GPU suites on Mesa llvmpipe (LLVM 21.1.8, Vulkan 1.4.341) with `MERSENNE_FORGE_ALLOW_SOFTWARE_GPU=1`. Run 45489277161 (commit `cedbd28`) passed:

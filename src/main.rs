@@ -343,7 +343,8 @@ enum Cmd {
     },
     /// The PrimeNet v5 API, the protocol Prime95 and AutoPrimeNet speak:
     /// register this computer, fetch assignments, send results, report
-    /// progress, unreserve. NOT TESTED against the PrimeNet server.
+    /// progress, unreserve. Only `register` has been sent to the PrimeNet
+    /// server (once, anonymously); the other actions are untested there.
     PrimenetV5 {
         /// Holds the computer GUID and the log of results sent.
         #[arg(long, default_value = "primenet")]
