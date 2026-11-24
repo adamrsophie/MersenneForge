@@ -466,6 +466,102 @@ fn stage2_paired(
     result
 }
 
+/// Giant step width of the polynomial stage 2: 2 * 3 * 5 * 7 * 11, so 240
+/// baby steps.
+const POLY_D: u64 = 2310;
+
+/// Largest exponent for the polynomial stage 2, whose coefficients all live
+/// on the host (see [`crate::poly`]).
+pub const POLY_MAX_P: u32 = 2_000_000;
+
+/// The polynomial stage 2 was asked for (`MERSENNE_FORGE_PM1_POLY=1`).
+fn poly_requested() -> bool {
+    std::env::var("MERSENNE_FORGE_PM1_POLY").is_ok_and(|v| v == "1")
+}
+
+/// Stage 2 as a polynomial evaluation (the "FFT continuation"): with
+/// b_j = x^(j^2) for the j below D / 2 coprime to D and g_m = x^((mD)^2),
+/// the product over m of F(g_m), F(X) = prod_j (X - b_j), holds every term
+/// g_m - b_j of [`stage2_paired`], so it covers every prime mD +- j up to
+/// B2. The device computes the b_j and g_m with the same recurrences;
+/// F is built once and evaluated at 240 giant points at a time on the host
+/// with a remainder tree. It multiplies in the terms for composite mD +- j
+/// too, which do no harm. The caller ensures every prime factor of D is at
+/// most B1 and (B2 + D)^2 fits in a u64. Returns the product, or None when
+/// stopped.
+fn stage2_poly(
+    be: &mut dyn Backend,
+    x: crate::backend::Reg,
+    primes: &[u64],
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<BigUint>, String> {
+    let berr = |e: crate::backend::BackendError| e.to_string();
+    let p = be.exponent();
+    let ring = crate::poly::Ring::new(p);
+    let d = POLY_D;
+    let (Some(&lo), Some(&hi)) = (primes.first(), primes.last()) else {
+        return Ok(Some(BigUint::one()));
+    };
+    let js: Vec<u64> = (1..d / 2).filter(|j| j.gcd(&d) == 1).collect();
+    let mut regs = Vec::new();
+    let result = (|| -> Result<Option<BigUint>, String> {
+        let mut new_reg = |be: &mut dyn Backend| -> Result<crate::backend::Reg, String> {
+            let r = be.alloc().map_err(berr)?;
+            regs.push(r);
+            Ok(r)
+        };
+        let tmp = new_reg(be)?;
+        let cur = new_reg(be)?;
+        let inc = new_reg(be)?;
+        let x8 = new_reg(be)?;
+        be.copy(cur, x).map_err(berr)?;
+        pow_small(be, x8, x, 8, tmp)?;
+        be.copy(inc, x8).map_err(berr)?;
+        let mut roots = Vec::with_capacity(js.len());
+        let mut j = 1;
+        while j <= *js.last().expect("D has units") {
+            if js.binary_search(&j).is_ok() {
+                roots.push(be.export(cur).map_err(berr)?.to_biguint());
+            }
+            be.mul(cur, inc).map_err(berr)?;
+            be.mul(inc, x8).map_err(berr)?;
+            j += 2;
+        }
+        let f = ring.from_roots(&roots);
+        let m_lo = lo.saturating_sub(d / 2) / d;
+        let m_hi = (hi + d / 2) / d;
+        let (g, r, s) = (new_reg(be)?, new_reg(be)?, new_reg(be)?);
+        if m_lo == 0 {
+            be.import(g, &Residue::from_u64(p, 1)).map_err(berr)?;
+        } else {
+            pow_small(be, g, x, (m_lo * d) * (m_lo * d), tmp)?;
+        }
+        pow_small(be, r, x, (2 * m_lo + 1) * d * d, tmp)?;
+        pow_small(be, s, x, 2 * d * d, tmp)?;
+        let mut acc = BigUint::one();
+        let mut batch = Vec::with_capacity(js.len());
+        for m in m_lo..=m_hi {
+            batch.push(be.export(g).map_err(berr)?.to_biguint());
+            if batch.len() == js.len() || m == m_hi {
+                for v in ring.eval(&f, &batch) {
+                    acc = ring.mul_elt(&acc, &v);
+                }
+                batch.clear();
+                if stop() {
+                    return Ok(None);
+                }
+            }
+            be.mul(g, r).map_err(berr)?;
+            be.mul(r, s).map_err(berr)?;
+        }
+        Ok(Some(acc))
+    })();
+    for r in regs {
+        let _ = be.free(r);
+    }
+    result
+}
+
 /// Stage 1 state: after bit `i` of E (counting down), x = 3^(E >> i).
 pub type Stage1State = (u64, Residue);
 
@@ -561,6 +657,31 @@ pub fn pm1_resumable(
         out.complete = true;
         return Ok(out);
     };
+    // Polynomial stage 2 on request, where it fits (see `stage2_poly`).
+    if poly_requested() {
+        if b1 >= 11 && p <= POLY_MAX_P && (b2 + POLY_D).checked_mul(b2 + POLY_D).is_some() {
+            let xr = be.alloc().map_err(berr)?;
+            let res = be
+                .import(xr, &x1)
+                .map_err(berr)
+                .and_then(|()| stage2_poly(be, xr, &primes, stop));
+            let _ = be.free(xr);
+            let Some(acc) = res? else {
+                out.notes.push("stopped in stage 2".into());
+                return Ok(out);
+            };
+            out.notes.push("polynomial stage 2".into());
+            if let Some(f) = factor_from(p, &acc, &n, &mut out.notes) {
+                out.factor = Some(f);
+                out.stage = Some(2);
+            }
+            out.complete = true;
+            return Ok(out);
+        }
+        out.notes.push(format!(
+            "polynomial stage 2 needs B1 >= 11 and p <= {POLY_MAX_P}; paired stage 2 instead"
+        ));
+    }
     // Paired stage 2 when the bounds allow it (see `stage2_paired`).
     if b1 >= 7 && (b2 + PAIR_D).checked_mul(b2 + PAIR_D).is_some() {
         let xr = be.alloc().map_err(berr)?;
@@ -1688,6 +1809,41 @@ mod tests {
         let mut dwt = crate::backend::dwt::DwtBackend::new(67).unwrap();
         let o = pm1(&mut dwt, 1000, 3000, &|| false).unwrap();
         assert_eq!((o.factor.as_deref(), o.stage), (Some("193707721"), Some(2)));
+    }
+
+    /// The polynomial stage 2 finds what the paired one finds, and its
+    /// product holds every paired term (so a factor of one divides the
+    /// other's gcd with N).
+    #[test]
+    fn polynomial_stage_2_matches_the_paired_one() {
+        use crate::backend::Backend;
+        let p = 67;
+        let n = modulus(p);
+        let mut be = crate::backend::cpu::CpuBackend::new(p).unwrap();
+        // x = 3^E for B1 = 1000, as stage 1 leaves it.
+        let e = stage1_exponent(p, 1000);
+        let x1 = Residue::from_biguint(p, &BigUint::from(3u32).modpow(&e, &n));
+        for b2 in [2676u64, 2677, 3000, 20_000] {
+            let primes: Vec<u64> = primes_below(b2 + 1)
+                .into_iter()
+                .filter(|&q| q > 1000)
+                .collect();
+            let xr = be.alloc().unwrap();
+            be.import(xr, &x1).unwrap();
+            let poly = stage2_poly(&mut be, xr, &primes, &|| false)
+                .unwrap()
+                .unwrap();
+            let paired = stage2_paired(&mut be, xr, &primes, &|| false)
+                .unwrap()
+                .unwrap();
+            be.free(xr).unwrap();
+            let (gp, gq) = (poly.gcd(&n), paired.gcd(&n));
+            assert!((&gp % &gq).is_zero(), "B2 = {b2}: {gp} {gq}");
+            // 193707721 needs the prime 2677. The giant steps of D = 2310
+            // run to 3464 = 2310 + 1154 whatever B2, so even B2 = 2676,
+            // where the paired gcd is 1, finds it.
+            assert_eq!(gp.to_string(), "193707721", "B2 = {b2}");
+        }
     }
 
     #[test]
