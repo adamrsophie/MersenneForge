@@ -2,6 +2,22 @@
 
 Historical results below used Apple M2 (macOS 27.2, arm64), Rust 1.100.0 stable. The completion checks dated 2026-11-16 used the same hardware with macOS 27.2.1. No NVIDIA, AMD, or Intel GPU was available. Nothing here was run on CUDA hardware.
 
+## Continuous integration (2026-11-24)
+
+The build host was too loaded to compile or test after 2026-11-19, so GitHub Actions did both. Runs (repository `adamrsophie/MersenneForge`, workflow `ci`): 45443574126 (the backlog, after its fixes), 45455447642 (P-1 stage 2 pairing), 45456831356 (`ECMSTAGE2=`), 45457319409 and 45457651572 (`status --serve`), and 45458391415 (device sieve, commit `f9a0d94`). The `ubuntu-latest` and `msrv` jobs passed in every one; the `macos-latest` job was never given a runner and proves nothing.
+
+| Command (ubuntu-latest, Rust 1.100.0, run 45458391415) | Observed result |
+|---|---|
+| `cargo build --locked --all-targets`; `cargo test --locked` | 176 passed, 0 failed, 5 ignored by default |
+| `cargo clippy --locked --all-targets -- -D warnings`; `cargo fmt --check`; `cargo doc --locked --no-deps --features gpu,cuda` | passed (clippy on default features only) |
+| `cargo check --locked --features gpu --all-targets`; same with `--features cuda` | passed; compiled only |
+| `cargo test --locked --features cuda --lib backend::cuda`; `--test cuda_kernel_emulation` | 20 and 6 passed; CPU model and emulation, not CUDA hardware |
+| `msrv` job: `cargo test --locked` and `cargo check --locked --all-targets --features gpu,cuda` on Rust 1.89 | passed |
+
+New since 2026-11-19 and covered by these tests: PRP residue types 2 and 4, P-1 stage 2 prime pairing, `ECMSTAGE2=` from GMP-ECM save files, `status --serve` (token and Host check), and the backlog rows marked CI tested in STATUS.md.
+
+Not covered: no GPU test ran (`tests/gpu_backend.rs`, `tests/protocol_gpu.rs`, the TF kernel tests including `segment_kernel_matches_the_host`, lengths 2^23 and 2^24); no CUDA kernel ran on NVIDIA hardware; no sensor, release workflow, or PrimeNet exchange ran.
+
 ## Benchmark evidence, work queue, and factor checks (2026-11-19)
 
 Implementation source SHA3-256: `390fa29f7066fc0c46b4e48831a7d1076c4221adc5f7c818157ad7980758c914`; debug executable SHA-256 `79b8d86d8292c0132b8b712310721f1b226d4926860bbdd806144b6f2b40d4af` (Apple M2, macOS 27.2.1, Rust 1.100.0).
