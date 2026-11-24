@@ -1,8 +1,11 @@
 # Copyright (C) 2026 Adam R Sophie. GPL-3.0-only.
 #
-# CPU continuous integration. GPU and CUDA tests (tests/protocol_gpu.rs,
-# tests/protocol_cuda.rs) need real hardware and are NOT run here; the gpu
-# feature is only compiled, which proves nothing about GPU arithmetic.
+# Continuous integration on Linux: the CPU checks, the minimum Rust
+# version, and the GPU suites on Mesa llvmpipe (a software Vulkan device,
+# which shows the kernels compute the right values, not that a hardware
+# GPU does). CUDA tests need NVIDIA hardware and are not run. macOS is built
+# and tested by the release workflow; a macOS job here was never given a
+# runner, so it is left out.
 
 name: ci
 
@@ -15,10 +18,7 @@ env:
 
 jobs:
   cpu:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
