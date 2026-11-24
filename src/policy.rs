@@ -23,7 +23,7 @@ use serde::Serialize;
 use std::sync::OnceLock;
 
 /// Steps per unit of u in the rho table.
-const RHO_STEPS: usize = 256;
+const RHO_STEPS: usize = 2048;
 /// rho is tabulated up to this u; beyond it the chance is below 1e-29.
 const RHO_MAX: f64 = 24.0;
 

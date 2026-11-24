@@ -149,7 +149,7 @@ impl TfSegment<'_> {
     /// The index of k, when k is in the segment.
     pub fn index(&self, k: u128) -> Option<usize> {
         let s = u128::from(self.stride);
-        (k >= self.k0 && (k - self.k0) % s == 0)
+        (k >= self.k0 && (k - self.k0).is_multiple_of(s))
             .then(|| (k - self.k0) / s)
             .filter(|&i| i < self.len as u128)
             .map(|i| i as usize)
@@ -311,7 +311,11 @@ pub fn trial_factor_segments(
                 }
                 let kc = k0 + c;
                 let q = two_p * kc + 1;
-                if !matches!(q & 7, 1 | 7) || CLASS_PRIMES.iter().any(|&s| q % u128::from(s) == 0) {
+                if !matches!(q & 7, 1 | 7)
+                    || CLASS_PRIMES
+                        .iter()
+                        .any(|&s| q.is_multiple_of(u128::from(s)))
+                {
                     continue;
                 }
                 let len = (span - c).div_ceil(classes) as usize;
