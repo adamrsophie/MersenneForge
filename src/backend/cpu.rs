@@ -191,6 +191,19 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
+    fn sub(&mut self, dst: Reg, src: Reg) -> BackendResult<()> {
+        if dst == src {
+            return Err(BackendError::Unsupported(
+                "sub needs distinct handles".into(),
+            ));
+        }
+        let b = self.get(src)?.clone();
+        let a = std::mem::take(self.get_mut(dst)?);
+        let v = if a >= b { a - b } else { a + &self.n - b };
+        *self.get_mut(dst)? = v;
+        Ok(())
+    }
+
     fn mul(&mut self, dst: Reg, src: Reg) -> BackendResult<()> {
         if dst == src {
             return Err(BackendError::Unsupported(

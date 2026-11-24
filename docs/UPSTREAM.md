@@ -55,7 +55,7 @@ no code was copied. Status words are those of [STATUS.md](STATUS.md):
 | CERT squarings with SHA3-256 hash | Prime95, gpuowl | written |
 | GPU trial factoring to 2^95 | mfaktc, mfakto | written (WGSL, three word Montgomery); no CUDA or OpenCL kernel |
 | GPU sieving, 4620 class split, `MoreClasses` | mfaktc, mfakto | not planned: the host sieves and batches candidates |
-| P-1 stage 2 with prime pairing and polynomial multiplication | Prime95, gpuowl | not planned now: stage 2 here is one prime at a time |
+| P-1 stage 2 with prime pairing and polynomial multiplication | Prime95, gpuowl | prime pairing written: baby step giant step with D = 210 and f(t) = t^2, one subtraction and one multiplication per pair; subtraction is native on the CPU backend and a host round trip elsewhere; no polynomial multiplication (FFT continuation) |
 | ECM on Edwards curves, GMP-ECM param 3, big stage 2 | Prime95 | not planned now: Montgomery curves, Suyama sigma, standard continuation |
 | P+1 stage 2 | Prime95 | written (one Lucas ladder per prime) |
 | Self test (mfaktc `-st`, Prime95 torture test) | mfaktc, Prime95 | written: `selftest` checks correctness; it is not a stress test with heat and memory load |

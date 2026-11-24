@@ -177,6 +177,9 @@ impl Backend for Box<dyn Backend> {
     fn mul(&mut self, dst: Reg, src: Reg) -> BackendResult<()> {
         (**self).mul(dst, src)
     }
+    fn sub(&mut self, dst: Reg, src: Reg) -> BackendResult<()> {
+        (**self).sub(dst, src)
+    }
     fn equal(&mut self, a: Reg, b: Reg) -> BackendResult<bool> {
         (**self).equal(a, b)
     }

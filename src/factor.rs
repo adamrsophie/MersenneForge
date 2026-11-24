@@ -311,6 +311,97 @@ fn pow_small(
     Ok(())
 }
 
+/// Giant step width of the paired stage 2: 2 * 3 * 5 * 7.
+const PAIR_D: u64 = 210;
+
+/// Stage 2 with prime pairing (Montgomery's baby step giant step with the
+/// Brent-Suyama polynomial f(t) = t^2). Every prime q in `primes` is written
+/// q = m D +- j with D = 210 and j < D / 2 coprime to D, and acc collects
+/// x^((mD)^2) - x^(j^2) = x^(j^2) (x^((mD - j)(mD + j)) - 1), which is 0
+/// modulo any factor where the order of x divides mD - j or mD + j. So one
+/// term covers both primes of a pair, and no inverse is needed. Per term:
+/// one copy, one subtraction, one multiplication; per giant step two
+/// multiplications. The caller ensures every prime factor of D is at most
+/// B1 and (B2 + D)^2 fits in a u64. Returns the product, or None when
+/// stopped. ponytail: D is fixed at 210 (24 baby registers); a larger D
+/// saves giant steps for large B2 at the cost of more resident registers.
+fn stage2_paired(
+    be: &mut dyn Backend,
+    x: crate::backend::Reg,
+    primes: &[u64],
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<BigUint>, String> {
+    let berr = |e: crate::backend::BackendError| e.to_string();
+    let p = be.exponent();
+    let d = PAIR_D;
+    let (Some(&lo), Some(&hi)) = (primes.first(), primes.last()) else {
+        return Ok(Some(BigUint::one()));
+    };
+    let is_prime = |q: u64| q >= lo && q <= hi && primes.binary_search(&q).is_ok();
+    let js: Vec<u64> = (1..d / 2).filter(|j| j.gcd(&d) == 1).collect();
+    let mut regs = Vec::new();
+    let result = (|| -> Result<Option<BigUint>, String> {
+        let mut new_reg = |be: &mut dyn Backend| -> Result<crate::backend::Reg, String> {
+            let r = be.alloc().map_err(berr)?;
+            regs.push(r);
+            Ok(r)
+        };
+        let tmp = new_reg(be)?;
+        // Baby steps: x^(j^2) for odd j, from x^((j+2)^2) = x^(j^2) x^(4j+4).
+        let cur = new_reg(be)?;
+        let inc = new_reg(be)?;
+        let x8 = new_reg(be)?;
+        be.copy(cur, x).map_err(berr)?;
+        pow_small(be, x8, x, 8, tmp)?;
+        be.copy(inc, x8).map_err(berr)?;
+        let mut baby = std::collections::HashMap::new();
+        let mut j = 1;
+        while j <= *js.last().expect("D has units") {
+            if js.contains(&j) {
+                let r = new_reg(be)?;
+                be.copy(r, cur).map_err(berr)?;
+                baby.insert(j, r);
+            }
+            be.mul(cur, inc).map_err(berr)?;
+            be.mul(inc, x8).map_err(berr)?;
+            j += 2;
+        }
+        // Giant steps: G = x^((mD)^2), R = x^((2m + 1) D^2), S = x^(2 D^2).
+        let m_lo = lo.saturating_sub(d / 2) / d;
+        let m_hi = (hi + d / 2) / d;
+        let (g, r, s) = (new_reg(be)?, new_reg(be)?, new_reg(be)?);
+        if m_lo == 0 {
+            be.import(g, &Residue::from_u64(p, 1)).map_err(berr)?;
+        } else {
+            pow_small(be, g, x, (m_lo * d) * (m_lo * d), tmp)?;
+        }
+        pow_small(be, r, x, (2 * m_lo + 1) * d * d, tmp)?;
+        pow_small(be, s, x, 2 * d * d, tmp)?;
+        let acc = new_reg(be)?;
+        be.import(acc, &Residue::from_u64(p, 1)).map_err(berr)?;
+        for m in m_lo..=m_hi {
+            for &j in &js {
+                let md = m * d;
+                if is_prime(md + j) || (md > j && is_prime(md - j)) {
+                    be.copy(tmp, g).map_err(berr)?;
+                    be.sub(tmp, baby[&j]).map_err(berr)?;
+                    be.mul(acc, tmp).map_err(berr)?;
+                }
+            }
+            be.mul(g, r).map_err(berr)?;
+            be.mul(r, s).map_err(berr)?;
+            if m % 100 == 0 && stop() {
+                return Ok(None);
+            }
+        }
+        Ok(Some(be.export(acc).map_err(berr)?.to_biguint()))
+    })();
+    for r in regs {
+        let _ = be.free(r);
+    }
+    result
+}
+
 /// Stage 1 state: after bit `i` of E (counting down), x = 3^(E >> i).
 pub type Stage1State = (u64, Residue);
 
@@ -398,12 +489,6 @@ pub fn pm1_resumable(
         out.complete = true;
         return Ok(out);
     }
-    // Stage 2 on the backend: y = x^q walks the primes by multiplying with
-    // cached powers x^d for each prime gap d, and acc collects (y - 1). The
-    // backend has no subtraction, so y goes to the host once per prime for
-    // the O(p) "- 1" and comes back; every multiplication stays on the
-    // device. ponytail: no prime pairing or baby step giant step; one device
-    // multiply plus one round trip per prime, upgrade when B2 grows large.
     let primes: Vec<u64> = primes_below(b2 + 1)
         .into_iter()
         .filter(|&q| q > b1)
@@ -412,6 +497,28 @@ pub fn pm1_resumable(
         out.complete = true;
         return Ok(out);
     };
+    // Paired stage 2 when the bounds allow it (see `stage2_paired`).
+    if b1 >= 7 && (b2 + PAIR_D).checked_mul(b2 + PAIR_D).is_some() {
+        let xr = be.alloc().map_err(berr)?;
+        let res = be
+            .import(xr, &x1)
+            .map_err(berr)
+            .and_then(|()| stage2_paired(be, xr, &primes, stop));
+        let _ = be.free(xr);
+        let Some(acc) = res? else {
+            out.notes.push("stopped in stage 2".into());
+            return Ok(out);
+        };
+        if let Some(f) = factor_from(p, &acc, &n, &mut out.notes) {
+            out.factor = Some(f);
+            out.stage = Some(2);
+        }
+        out.complete = true;
+        return Ok(out);
+    }
+    // Stage 2 for B1 < 7: y = x^q walks the primes by multiplying with
+    // cached powers x^d for each prime gap d, and acc collects (y - 1), one
+    // multiply and one host round trip per prime.
     let xr = be.alloc().map_err(berr)?;
     be.import(xr, &x1).map_err(berr)?;
     let y = be.alloc().map_err(berr)?;
@@ -1206,6 +1313,38 @@ mod tests {
         assert_eq!((o.factor.as_deref(), o.stage), (Some("193707721"), Some(2)));
         let o = pm1(&mut be, 100, 200, &|| false).unwrap();
         assert!(o.factor.is_none() && o.complete);
+        // The paired stage 2 covers B2 exactly (2677 = 13 * 210 - 53) and
+        // stops short of it below.
+        let o = pm1(&mut be, 1000, 2677, &|| false).unwrap();
+        assert_eq!(o.factor.as_deref(), Some("193707721"));
+        let o = pm1(&mut be, 1000, 2676, &|| false).unwrap();
+        assert!(o.factor.is_none() && o.complete);
+        // A backend without device subtraction (the default `sub`) agrees.
+        let mut dwt = crate::backend::dwt::DwtBackend::new(67).unwrap();
+        let o = pm1(&mut dwt, 1000, 3000, &|| false).unwrap();
+        assert_eq!((o.factor.as_deref(), o.stage), (Some("193707721"), Some(2)));
+    }
+
+    #[test]
+    fn the_default_sub_matches_the_cpu_backend() {
+        use crate::backend::Backend;
+        let p = 127;
+        let n = modulus(p);
+        let mut cpu = crate::backend::cpu::CpuBackend::new(p).unwrap();
+        let mut dwt = crate::backend::dwt::DwtBackend::new(p).unwrap();
+        for (a, b) in [(5u64, 3u64), (3, 5), (0, 1), (7, 7)] {
+            let want = (BigUint::from(a) + &n - BigUint::from(b)) % &n;
+            for be in [&mut cpu as &mut dyn Backend, &mut dwt] {
+                let (ra, rb) = (be.alloc().unwrap(), be.alloc().unwrap());
+                be.import(ra, &Residue::from_u64(p, a)).unwrap();
+                be.import(rb, &Residue::from_u64(p, b)).unwrap();
+                be.sub(ra, rb).unwrap();
+                assert_eq!(be.export(ra).unwrap().to_biguint(), want, "{a} - {b}");
+                assert!(be.sub(ra, ra).is_err());
+                be.free(ra).unwrap();
+                be.free(rb).unwrap();
+            }
+        }
     }
 
     #[test]

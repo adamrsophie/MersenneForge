@@ -165,6 +165,23 @@ pub trait Backend {
     /// dst <- dst * src mod N. `dst` and `src` must be different handles.
     fn mul(&mut self, dst: Reg, src: Reg) -> BackendResult<()>;
 
+    /// dst <- dst - src mod N. `dst` and `src` must be different handles.
+    /// The default reads both to the host and writes the difference back;
+    /// a backend with device subtraction overrides it.
+    fn sub(&mut self, dst: Reg, src: Reg) -> BackendResult<()> {
+        if dst == src {
+            return Err(BackendError::Unsupported(
+                "sub needs distinct handles".into(),
+            ));
+        }
+        let p = self.exponent();
+        let n = crate::residue::modulus(p);
+        let a = self.export(dst)?.to_biguint();
+        let b = self.export(src)?.to_biguint();
+        let d = if a >= b { a - b } else { a + &n - b };
+        self.import(dst, &Residue::from_biguint(p, &d))
+    }
+
     /// Whether the two residues are equal as integers modulo N. Compares the
     /// complete values, not a fingerprint.
     fn equal(&mut self, a: Reg, b: Reg) -> BackendResult<bool>;
