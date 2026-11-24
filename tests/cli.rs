@@ -1399,3 +1399,51 @@ fn tune_compares_dwt_variants_and_they_agree() {
     assert!(rows.iter().all(|r| r["agrees_with_default"] == true));
     assert!(v["fastest"]["ms_per_iteration"].as_f64().unwrap() > 0.0);
 }
+
+/// `status --serve` answers on loopback with the page and the plain text,
+/// and refuses a public address.
+#[test]
+fn status_serves_a_local_page() {
+    use std::io::{BufRead, Read, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let todo = dir.path().join("worktodo.txt");
+    std::fs::write(&todo, "PRP=127\n<script>\n").unwrap();
+    let exe = env!("CARGO_BIN_EXE_mersenne-forge");
+    let o = std::process::Command::new(exe)
+        .args(["status", "--worktodo", s(&todo), "--serve", "0.0.0.0:0"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    let mut child = std::process::Command::new(exe)
+        .args(["status", "--worktodo", s(&todo), "--serve", "127.0.0.1:0"])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(child.stderr.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let addr = line
+        .split("http://")
+        .nth(1)
+        .and_then(|r| r.split('/').next())
+        .unwrap()
+        .to_string();
+    let get = |path: &str| {
+        let mut c = std::net::TcpStream::connect(&addr).unwrap();
+        write!(c, "GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let mut r = String::new();
+        c.read_to_string(&mut r).unwrap();
+        r
+    };
+    let page = get("/");
+    let text = get("/status.txt");
+    let missing = get("/nope");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    assert!(page.contains("<pre>") && page.contains("PRP=127"));
+    assert!(page.contains("1 runnable"));
+    assert!(text.starts_with("HTTP/1.1 200") && text.contains("1 runnable"));
+    assert!(missing.starts_with("HTTP/1.1 404"));
+}

@@ -291,6 +291,11 @@ enum Cmd {
         status_file: Vec<PathBuf>,
         #[arg(long)]
         watch: Option<u64>,
+        /// Serve the status as a web page (refreshed every 5 s) and as text
+        /// at /status.txt on this loopback address, for example
+        /// 127.0.0.1:8080, until Ctrl-C. Read only.
+        #[arg(long)]
+        serve: Option<std::net::SocketAddr>,
     },
     /// Print one power reading in watts from a built-in sensor, for use as a
     /// benchmark telemetry command: rapl (Linux CPU package), nvidia
@@ -2587,10 +2592,17 @@ fn cmd_supervise(config: &Path, max_restarts: u32) -> Result<u8, Failure> {
     }
 }
 
-/// Print the state of one queue: runnable and refused lines, checkpoints,
-/// result counts, and worker status files.
-fn print_status(worktodo: &Path, results: &Path, ckpt_dir: Option<&Path>, status: &[PathBuf]) {
+/// The state of one queue as text: runnable and refused lines,
+/// checkpoints, result counts, and worker status files.
+fn status_text(
+    worktodo: &Path,
+    results: &Path,
+    ckpt_dir: Option<&Path>,
+    status: &[PathBuf],
+) -> String {
     use mersenne_forge::{factor, worktodo as wt};
+    use std::fmt::Write as _;
+    let mut out = String::new();
     let text = std::fs::read_to_string(worktodo).unwrap_or_default();
     let (mut runnable, mut refused) = (Vec::new(), 0usize);
     for l in text.lines() {
@@ -2601,14 +2613,15 @@ fn print_status(worktodo: &Path, results: &Path, ckpt_dir: Option<&Path>, status
             _ => refused += 1,
         }
     }
-    println!(
+    let _ = writeln!(
+        out,
         "{}: {} runnable, {} left for other programs",
         worktodo.display(),
         runnable.len(),
         refused
     );
     for l in runnable.iter().take(5) {
-        println!("  {l}");
+        let _ = writeln!(out, "  {l}");
     }
     let lines = std::fs::read_to_string(results).unwrap_or_default();
     let mut by_status = std::collections::BTreeMap::<String, usize>::new();
@@ -2623,16 +2636,17 @@ fn print_status(worktodo: &Path, results: &Path, ckpt_dir: Option<&Path>, status
         );
         *by_status.entry(key).or_default() += 1;
     }
-    println!("{}: {by_status:?}", results.display());
+    let _ = writeln!(out, "{}: {by_status:?}", results.display());
     if let Some(d) = ckpt_dir {
         for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
             let path = e.path();
             if path.extension().is_some_and(|x| x == "ckpt") {
-                match Checkpoint::load_file(&path) {
+                let _ = match Checkpoint::load_file(&path) {
                     Ok(ck) => {
                         let done = (ck.meta.k as f64 / f64::from(ck.meta.exponent.max(1))).min(1.0);
                         let filled = (done * 30.0).round() as usize;
-                        println!(
+                        writeln!(
+                            out,
                             "  {}: {} k = {} of {}\n    [{}{}] {:.1}%, {:.0} s",
                             path.display(),
                             ck.meta.protocol,
@@ -2644,15 +2658,16 @@ fn print_status(worktodo: &Path, results: &Path, ckpt_dir: Option<&Path>, status
                             ck.meta.elapsed_secs
                         )
                     }
-                    Err(e) => println!("  {}: {e}", path.display()),
-                }
+                    Err(e) => writeln!(out, "  {}: {e}", path.display()),
+                };
             }
         }
     }
     for s in status {
-        match std::fs::read_to_string(s) {
+        let _ = match std::fs::read_to_string(s) {
             Ok(t) => match serde_json::from_str::<serde_json::Value>(&t) {
-                Ok(v) => println!(
+                Ok(v) => writeln!(
+                    out,
                     "{}: {} on {} {} at {}: {}{}",
                     s.display(),
                     v["state"].as_str().unwrap_or("?"),
@@ -2665,11 +2680,109 @@ fn print_status(worktodo: &Path, results: &Path, ckpt_dir: Option<&Path>, status
                         .map(|c| format!(" (exit {c})"))
                         .unwrap_or_default()
                 ),
-                Err(_) => println!("{}:\n{t}", s.display()),
+                Err(_) => writeln!(out, "{}:\n{t}", s.display()),
             },
-            Err(e) => println!("{}: {e}", s.display()),
+            Err(e) => writeln!(out, "{}: {e}", s.display()),
+        };
+    }
+    out
+}
+
+/// Serve `text()` over HTTP on a loopback address until Ctrl-C: `/` is an
+/// HTML page that reloads every 5 s, `/status.txt` the plain text. Any
+/// other path is 404; only GET and HEAD are answered. Requests are handled
+/// one at a time. ponytail: a single threaded loop with no keep-alive; a
+/// slow client delays the next one by at most the 5 s read timeout.
+fn serve_status(addr: std::net::SocketAddr, text: impl Fn() -> String) -> Result<u8, Failure> {
+    use std::io::{Read, Write};
+    // The page shows local paths and queue contents: never on a public
+    // interface.
+    if !addr.ip().is_loopback() {
+        return Err(fail(
+            2,
+            format!("--serve {addr}: only loopback addresses are allowed"),
+        ));
+    }
+    let listener = std::net::TcpListener::bind(addr)
+        .map_err(|e| fail(EXIT_STATE, format!("--serve {addr}: {e}")))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| fail(EXIT_STATE, e.to_string()))?;
+    let addr = listener.local_addr().unwrap_or(addr);
+    eprintln!("serving status at http://{addr}/ (Ctrl-C to stop)");
+    while !STOP.load(Ordering::SeqCst) {
+        let mut stream = match listener.accept() {
+            Ok((s, _)) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(e) => {
+                eprintln!("--serve: {e}");
+                continue;
+            }
+        };
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut buf = [0u8; 4096];
+        let mut req = Vec::new();
+        while !req.windows(4).any(|w| w == b"\r\n\r\n") && req.len() < buf.len() {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => req.extend_from_slice(&buf[..n]),
+            }
+        }
+        let first = String::from_utf8_lossy(&req);
+        let mut words = first.lines().next().unwrap_or("").split(' ');
+        let (method, path) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+        let (code, kind, body) = match (method, path) {
+            ("GET" | "HEAD", "/") => ("200 OK", "text/html; charset=utf-8", status_page(&text())),
+            ("GET" | "HEAD", "/status.txt") => ("200 OK", "text/plain; charset=utf-8", text()),
+            ("GET" | "HEAD", _) => (
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                "not found\n".into(),
+            ),
+            _ => (
+                "405 Method Not Allowed",
+                "text/plain; charset=utf-8",
+                "only GET and HEAD\n".into(),
+            ),
+        };
+        let head = format!(
+            "HTTP/1.1 {code}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        if method != "HEAD" {
+            let _ = stream.write_all(body.as_bytes());
         }
     }
+    Ok(0)
+}
+
+/// The status text as a small self refreshing HTML page, every character
+/// that HTML treats specially escaped.
+fn status_page(text: &str) -> String {
+    let mut esc = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => esc.push_str("&amp;"),
+            '<' => esc.push_str("&lt;"),
+            '>' => esc.push_str("&gt;"),
+            '"' => esc.push_str("&quot;"),
+            _ => esc.push(c),
+        }
+    }
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <meta http-equiv=\"refresh\" content=\"5\"><title>mersenne-forge status</title>\
+         <style>body{{font:14px/1.4 ui-monospace,monospace;margin:16px;background:#fff;color:#111}}\
+         @media (prefers-color-scheme:dark){{body{{background:#111;color:#eee}}}}\
+         pre{{white-space:pre-wrap;overflow-wrap:anywhere}}</style></head>\
+         <body><h1>mersenne-forge status</h1><pre>{esc}</pre></body></html>\n"
+    )
 }
 
 fn cmd_bench(plan: &Path, output: &Path) -> Result<u8, Failure> {
@@ -3195,7 +3308,13 @@ fn main() -> ExitCode {
                 checkpoint_dir,
                 status_file,
                 watch,
+                serve,
             } => {
+                if let Some(addr) = serve {
+                    return serve_status(addr, || {
+                        status_text(&worktodo, &results, checkpoint_dir.as_deref(), &status_file)
+                    });
+                }
                 // --watch: a full screen view on the terminal's alternate screen,
                 // redrawn every N seconds until Ctrl-C, then the screen is
                 // restored. Without it, one plain report.
@@ -3211,7 +3330,10 @@ fn main() -> ExitCode {
                             watch.unwrap_or(1).max(1)
                         );
                     }
-                    print_status(&worktodo, &results, checkpoint_dir.as_deref(), &status_file);
+                    print!(
+                        "{}",
+                        status_text(&worktodo, &results, checkpoint_dir.as_deref(), &status_file)
+                    );
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                     match watch {
                         Some(n) if !STOP.load(Ordering::SeqCst) => {
