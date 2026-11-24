@@ -69,7 +69,7 @@ fn upstream_line_forms() {
         "Test=3,2,1279,-1",              // 3*2^1279-1
         "PRPDC=1,2,1279,-1,75,0,2,1",    // base 2
         "PRP=1,2,1279,-1,75,0,3,5",      // residue type 5
-        "PRP=1,2,23,-1,75,0,3,2",        // residue type 2
+        "PRP=1,2,23,-1,75,0,3,6",        // residue type 6
         "PRP=1,2,23,-1,75,0,3,1,\"47\"", // known factors, type 1
         "PRP=1,2,23,-1,75,0,3,5,\"7\"",  // 7 does not divide M23
         "Test=23,\"47\"",                // LL has no known factors
@@ -255,12 +255,12 @@ fn an_interrupted_assignment_resumes_in_the_next_session() {
 fn an_unrunnable_assignment_does_not_block_the_queue() {
     let dir = tempfile::tempdir().unwrap();
     let todo = dir.path().join("worktodo.txt");
-    std::fs::write(&todo, "PRP=1,2,1279,-1,75,0,3,2\nTest=127\n").unwrap();
+    std::fs::write(&todo, "PRP=1,2,1279,-1,75,0,3,6\nTest=127\n").unwrap();
     let o = work(dir.path(), &[]);
     assert!(String::from_utf8_lossy(&o.stderr).contains("residue type"));
     assert_eq!(
         std::fs::read_to_string(&todo).unwrap(),
-        "PRP=1,2,1279,-1,75,0,3,2\n"
+        "PRP=1,2,1279,-1,75,0,3,6\n"
     );
     assert_eq!(results(dir.path())[0]["exponent"], 127);
 }

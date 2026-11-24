@@ -738,6 +738,7 @@ fn cmd_run(
                 verify_proof: !no_proof_verify,
                 checkpoint: ckpt.clone(),
                 max_batch: 1000,
+                before_last: false,
             };
             let eff = prp::effective_config(p, &cfg).map_err(protocol_failure)?;
             let r = prp::run_prp(&mut be, p, &cfg, requested.clone(), None, &mut ctl)
@@ -1830,9 +1831,12 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
             Some(&a.line),
             json!({"done": done, "skipped": skipped.len()}),
         );
+        // Residue types 2 and 4 stop one squaring early; no proof exists
+        // for that chain, as in Prime95.
+        let before_last = a.kind == WorkKind::Prp && matches!(a.residue_type, 2 | 4);
         let proof_dir = match a.kind {
-            WorkKind::Prp => w.proof_dir.clone(),
-            WorkKind::Ll => None,
+            WorkKind::Prp if !before_last => w.proof_dir.clone(),
+            _ => None,
         };
         let ckpt = assignment_checkpoint(&w.checkpoint_dir, &a);
         let prp_cfg = PrpConfig {
@@ -1843,6 +1847,7 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
             verify_proof: true,
             checkpoint: Some(ckpt.clone()),
             max_batch: 1000,
+            before_last,
         };
         let mut ctl = Control {
             stop: Some(&STOP),

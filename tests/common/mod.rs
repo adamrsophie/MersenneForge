@@ -33,6 +33,7 @@ pub fn prp_cfg(dir: &Path, proof_power: Option<u32>) -> PrpConfig {
         verify_proof: true,
         checkpoint: Some(dir.join("ckpt").join("prp.ckpt")),
         max_batch: 1000,
+        before_last: false,
     }
 }
 

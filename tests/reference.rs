@@ -126,3 +126,66 @@ fn large_mersenne_primes_slow() {
         (Verdict::Prime, Verdict::ProbablePrime)
     );
 }
+
+/// Residue types 2 and 4: the chain stops at y = 3^(2^(p-1)), which is
+/// N - 3 for every Mersenne prime N with p odd, and the final value matches
+/// the host's power.
+#[test]
+fn prp_before_last_matches_the_host_and_flags_primes() {
+    use num_bigint::BigUint;
+    for p in PRIMES.iter().chain(COMPOSITES.iter()).copied() {
+        if p < 3 {
+            continue;
+        }
+        let cfg = PrpConfig {
+            block_size: if p < 64 { 2 } else { 16 },
+            check_step: Some(4 * if p < 64 { 2 } else { 16 }),
+            before_last: true,
+            ..PrpConfig::default()
+        };
+        let mut be = CpuBackend::new(p).unwrap();
+        let r = run_prp(
+            &mut be,
+            p,
+            &cfg,
+            serde_json::json!({}),
+            None,
+            &mut Control::default(),
+        )
+        .unwrap()
+        .result
+        .unwrap();
+        let n = (BigUint::from(1u32) << p) - 1u32;
+        let y = BigUint::from(3u32).modpow(&(BigUint::from(1u32) << (p - 1)), &n);
+        assert_eq!(r.final_residue.unwrap().to_biguint(), y, "M{p}");
+        let prime = oracle::ll(p).positive;
+        assert_eq!(
+            r.verdict,
+            if prime {
+                Verdict::ProbablePrime
+            } else {
+                Verdict::Composite
+            },
+            "M{p}"
+        );
+        if prime {
+            assert_eq!(y, &n - 3u32, "M{p}");
+        }
+    }
+    // No proof exists for the shorter chain.
+    let cfg = PrpConfig {
+        before_last: true,
+        proof_dir: Some(std::env::temp_dir()),
+        ..PrpConfig::default()
+    };
+    let mut be = CpuBackend::new(127).unwrap();
+    assert!(run_prp(
+        &mut be,
+        127,
+        &cfg,
+        serde_json::json!({}),
+        None,
+        &mut Control::default()
+    )
+    .is_err());
+}

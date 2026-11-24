@@ -63,6 +63,11 @@ pub struct PrpConfig {
     pub checkpoint: Option<PathBuf>,
     /// Largest number of squarings per backend call.
     pub max_batch: u64,
+    /// Stop one squaring early, at x = 3^(2^(p-1)), for PRP residue types 2
+    /// and 4. No proof exists for that chain. Left out of the serialized
+    /// configuration when false, so older checkpoints still match.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub before_last: bool,
 }
 
 impl Default for PrpConfig {
@@ -75,6 +80,7 @@ impl Default for PrpConfig {
             verify_proof: true,
             checkpoint: None,
             max_batch: 1000,
+            before_last: false,
         }
     }
 }
@@ -685,6 +691,11 @@ fn validate(p: u32, cfg: &PrpConfig) -> Result<Option<ProofSchedule>, ProtocolEr
         }
         _ => {}
     }
+    if cfg.before_last && (cfg.proof_dir.is_some() || p < 3) {
+        return Err(ProtocolError::Config(
+            "a run that stops before the last squaring has no proof and needs p >= 3".into(),
+        ));
+    }
     match (&cfg.proof_dir, cfg.proof_power) {
         (None, Some(_)) => Err(ProtocolError::Config(
             "a proof power needs a proof directory".into(),
@@ -734,6 +745,31 @@ fn final_result(p: u32, x: &Residue) -> MathResult {
         res2048: type1.res2048_hex(),
         special_case: None,
         final_residue: Some(x.clone()),
+    }
+}
+
+/// Result from y = 3^(2^(p-1)) = 3^((N+1)/2), N = 2^p - 1. For a prime N,
+/// Euler's criterion gives y = (3/N) 3, and (3/N) = -1 because N = 7 mod 12
+/// (p odd), so y = N - 3. Either sign counts as a probable prime, as in
+/// Prime95. The residue shown is that of a^((N-1)/2) = y / 3 (type 2); the
+/// work layer chooses which value it reports.
+fn before_last_result(p: u32, y: &Residue) -> MathResult {
+    let three = Residue::from_u64(p, 3);
+    let minus_three = Residue::from_biguint(p, &(crate::residue::modulus(p) - 3u32));
+    let pp = *y == three || *y == minus_three;
+    let type2 = y.div3();
+    MathResult {
+        test: "prp".into(),
+        exponent: p,
+        verdict: if pp {
+            Verdict::ProbablePrime
+        } else {
+            Verdict::Composite
+        },
+        res64: format!("{:016x}", type2.res64()),
+        res2048: type2.res2048_hex(),
+        special_case: None,
+        final_residue: Some(y.clone()),
     }
 }
 
@@ -835,6 +871,8 @@ pub fn run_prp<B: Backend>(
     };
     let eff = effective_config(p, cfg)?;
     let config_json = serde_json::to_value(&eff).expect("config serializes");
+    // Squarings in the chain: p, or p - 1 for residue types 2 and 4.
+    let kend = u64::from(p) - u64::from(cfg.before_last);
 
     let (from, n_errors, elapsed_before) = match resume {
         None => (
@@ -854,9 +892,9 @@ pub fn run_prp<B: Backend>(
                 || ck.residues.len() != if completed { 3 } else { 2 }
                 || ck.residues.iter().any(|r| r.exponent() != p)
                 || if completed {
-                    m.k != round_up(u64::from(p), u64::from(cfg.block_size))
+                    m.k != round_up(kend, u64::from(cfg.block_size))
                 } else {
-                    m.k >= u64::from(p)
+                    m.k >= kend
                 }
                 || m.k % u64::from(cfg.block_size) != 0
             {
@@ -906,7 +944,7 @@ pub fn run_prp<B: Backend>(
 
     let spec = Spec {
         block: u64::from(cfg.block_size),
-        kend: u64::from(p),
+        kend,
         rule: step_rule(p, cfg),
         max_batch: cfg.max_batch,
         proof: store.as_ref(),
@@ -1001,7 +1039,11 @@ pub fn run_prp<B: Backend>(
         }
         End::Done { final_x, .. } => final_x,
     };
-    let result = final_result(p, &final_x);
+    let result = if cfg.before_last {
+        before_last_result(p, &final_x)
+    } else {
+        final_result(p, &final_x)
+    };
     if let Some(store) = &store {
         let sw = Stopwatch::start();
         let dir = cfg.proof_dir.as_deref().expect("store implies dir");

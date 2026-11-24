@@ -177,11 +177,11 @@ pub fn tokenize(raw: &str) -> Result<Option<Tokens<'_>>, String> {
 /// `[AID,]1,2,p,-1[,tf_bits,tests_saved[,base,residue_type]][,"factors"]`
 /// or a bare `[AID,]p`; `Test=` and `DoubleCheck=` with
 /// `[AID,]1,2,p,-1[,...]` or `[AID,]p[,...]`. An empty or `N/A` first
-/// field is skipped. PRP residue types 1, 3, and 5 are accepted; known
-/// factors (each must divide 2^p - 1) make the test one of the cofactor,
-/// reported as type 5 as Prime95 does. Refused and left in place: other
-/// number forms (k*b^n+c), PRP bases other than 3, residue types 2 and 4,
-/// known factors with a residue type other than 5, composite exponents,
+/// field is skipped. PRP residue types 1 to 5 are accepted (2 and 4 stop
+/// one squaring early); known factors (each must divide 2^p - 1) make the
+/// test one of the cofactor, reported as type 5 as Prime95 does. Refused
+/// and left in place: other number forms (k*b^n+c), PRP bases other than
+/// 3, other residue types, known factors with a residue type other than 5, composite exponents,
 /// and PRP of M2.
 pub fn parse_line(raw: &str) -> Result<Option<Assignment>, String> {
     let Some(t) = tokenize(raw)? else {
@@ -231,9 +231,11 @@ pub fn parse_line(raw: &str) -> Result<Option<Assignment>, String> {
         if let Some(t) = parts.get(7) {
             residue_type = match *t {
                 "1" => 1,
+                "2" => 2,
                 "3" => 3,
+                "4" => 4,
                 "5" => 5,
-                _ => return refuse("PRP residue types 2 and 4 are not supported"),
+                _ => return refuse("PRP residue types are 1 to 5"),
             };
         }
         if parts.len() > 8 {
@@ -296,7 +298,9 @@ pub struct PrpOutcome {
 /// residue type (primenet.h's definitions, with N = 2^p - 1, a = 3):
 ///
 /// - type 1: a^(N-1) = x / 9, probable prime when 1;
+/// - type 2: a^((N-1)/2) = y / 3, probable prime when +1 or -1;
 /// - type 3: a^(N+1) = x, probable prime when 9;
+/// - type 4: a^((N+1)/2) = y, probable prime when +3 or -3;
 /// - type 5 (cofactor C = N / F, F the product of the known factors): the
 ///   reported residue is a^(N-1) mod N, as Prime95 reports it, and C is a
 ///   probable prime when a^(N-1) = a^(F-1) mod C (Fermat's test of C to
@@ -306,11 +310,22 @@ pub struct PrpOutcome {
 /// bit of F (BigUint multiplication, reduced modulo 2^p - 1 by shifts) and
 /// one division by C, whose quotient is below F. Minutes at wavefront exponents; move the power to
 /// a backend if that matters.
+///
+/// For types 2 and 4 the run stops one squaring early, and `x` is
+/// y = 3^(2^(p-1)) instead.
 pub fn prp_outcome(a: &Assignment, x: &crate::residue::Residue) -> PrpOutcome {
     let p = a.exponent;
     let type1 = x.div3().div3();
-    let shown = if a.residue_type == 3 { x } else { &type1 };
+    let type2 = x.div3();
+    let shown = match a.residue_type {
+        2 => &type2,
+        3 | 4 => x,
+        _ => &type1,
+    };
+    let minus_three =
+        crate::residue::Residue::from_biguint(p, &(crate::residue::modulus(p) - 3u32));
     let probable_prime = match a.residue_type {
+        2 | 4 => *x == crate::residue::Residue::from_u64(p, 3) || *x == minus_three,
         3 => *x == crate::residue::Residue::from_u64(p, 9),
         5 => {
             let n = crate::residue::modulus(p);
@@ -759,6 +774,21 @@ mod tests {
         assert_eq!(o.res64, format!("{:016x}", 9));
         assert!(prp_outcome(&a("PRP=1,2,31,-1,75,0"), &x(31)).probable_prime);
         assert!(!prp_outcome(&a("PRP=1,2,29,-1,75,0,3,3"), &x(29)).probable_prime);
+        // Types 2 and 4 get y = 3^(2^(p-1)): N - 3 for the prime M31.
+        let y = |p: u32| {
+            let n = modulus(p);
+            let e = BigUint::one() << (p - 1);
+            Residue::from_biguint(p, &BigUint::from(3u32).modpow(&e, &n))
+        };
+        let n31 = modulus(31);
+        let o4 = prp_outcome(&a("PRP=1,2,31,-1,75,0,3,4"), &y(31));
+        assert!(o4.probable_prime);
+        assert_eq!(o4.res64, format!("{:016x}", &n31 - 3u32));
+        let o2 = prp_outcome(&a("PRP=1,2,31,-1,75,0,3,2"), &y(31));
+        assert!(o2.probable_prime);
+        assert_eq!(o2.res64, format!("{:016x}", &n31 - 1u32));
+        assert!(!prp_outcome(&a("PRP=1,2,29,-1,75,0,3,2"), &y(29)).probable_prime);
+        assert!(!prp_outcome(&a("PRP=1,2,29,-1,75,0,3,4"), &y(29)).probable_prime);
     }
 
     #[test]

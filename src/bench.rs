@@ -489,6 +489,7 @@ fn engine_run(
                 verify_proof: o.verify_proof.unwrap_or(true),
                 checkpoint: checkpoint.clone(),
                 max_batch: 1000,
+                before_last: false,
             };
             run_prp(&mut be, p, &cfg, serde_json::json!({}), None, &mut ctl)
         }
