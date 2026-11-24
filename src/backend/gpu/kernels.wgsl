@@ -195,9 +195,11 @@ fn dit4(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw
 // rotation. Thread k handles the pair k, m - k, reading and writing only
 // those two elements, so the pass is in place without races. P.n is the
 // word count n in these kernels.
-// ponytail: the packed path has no imaginary part fault check (both parts
-// carry words) and keeps the full size buffers; memory halving is the
-// upgrade.
+// Both parts carry words, so the imaginary part fault check of the
+// unpacked path does not apply. Instead unweight_packed flags ERR[0] when a
+// coefficient lies past the proven bound P.m (model.rs, capacity_bound),
+// which no exact product reaches; a fault lands there with probability
+// about 1 - 2 P.m / q. The transform buffers hold n / 2 elements.
 
 fn half(a: vec2<u32>) -> vec2<u32> {
     return vec2<u32>(rot(a.x, 30u), rot(a.y, 30u));
@@ -289,11 +291,15 @@ fn unweight_packed(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_wor
         let t = T[j];
         let a = 2u * j;
         var z = balanced(rot(t.x, (WT[a] >> 16u) & 31u));
+        let z1 = balanced(rot(t.y, (WT[a + 1u] >> 16u) & 31u));
+        if (u32(abs(z)) > P.m || u32(abs(z1)) > P.m) {
+            atomicOr(&ERR[0], 1u);
+        }
         if (j == 0u) {
             z -= i32(P.sub);
         }
         WOUT[a] = z;
-        WOUT[a + 1u] = balanced(rot(t.y, (WT[a + 1u] >> 16u) & 31u));
+        WOUT[a + 1u] = z1;
     }
 }
 

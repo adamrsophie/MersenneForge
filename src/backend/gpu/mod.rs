@@ -128,10 +128,17 @@ pub fn memory_estimate(p: u32) -> BackendResult<MemoryEstimate> {
     let n64 = u64::from(plan.n);
     // Wide field elements are 16 bytes instead of 8.
     let elt = if plan.wide { 16 } else { 8 };
+    // The packed transform (MERSENNE_FORGE_GPU_PACKED=1) holds n / 2
+    // elements per transform buffer.
+    let t_elts = if !plan.wide && packed_requested() {
+        n64 / 2
+    } else {
+        n64
+    };
     Ok(MemoryEstimate {
         plan: plan_name(&plan),
         bytes_per_register: 4 * n64,
-        fixed_bytes: 2 * elt * n64
+        fixed_bytes: 2 * elt * t_elts
             + 2 * 4 * n64
             + elt / 2 * n64
             + 4 * n64
@@ -501,9 +508,13 @@ impl GpuBackend {
                 .flat_map(|w| [w.re, w.im])
                 .collect()
         };
+        // The packed transform runs at length n / 2, so its transform
+        // buffers hold half as many elements.
+        let packed = !plan.wide && (opts.packed || packed_requested());
+        let t_elts = if packed { n / 2 } else { n };
         let (t, t2) = (
-            storage_buf("t", elt * n, copy),
-            storage_buf("t2", elt * n, copy),
+            storage_buf("t", elt * t_elts, copy),
+            storage_buf("t2", elt * t_elts, copy),
         );
         let s = [
             storage_buf("s0", 4 * n, copy),
@@ -521,14 +532,19 @@ impl GpuBackend {
             wt,
             err,
         };
-        // The wide unweight reads its digit count from the m field; the
-        // other kernels these blocks drive do not read it.
-        let base = sh.params([plan.n, plan.digits, 0, 0]);
-        let ll = sh.params([plan.n, plan.digits, 0, 2]);
+        // The m field: the wide unweight reads its digit count there, and
+        // the packed unweight the coefficient bound it checks every output
+        // against; the other kernels these blocks drive do not read it.
+        let m_field = if plan.wide {
+            plan.digits
+        } else {
+            u32::try_from(plan.z_bound).expect("31-bit field bounds fit")
+        };
+        let base = sh.params([plan.n, m_field, 0, 0]);
+        let ll = sh.params([plan.n, m_field, 0, 2]);
         // Transform length: n, or n / 2 when packed. The twiddle stride
         // stays n / (2 m): a length L stage with half block m uses w_L^j =
         // w_n^(j n / L), and the table holds powers of w_n.
-        let packed = !plan.wide && (opts.packed || packed_requested());
         let tlen = if packed { plan.n / 2 } else { plan.n };
         let mut bg_dif = Vec::new();
         let mut bg_dit = Vec::new();
@@ -773,14 +789,15 @@ impl GpuBackend {
         Ok(data)
     }
 
-    /// Report and clear the kernel fault flag (nonzero imaginary part).
+    /// Report and clear the kernel fault flag (a nonzero imaginary part, or
+    /// in the packed and wide fields a coefficient outside its bound).
     fn check_fault_flag(&mut self) -> BackendResult<()> {
         let err = self.sh.err.clone();
         let flags = self.read(&err, 16)?;
         if flags.iter().any(|&b| b != 0) {
             self.queue.write_buffer(&self.sh.err, 0, &[0u8; 16]);
             return Err(BackendError::Fault(
-                "a GPU transform produced a nonzero imaginary part".into(),
+                "a GPU transform produced a value no exact product can have".into(),
             ));
         }
         self.check()
@@ -1144,6 +1161,39 @@ mod tests {
         g.sync().unwrap();
         g.square(r, 1).unwrap();
         assert_eq!(g.export(r).unwrap(), Residue::from_u64(521, 9));
+    }
+
+    /// The packed path holds half size transform buffers, and a
+    /// coefficient past the proven bound is reported as a Fault once.
+    #[test]
+    fn packed_bound_fault_is_reported_once() {
+        let opts = GpuOptions {
+            packed: true,
+            ..GpuOptions::default()
+        };
+        let p = 521;
+        let mut g = GpuBackend::new(p, &opts).unwrap();
+        assert_eq!(g.sh.t.size(), 8 * u64::from(g.plan.n) / 2);
+        assert_eq!(g.sh.t2.size(), g.sh.t.size());
+        let r = g.alloc().unwrap();
+        g.import(r, &Residue::from_u64(p, 3)).unwrap();
+        g.sync().unwrap();
+        // Alternating bits: every rotation of them balances to about q / 3,
+        // far past the bound of this small plan.
+        let bad = vec![0x5555_5555u32; g.plan.n as usize];
+        g.queue.write_buffer(&g.sh.t, 0, bytemuck::cast_slice(&bad));
+        let mut enc = g.sh.device.create_command_encoder(&Default::default());
+        {
+            let pk = g.packed_pipes().unwrap();
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            g.dispatch(&mut pass, &pk.unweight, &g.bg_base, g.plan.n / 2);
+        }
+        g.submit(enc.finish()).unwrap();
+        assert!(matches!(g.sync(), Err(BackendError::Fault(_))));
+        g.sync().unwrap();
+        g.import(r, &Residue::from_u64(p, 3)).unwrap();
+        g.square(r, 1).unwrap();
+        assert_eq!(g.export(r).unwrap(), Residue::from_u64(p, 9));
     }
 
     #[test]
