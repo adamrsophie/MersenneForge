@@ -26,7 +26,7 @@ no code was copied. Status words are those of [STATUS.md](STATUS.md):
 | `Pfactor=`, old and new forms | Prime95 | written (bounds from a fixed rule, not Prime95's cost model) |
 | `Pplus1=` with nth_run | Prime95 | written |
 | `ECM=`, `ECM2=` with B2, curves, sigma | Prime95 | written (host arithmetic, small exponents) |
-| `ECMSTAGE2=` with GMP-ECM save files | Prime95 | not planned |
+| `ECMSTAGE2=` with GMP-ECM save files | Prime95 | written: Suyama (PARAM=0) curves, Z normalized, skip and count fields, each N must divide 2^p - 1; `ECMSTAGE2N=` (no number given) is refused |
 | `B1=..,B2=..;` prefixes, `[Worker #n]` sections, `;` and `#` comments, case insensitive work types | Prime95, AutoPrimeNet, mfaktc | written |
 | `AdvancedTest=`, `AdvancedFactor=` | Prime95 | not planned: test and debugging forms |
 | Fermat numbers (Pépin test, `Fermat` lines) | Mlucas | not planned: arithmetic modulo 2^(2^m) + 1 needs other backends |

@@ -679,29 +679,17 @@ pub fn ecm(
         .collect();
     let primes: Vec<u64> = primes.into_iter().filter(|&q| q <= b1).collect();
     for c in 0..u64::from(curves) {
-        let s = BigUint::from(sigma + c);
-        let u = m.sub(&m.mul(&s, &s), &BigUint::from(5u32));
-        let v = m.mul(&BigUint::from(4u32), &s);
-        let u3 = m.mul(&m.mul(&u, &u), &u);
-        let vmu = m.sub(&v, &u);
-        // a24 = (v - u)^3 (3u + v) / (16 u^3 v)
-        let num = m.mul(
-            &m.mul(&m.mul(&vmu, &vmu), &vmu),
-            &m.add(&m.mul(&BigUint::from(3u32), &u), &v),
-        );
-        let den = m.mul(&m.mul(&BigUint::from(16u32), &u3), &v);
-        let g = den.gcd(&n);
-        if !g.is_one() {
-            if let Some(f) = factor_from(p, &den, &n, &mut out.notes) {
-                out.factor = Some(f);
-                out.found_sigma = Some(sigma + c);
-                return Ok(out);
+        let (a24, mut pt) = match suyama_curve(&m, &BigUint::from(sigma + c)) {
+            Ok(v) => v,
+            Err(den) => {
+                if let Some(f) = factor_from(p, &den, &n, &mut out.notes) {
+                    out.factor = Some(f);
+                    out.found_sigma = Some(sigma + c);
+                    return Ok(out);
+                }
+                continue;
             }
-            continue;
-        }
-        let inv = mod_inverse_big(&den, &n).expect("gcd is 1");
-        let a24 = m.mul(&num, &inv);
-        let mut pt: Point = (u3, m.mul(&m.mul(&v, &v), &v));
+        };
         for &q in &primes {
             let mut qk = q;
             while let Some(x) = qk.checked_mul(q).filter(|&x| x <= b1) {
@@ -720,44 +708,245 @@ pub fn ecm(
             out.found_sigma = Some(sigma + c);
             return Ok(out);
         }
-        // Stage 2, standard continuation: walk the odd multiples m Q with
-        // (m + 2) Q = xADD(m Q, 2 Q; difference (m - 2) Q), one xADD per odd
-        // m, and multiply Z(q Q) into acc for every prime q in (B1, B2]. A
-        // factor f of N divides acc when the order of Q mod f is such a q.
-        // ponytail: no baby step giant step pairing; about 3 (B2 - B1)
-        // multiplications per curve.
-        if let Some(&first) = stage2.first() {
-            let two = xdbl(&m, &pt, &a24);
-            let mut prev = ladder(&m, &pt, first - 2, &a24);
-            let mut cur = ladder(&m, &pt, first, &a24);
-            let mut mq = first;
-            let mut acc = BigUint::one();
-            let mut next = stage2.iter().peekable();
-            while let Some(&&q) = next.peek() {
-                if mq == q {
-                    acc = m.mul(&acc, &cur.1);
-                    next.next();
-                    if next.peek().is_none() {
-                        break;
-                    }
-                }
-                let after = xadd(&m, &cur, &two, &prev);
-                prev = std::mem::replace(&mut cur, after);
-                mq += 2;
-                if mq % 2_000_000 == 1 && stop() {
-                    out.notes
-                        .push(format!("stopped in stage 2 of curve sigma = {}", sigma + c));
+        match ecm_stage2(&m, &pt, &a24, &stage2, stop) {
+            None => {
+                out.notes
+                    .push(format!("stopped in stage 2 of curve sigma = {}", sigma + c));
+                return Ok(out);
+            }
+            Some(acc) => {
+                if let Some(f) = factor_from(p, &acc, &n, &mut out.notes) {
+                    out.curves += 1;
+                    out.factor = Some(f);
+                    out.found_sigma = Some(sigma + c);
                     return Ok(out);
                 }
             }
-            if let Some(f) = factor_from(p, &acc, &n, &mut out.notes) {
-                out.curves += 1;
-                out.factor = Some(f);
-                out.found_sigma = Some(sigma + c);
-                return Ok(out);
-            }
         }
         out.curves += 1;
+    }
+    Ok(out)
+}
+
+/// ECM stage 2, standard continuation, from the stage 1 point `pt`: walk
+/// the odd multiples m Q with (m + 2) Q = xADD(m Q, 2 Q; difference
+/// (m - 2) Q), one xADD per odd m, and multiply Z(q Q) into the product for
+/// every prime q in `primes` (sorted, odd, above 2). A factor f of N
+/// divides the product when the order of Q mod f is such a q. None when
+/// stopped; the product of no terms is 1. ponytail: no baby step giant step
+/// pairing; about 3 (B2 - B1) multiplications per curve.
+fn ecm_stage2(
+    m: &ModN,
+    pt: &Point,
+    a24: &BigUint,
+    primes: &[u64],
+    stop: &dyn Fn() -> bool,
+) -> Option<BigUint> {
+    let mut acc = BigUint::one();
+    let Some(&first) = primes.first() else {
+        return Some(acc);
+    };
+    let two = xdbl(m, pt, a24);
+    let mut prev = ladder(m, pt, first - 2, a24);
+    let mut cur = ladder(m, pt, first, a24);
+    let mut mq = first;
+    let mut next = primes.iter().peekable();
+    while let Some(&&q) = next.peek() {
+        if mq == q {
+            acc = m.mul(&acc, &cur.1);
+            next.next();
+            if next.peek().is_none() {
+                break;
+            }
+        }
+        let after = xadd(m, &cur, &two, &prev);
+        prev = std::mem::replace(&mut cur, after);
+        mq += 2;
+        if mq % 2_000_000 == 1 && stop() {
+            return None;
+        }
+    }
+    Some(acc)
+}
+
+/// (A + 2) / 4 of the Montgomery curve with Suyama's parametrization for
+/// `sigma`, with the starting point (u^3 : v^3). Err(den) when the
+/// denominator is not invertible modulo N (its gcd with N may be a factor).
+fn suyama_curve(m: &ModN, sigma: &BigUint) -> Result<(BigUint, Point), BigUint> {
+    let u = m.sub(&m.mul(sigma, sigma), &BigUint::from(5u32));
+    let v = m.mul(&BigUint::from(4u32), sigma);
+    let u3 = m.mul(&m.mul(&u, &u), &u);
+    let vmu = m.sub(&v, &u);
+    // a24 = (v - u)^3 (3u + v) / (16 u^3 v)
+    let num = m.mul(
+        &m.mul(&m.mul(&vmu, &vmu), &vmu),
+        &m.add(&m.mul(&BigUint::from(3u32), &u), &v),
+    );
+    let den = m.mul(&m.mul(&BigUint::from(16u32), &u3), &v);
+    match mod_inverse_big(&den, m.0) {
+        Some(inv) => Ok((m.mul(&num, &inv), (u3, m.mul(&m.mul(&v, &v), &v)))),
+        None => Err(den),
+    }
+}
+
+/// One curve of a GMP-ECM save file (`-save`), as Prime95's
+/// `read_resumefile_line` reads it: `METHOD=ECM; PARAM=0; SIGMA=..;
+/// B1=..; N=..; X=..; [Z=..;] ...`. Only PARAM=0 (Suyama) curves are
+/// supported here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GmpEcmCurve {
+    pub sigma: u64,
+    pub b1: u64,
+    pub n: BigUint,
+    /// The stage 1 point's x coordinate, normalized to Z = 1.
+    pub x: BigUint,
+}
+
+/// Parse the curves of a GMP-ECM save file. Comment lines (`#`) and empty
+/// lines are skipped; a line Prime95 would skip with a warning (unknown
+/// tag, missing field) is an error here, so nothing is silently dropped.
+pub fn parse_gmp_ecm_save(text: &str) -> Result<Vec<GmpEcmCurve>, String> {
+    let num = |s: &str| -> Option<BigUint> {
+        let s = s.trim();
+        match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            Some(h) => BigUint::parse_bytes(h.as_bytes(), 16),
+            None => BigUint::parse_bytes(s.as_bytes(), 10),
+        }
+    };
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let bad = |what: &str| format!("save file line {}: {what}", i + 1);
+        let (mut method, mut param, mut sigma, mut b1, mut n, mut x, mut z) =
+            (false, 0u64, None, None, None, None, None);
+        for field in line.split(';').map(str::trim).filter(|f| !f.is_empty()) {
+            let (tag, value) = field
+                .split_once('=')
+                .ok_or_else(|| bad("field without '='"))?;
+            let value = value.trim();
+            match tag.trim() {
+                "METHOD" => method = value == "ECM",
+                "PARAM" => param = value.parse().map_err(|_| bad("bad PARAM"))?,
+                "SIGMA" => sigma = Some(value.parse::<u64>().map_err(|_| bad("bad SIGMA"))?),
+                "B1" => {
+                    let v: f64 = value.parse().map_err(|_| bad("bad B1"))?;
+                    if !(v.is_finite() && v >= 2.0) {
+                        return Err(bad("bad B1"));
+                    }
+                    b1 = Some(v as u64);
+                }
+                "N" => n = Some(num(value).ok_or_else(|| bad("bad N"))?),
+                "X" => x = Some(num(value).ok_or_else(|| bad("bad X"))?),
+                "Z" => z = Some(num(value).ok_or_else(|| bad("bad Z"))?),
+                "Y" | "X0" | "Y0" | "A" | "ETYPE" | "CHECKSUM" | "COMMENT" | "PROGRAM" | "WHO"
+                | "TIME" => {}
+                t => return Err(bad(&format!("unknown tag {t}"))),
+            }
+        }
+        if !method {
+            return Err(bad("not an ECM line"));
+        }
+        if param != 0 {
+            return Err(bad(&format!(
+                "PARAM={param} is not supported (only 0, Suyama)"
+            )));
+        }
+        let (Some(sigma), Some(b1), Some(n), Some(x)) = (sigma, b1, n, x) else {
+            return Err(bad("SIGMA, B1, N, and X are required"));
+        };
+        if n <= BigUint::from(1u32) || sigma < 6 {
+            return Err(bad("bad N or SIGMA"));
+        }
+        let x = match z {
+            Some(z) => {
+                let zi =
+                    mod_inverse_big(&(z % &n), &n).ok_or_else(|| bad("Z is not invertible"))?;
+                x * zi % &n
+            }
+            None => x % &n,
+        };
+        out.push(GmpEcmCurve { sigma, b1, n, x });
+    }
+    Ok(out)
+}
+
+/// ECM stage 2 from GMP-ECM stage 1 results (Prime95's `ECMSTAGE2=`):
+/// curves `skip..skip + count` of `curves`, each to `b2` (0: 100 B1). Each
+/// N must divide 2^p - 1; the arithmetic is modulo that N, and a factor is
+/// checked against 2^p - 1. The outcome's b1 is the largest B1 of the
+/// curves run, and its sigma the first curve's.
+pub fn ecm_stage2_gmp(
+    p: u32,
+    curves: &[GmpEcmCurve],
+    b2: u64,
+    skip: usize,
+    count: Option<usize>,
+    stop: &dyn Fn() -> bool,
+) -> Result<EcmOutcome, String> {
+    crate::exponent::validate(p).map_err(|e| e.to_string())?;
+    let mp = modulus(p);
+    let chosen: Vec<&GmpEcmCurve> = curves
+        .iter()
+        .skip(skip)
+        .take(count.unwrap_or(usize::MAX))
+        .collect();
+    let Some(first) = chosen.first() else {
+        return Err("no curves to run in the save file".into());
+    };
+    let mut out = EcmOutcome {
+        exponent: p,
+        b1: chosen.iter().map(|c| c.b1).max().unwrap_or(0),
+        b2: 0,
+        curves: 0,
+        sigma: first.sigma,
+        factor: None,
+        found_sigma: None,
+        notes: Vec::new(),
+    };
+    for c in chosen {
+        if !(&mp % &c.n).is_zero() {
+            return Err(format!(
+                "N of the curve with sigma {} does not divide 2^{p} - 1",
+                c.sigma
+            ));
+        }
+        let b2c = if b2 == 0 {
+            c.b1.saturating_mul(100)
+        } else {
+            b2
+        };
+        out.b2 = out.b2.max(b2c);
+        let m = ModN(&c.n);
+        let (a24, _) = match suyama_curve(&m, &BigUint::from(c.sigma)) {
+            Ok(v) => v,
+            Err(den) => {
+                if let Some(f) = factor_from(p, &den, &c.n, &mut out.notes) {
+                    out.factor = Some(f);
+                    out.found_sigma = Some(c.sigma);
+                    return Ok(out);
+                }
+                continue;
+            }
+        };
+        let primes: Vec<u64> = primes_below(b2c + 1)
+            .into_iter()
+            .filter(|&q| q > c.b1 && q > 2)
+            .collect();
+        let pt: Point = (c.x.clone(), BigUint::one());
+        let Some(acc) = ecm_stage2(&m, &pt, &a24, &primes, stop) else {
+            out.notes
+                .push(format!("stopped in stage 2 of curve sigma = {}", c.sigma));
+            return Ok(out);
+        };
+        out.curves += 1;
+        if let Some(f) = factor_from(p, &acc, &c.n, &mut out.notes) {
+            out.factor = Some(f);
+            out.found_sigma = Some(c.sigma);
+            return Ok(out);
+        }
     }
     Ok(out)
 }
@@ -908,6 +1097,15 @@ pub enum FactorWork {
         curves: u32,
         sigma: Option<u64>,
     },
+    /// `ECMSTAGE2=[AID,]1,2,p,-1,file[,B2][,skip_curves][,num_curves][,"factors"]`:
+    /// stage 2 of the curves in a GMP-ECM save file (a relative file name is
+    /// next to the worktodo file). B2 0 means 100 B1 per curve.
+    EcmStage2 {
+        file: String,
+        b2: u64,
+        skip: u32,
+        curves: Option<u32>,
+    },
 }
 
 /// One factoring assignment.
@@ -967,7 +1165,9 @@ pub fn work_max_p(w: &FactorWork) -> u32 {
     match w {
         FactorWork::Tf { .. } => u32::MAX,
         FactorWork::Pm1 { .. } => WORK_PM1_MAX_P,
-        FactorWork::Pp1 { .. } | FactorWork::Ecm { .. } => WORK_HOST_MAX_P,
+        FactorWork::Pp1 { .. } | FactorWork::Ecm { .. } | FactorWork::EcmStage2 { .. } => {
+            WORK_HOST_MAX_P
+        }
     }
 }
 
@@ -978,6 +1178,15 @@ pub fn work_max_p(w: &FactorWork) -> u32 {
 /// divide 2^p - 1.
 pub fn parse_factor_line(raw: &str) -> Result<Option<FactorLine>, String> {
     let line = raw.trim_end_matches(['\r', '\n']);
+    let head = line.split('=').next().unwrap_or("").trim();
+    if head.eq_ignore_ascii_case("ECMSTAGE2") {
+        return parse_ecm_stage2_line(line).map(Some);
+    }
+    if head.eq_ignore_ascii_case("ECMSTAGE2N") {
+        return Err(format!(
+            "ECMSTAGE2N names no number; use ECMSTAGE2=1,2,p,-1,...: {line:?}"
+        ));
+    }
     let t = match crate::worktodo::tokenize(raw) {
         Ok(Some(t)) => t,
         Ok(None) => return Ok(None),
@@ -1116,6 +1325,98 @@ pub fn parse_factor_line(raw: &str) -> Result<Option<FactorLine>, String> {
         line: line.to_string(),
         known_factors: t.known_factors,
     }))
+}
+
+/// `ECMSTAGE2=` has its own reader because the file name may be quoted,
+/// which the shared tokenizer would read as a known factor list.
+fn parse_ecm_stage2_line(line: &str) -> Result<FactorLine, String> {
+    let bad = || format!("malformed ECMSTAGE2 line: {line:?}");
+    let rest = line.split_once('=').ok_or_else(bad)?.1.trim();
+    // Split on commas outside double quotes, keeping the quotes.
+    let mut fields = Vec::new();
+    let (mut cur, mut quoted) = (String::new(), false);
+    for ch in rest.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                cur.push(ch);
+            }
+            ',' if !quoted => fields.push(std::mem::take(&mut cur)),
+            _ => cur.push(ch),
+        }
+    }
+    if quoted {
+        return Err(bad());
+    }
+    fields.push(cur);
+    let mut fields: Vec<String> = fields.into_iter().map(|f| f.trim().to_string()).collect();
+    let aid = match fields.first() {
+        Some(f) if f.len() == 32 && f.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            Some(fields.remove(0))
+        }
+        Some(f) if f.eq_ignore_ascii_case("N/A") || f.is_empty() => {
+            fields.remove(0);
+            None
+        }
+        _ => None,
+    };
+    if fields.len() < 5 || fields[0] != "1" || fields[1] != "2" || fields[3] != "-1" {
+        return Err(bad());
+    }
+    let p: u32 = fields[2].parse().map_err(|_| bad())?;
+    crate::exponent::validate(p).map_err(|e| format!("{e}: {line:?}"))?;
+    let file = fields[4].trim_matches('"').to_string();
+    if file.is_empty() {
+        return Err(bad());
+    }
+    let mut known_factors = Vec::new();
+    let mut nums = Vec::new();
+    for f in &fields[5..] {
+        if let Some(q) = f.strip_prefix('"') {
+            let inner = q.strip_suffix('"').ok_or_else(bad)?;
+            known_factors.extend(
+                inner
+                    .split(|c: char| !c.is_ascii_digit())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+            );
+        } else if known_factors.is_empty() {
+            nums.push(
+                f.parse::<f64>()
+                    .ok()
+                    .filter(|x| x.is_finite() && *x >= 0.0)
+                    .ok_or_else(bad)?,
+            );
+        } else {
+            return Err(bad());
+        }
+    }
+    if nums.len() > 3 {
+        return Err(bad());
+    }
+    for f in &known_factors {
+        let c = crate::worktodo::check_factor(p, f).map_err(|e| format!("{e}: {line:?}"))?;
+        if !c.accepted() {
+            return Err(format!("{f} is not a proper factor of 2^{p} - 1: {line:?}"));
+        }
+    }
+    let as_u32 = |x: f64| u32::try_from(x as u64).map_err(|_| bad());
+    Ok(FactorLine {
+        work: FactorWork::EcmStage2 {
+            file,
+            b2: nums.first().map_or(0, |&x| x as u64),
+            skip: nums.get(1).map_or(Ok(0), |&x| as_u32(x))?,
+            curves: nums
+                .get(2)
+                .map(|&x| as_u32(x))
+                .transpose()?
+                .filter(|&c| c > 0),
+        },
+        exponent: p,
+        aid,
+        line: line.to_string(),
+        known_factors,
+    })
 }
 
 /// `line` (a PRP line asking for P-1) with its tests_saved field set to 0,
@@ -1345,6 +1646,77 @@ mod tests {
                 be.free(rb).unwrap();
             }
         }
+    }
+
+    /// A GMP-ECM style save line built from this module's own stage 1 (on
+    /// N = 2^67 - 1, X and Z written in hex) gives the same stage 2 result
+    /// as a full run of that curve.
+    #[test]
+    fn ecm_stage2_from_a_save_file_matches_a_full_run() {
+        let p = 67;
+        let n = modulus(p);
+        let m = ModN(&n);
+        let (b1, b2) = (1000u64, 100_000u64);
+        let primes: Vec<u64> = primes_below(b1 + 1);
+        let mut agreed = 0;
+        for sigma in 6..80u64 {
+            let full = ecm(p, b1, b2, 1, sigma, &|| false).unwrap();
+            let only1 = ecm(p, b1, 0, 1, sigma, &|| false).unwrap();
+            let (a24, mut pt) = suyama_curve(&m, &BigUint::from(sigma)).unwrap();
+            for &q in &primes {
+                let mut qk = q;
+                while let Some(x) = qk.checked_mul(q).filter(|&x| x <= b1) {
+                    qk = x;
+                }
+                pt = ladder(&m, &pt, qk, &a24);
+            }
+            if only1.factor.is_some() {
+                continue;
+            }
+            let line = format!(
+                "# saved\nMETHOD=ECM; PARAM=0; SIGMA={sigma}; B1={b1}; N={n}; X=0x{:x}; Z=0x{:x}; CHECKSUM=1; PROGRAM=GMP-ECM 7.0.4;\n",
+                pt.0, pt.1
+            );
+            let curves = parse_gmp_ecm_save(&line).unwrap();
+            assert_eq!(curves.len(), 1);
+            let o = ecm_stage2_gmp(p, &curves, b2, 0, None, &|| false).unwrap();
+            assert_eq!(o.factor, full.factor, "sigma {sigma}");
+            agreed += usize::from(o.factor.is_some());
+        }
+        assert!(agreed > 0, "no curve found a factor in stage 2");
+        assert!(parse_gmp_ecm_save("METHOD=ECM; PARAM=1; SIGMA=7; B1=10; N=31; X=3;").is_err());
+        assert!(parse_gmp_ecm_save("METHOD=ECM; SIGMA=7; B1=10; N=31;").is_err());
+        let l = parse_factor_line(
+            "ECMSTAGE2=0123456789ABCDEF0123456789ABCDEF,1,2,67,-1,\"save, 1.txt\",50000,2,3,\"193707721\"",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            l.work,
+            FactorWork::EcmStage2 {
+                file: "save, 1.txt".into(),
+                b2: 50000,
+                skip: 2,
+                curves: Some(3),
+            }
+        );
+        assert_eq!(l.known_factors, ["193707721"]);
+        assert!(l.aid.is_some());
+        let l = parse_factor_line("ECMSTAGE2=1,2,67,-1,s.txt")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            l.work,
+            FactorWork::EcmStage2 {
+                b2: 0,
+                skip: 0,
+                curves: None,
+                ..
+            }
+        ));
+        assert!(parse_factor_line("ECMSTAGE2N=s.txt").is_err());
+        assert!(parse_factor_line("ECMSTAGE2=1,2,67,-1").is_err());
+        assert!(parse_factor_line("ECMSTAGE2=1,2,67,-1,s.txt,\"7\"").is_err());
     }
 
     #[test]

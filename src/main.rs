@@ -1505,6 +1505,41 @@ fn run_factor_line(
             );
             Ok(true)
         }
+        FactorWork::EcmStage2 {
+            ref file,
+            b2,
+            skip,
+            curves,
+        } => {
+            let dir = w
+                .worktodo
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let path = dir.join(file);
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", path.display())))?;
+            let saved = factor::parse_gmp_ecm_save(&text)
+                .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", path.display())))?;
+            let want = curves.map(|c| c as usize);
+            let mut o = factor::ecm_stage2_gmp(p, &saved, b2, skip as usize, want, &stop)
+                .map_err(|e| fail(EXIT_EXECUTION, e))?;
+            let available = saved.len().saturating_sub(skip as usize);
+            let target = want.map_or(available, |c| c.min(available));
+            if o.factor.is_none() && (o.curves as usize) < target {
+                return Ok(false);
+            }
+            o.factor = o.factor.and_then(|x| f.new_part(&x));
+            let line = factor::ecm_result_line(f, &o, &now());
+            commit_line(w, &f.line, &f.line, &line.to_string(), None)?;
+            println!(
+                "M{p}: ECM stage 2 from {} ({} curves), factor {:?}",
+                path.display(),
+                o.curves,
+                o.factor
+            );
+            Ok(true)
+        }
     }
 }
 
