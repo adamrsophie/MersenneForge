@@ -244,7 +244,8 @@ Only this machine: **Apple M2, Metal backend** (macOS arm64, Rust 1.100.0,
   and imaginary part of element j and runs a half length transform with an
   untangle, pointwise, and retangle pass (`sqr_packed`, `pmul_packed`; the
   derivation is in `kernels.wgsl`). The packed path cannot use the
-  imaginary part fault check. `tf.wgsl` is a separate trial factoring
-  kernel for candidates below 2^95 (three word Montgomery arithmetic). No speed claims are made.
+  imaginary part fault check. `tf.wgsl` holds the trial factoring
+  kernels for candidates below 2^95 (three word Montgomery arithmetic),
+  including the device sieve (`strike`, `tf_seg`). No speed claims are made.
 * Long-run behavior under device resets, thermal throttling, or driver
   timeouts beyond what the error paths above report.

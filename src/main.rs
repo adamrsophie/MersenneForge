@@ -2167,24 +2167,38 @@ fn tf_on_gpu(
     stop: &dyn Fn() -> bool,
 ) -> Result<mersenne_forge::factor::TfOutcome, Failure> {
     use mersenne_forge::backend::gpu::tf::{GpuTf, Q_LIMIT};
+    use mersenne_forge::factor::divides;
     let tf = GpuTf::new(device).map_err(|e| fail(EXIT_UNSUPPORTED, e))?;
-    mersenne_forge::factor::trial_factor_with(p, from, to, None, stop, &mut |_| {}, &mut |p, qs| {
-        let (small, big): (Vec<u128>, Vec<u128>) = qs.iter().partition(|&&q| q < Q_LIMIT);
-        let mut hits: Vec<u128> = match tf.test(p, &small)? {
-            Some(h) => h,
-            // More hits than slots: the host tests this batch.
-            None => small
-                .iter()
-                .copied()
-                .filter(|&q| mersenne_forge::factor::divides(p, q))
-                .collect(),
-        };
-        hits.extend(
-            big.into_iter()
-                .filter(|&q| mersenne_forge::factor::divides(p, q)),
-        );
-        Ok(hits)
-    })
+    let host =
+        |p, qs: Vec<u128>| -> Vec<u128> { qs.into_iter().filter(|&q| divides(p, q)).collect() };
+    mersenne_forge::factor::trial_factor_segments(
+        p,
+        from,
+        to,
+        None,
+        stop,
+        &mut |_| {},
+        &mut |p, seg| {
+            // The whole segment below 2^95: sieve and test it on the device.
+            let top = 2 * u128::from(p) * (seg.k0 + seg.len as u128) + 1;
+            if top < Q_LIMIT {
+                return Ok(match tf.test_segment(p, seg)? {
+                    Some(h) => h,
+                    // More hits than slots: the host tests this segment.
+                    None => host(p, seg.candidates(p)),
+                });
+            }
+            // Straddling 2^95: the kernel takes the part below, the host the rest.
+            let (small, big): (Vec<u128>, Vec<u128>) =
+                seg.candidates(p).into_iter().partition(|&q| q < Q_LIMIT);
+            let mut hits = match tf.test(p, &small)? {
+                Some(h) => h,
+                None => host(p, small),
+            };
+            hits.extend(host(p, big));
+            Ok(hits)
+        },
+    )
     .map_err(|e| fail(EXIT_EXECUTION, e))
 }
 

@@ -107,33 +107,105 @@ fn mont_mul(a: vec3<u32>, b: vec3<u32>, q: vec3<u32>, ninv: u32) -> vec3<u32> {
     return v;
 }
 
+// Whether 2^p = 1 mod q, for odd q < 2^95; top is the highest set bit of p.
+fn pow2_is_one(q: vec3<u32>, p: u32, top: u32) -> bool {
+    // -q^-1 mod 2^32 by Newton's iteration (q odd: q q = 1 mod 8).
+    var x = q.x;
+    for (var j = 0u; j < 4u; j++) {
+        x = x * (2u - q.x * x);
+    }
+    let ninv = 0u - x;
+    // R mod q = 2^96 mod q by 96 doublings of 1.
+    var one = vec3<u32>(1u, 0u, 0u);
+    for (var j = 0u; j < 96u; j++) {
+        one = dbl(one, q);
+    }
+    // Montgomery form throughout: v = 2^e R mod q, from the top bit.
+    var v = one;
+    for (var b = i32(top); b >= 0; b--) {
+        v = mont_mul(v, v, q, ninv);
+        if (((p >> u32(b)) & 1u) == 1u) {
+            v = dbl(v, q);
+        }
+    }
+    return all(v == one);
+}
+
 @compute @workgroup_size(256)
 fn tf(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
     for (var i = g.x; i < P.count; i += nw.x * WG) {
         let q = vec3<u32>(Q[3u * i], Q[3u * i + 1u], Q[3u * i + 2u]);
-        // -q^-1 mod 2^32 by Newton's iteration (q odd: q q = 1 mod 8).
-        var x = q.x;
-        for (var j = 0u; j < 4u; j++) {
-            x = x * (2u - q.x * x);
-        }
-        let ninv = 0u - x;
-        // R mod q = 2^96 mod q by 96 doublings of 1.
-        var one = vec3<u32>(1u, 0u, 0u);
-        for (var j = 0u; j < 96u; j++) {
-            one = dbl(one, q);
-        }
-        // Montgomery form throughout: v = 2^e R mod q, from the top bit.
-        var v = one;
-        for (var b = i32(P.top); b >= 0; b--) {
-            v = mont_mul(v, v, q, ninv);
-            if (((P.p >> u32(b)) & 1u) == 1u) {
-                v = dbl(v, q);
-            }
-        }
-        if (all(v == one)) {
+        if (pow2_is_one(q, P.p, P.top)) {
             let slot = atomicAdd(&HITS[0], 1u);
             if (slot < P.cap) {
                 atomicStore(&HITS[slot + 1u], i);
+            }
+        }
+    }
+}
+
+// Sieving on the device. One segment is the k values k0 + i, i < len; a
+// candidate is q = 2 k p + 1. `strike` marks every i with s | q for each
+// sieve prime s (from its first such i), and `tf_seg` tests the unmarked
+// i whose q is +-1 mod 8, recording i for each hit. The host only sends
+// the roots and checks every hit again. Separate bindings (3 to 6) so the
+// segment entry points share this module with `tf`.
+struct SegParams {
+    p: u32,
+    top: u32,
+    len: u32,    // k values in the segment
+    nroots: u32, // sieve primes
+    k0x: u32,    // first k, low word first
+    k0y: u32,
+    k0z: u32,
+    cap: u32,    // hit slots after SHITS[0]
+}
+
+@group(0) @binding(3) var<uniform> S: SegParams;
+// (s, first index) pairs.
+@group(0) @binding(4) var<storage, read> ROOTS: array<u32>;
+// One bit per k: set when sieved out. Zeroed by the host.
+@group(0) @binding(5) var<storage, read_write> BITS: array<atomic<u32>>;
+@group(0) @binding(6) var<storage, read_write> SHITS: array<atomic<u32>>;
+
+// ponytail: one thread per sieve prime, so the threads for 3, 5, 7 strike
+// far more than the rest; split small primes over threads if it shows up.
+@compute @workgroup_size(256)
+fn strike(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    for (var r = g.x; r < S.nroots; r += nw.x * WG) {
+        let s = ROOTS[2u * r];
+        for (var i = ROOTS[2u * r + 1u]; i < S.len; i += s) {
+            atomicOr(&BITS[i >> 5u], 1u << (i & 31u));
+        }
+    }
+}
+
+@compute @workgroup_size(256)
+fn tf_seg(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    for (var i = g.x; i < S.len; i += nw.x * WG) {
+        if ((atomicLoad(&BITS[i >> 5u]) & (1u << (i & 31u))) != 0u) {
+            continue;
+        }
+        // k = k0 + i, then k p in three words (the host keeps q < 2^95).
+        let kx = S.k0x + i;
+        let c0 = select(0u, 1u, kx < i);
+        let ky = S.k0y + c0;
+        let c1 = select(0u, 1u, ky < c0);
+        let kz = S.k0z + c1;
+        let a = mul32(kx, S.p);
+        let b = mul32(ky, S.p);
+        let y = a.y + b.x;
+        let cy = select(0u, 1u, y < a.y);
+        let z = kz * S.p + b.y + cy;
+        let q = vec3<u32>((a.x << 1u) | 1u, (y << 1u) | (a.x >> 31u), (z << 1u) | (y >> 31u));
+        let m = q.x & 7u;
+        if (m != 1u && m != 7u) {
+            continue;
+        }
+        if (pow2_is_one(q, S.p, S.top)) {
+            let slot = atomicAdd(&SHITS[0], 1u);
+            if (slot < S.cap) {
+                atomicStore(&SHITS[slot + 1u], i);
             }
         }
     }

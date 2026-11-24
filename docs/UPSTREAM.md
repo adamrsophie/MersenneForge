@@ -54,7 +54,7 @@ no code was copied. Status words are those of [STATUS.md](STATUS.md):
 | Speed comparable to gpuowl and Prime95 | gpuowl, Prime95 | not measured: no tuned baseline has been run (STATUS F16) |
 | CERT squarings with SHA3-256 hash | Prime95, gpuowl | written |
 | GPU trial factoring to 2^95 | mfaktc, mfakto | written (WGSL, three word Montgomery); no CUDA or OpenCL kernel |
-| GPU sieving, 4620 class split, `MoreClasses` | mfaktc, mfakto | not planned: the host sieves and batches candidates |
+| GPU sieving | mfaktc, mfakto | written: per segment, the device strikes the sieve primes below 2^16 from host computed roots and tests the survivors; no 4620 class split or `MoreClasses` (one class per segment instead) |
 | P-1 stage 2 with prime pairing and polynomial multiplication | Prime95, gpuowl | prime pairing written: baby step giant step with D = 210 and f(t) = t^2, one subtraction and one multiplication per pair; subtraction is native on the CPU backend and a host round trip elsewhere; no polynomial multiplication (FFT continuation) |
 | ECM on Edwards curves, GMP-ECM param 3, big stage 2 | Prime95 | not planned now: Montgomery curves, Suyama sigma, standard continuation |
 | P+1 stage 2 | Prime95 | written (one Lucas ladder per prime) |

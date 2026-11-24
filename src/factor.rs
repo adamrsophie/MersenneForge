@@ -114,6 +114,41 @@ pub fn divides(p: u32, q: u128) -> bool {
 /// in, the ones for which 2^p = 1 mod q out.
 pub type TfTester<'a> = dyn FnMut(u32, &[u128]) -> Result<Vec<u128>, String> + 'a;
 
+/// One sieve segment: k0 + i for i < len, and for each sieve prime s the
+/// first i with s | 2 (k0 + i) p + 1 (every s-th i after it also has it).
+pub struct TfSegment<'a> {
+    pub k0: u128,
+    pub len: usize,
+    /// (s, first index); the index may be at or past `len`.
+    pub roots: &'a [(u32, u32)],
+}
+
+impl TfSegment<'_> {
+    /// The candidates q = 2kp + 1 of the segment that survive the sieve and
+    /// are +-1 mod 8, in increasing order.
+    pub fn candidates(&self, p: u32) -> Vec<u128> {
+        let mut bad = vec![false; self.len];
+        for &(s, first) in self.roots {
+            let mut i = first as usize;
+            while i < self.len {
+                bad[i] = true;
+                i += s as usize;
+            }
+        }
+        let two_p = 2 * u128::from(p);
+        bad.iter()
+            .enumerate()
+            .filter(|(_, b)| !**b)
+            .map(|(i, _)| two_p * (self.k0 + i as u128) + 1)
+            .filter(|q| matches!(q & 7, 1 | 7))
+            .collect()
+    }
+}
+
+/// Segment tester for [`trial_factor_segments`]: returns the q of the
+/// segment's candidates for which 2^p = 1 mod q.
+pub type TfSegmentTester<'a> = dyn FnMut(u32, &TfSegment<'_>) -> Result<Vec<u128>, String> + 'a;
+
 /// [`trial_factor`] with the candidates of each sieved segment handed to
 /// `test` in one batch (the GPU kernel, for example). Every q it returns is
 /// checked again exactly before it is reported.
@@ -125,6 +160,29 @@ pub fn trial_factor_with(
     stop: &dyn Fn() -> bool,
     progress: &mut dyn FnMut(u128),
     test: &mut TfTester<'_>,
+) -> Result<TfOutcome, String> {
+    trial_factor_segments(p, bit_lo, bit_hi, from_k, stop, progress, &mut |p, seg| {
+        let cands = seg.candidates(p);
+        let hits = test(p, &cands)?;
+        if let Some(q) = hits.iter().find(|&&q| cands.binary_search(&q).is_err()) {
+            return Err(format!("the tester returned {q}, which is not a candidate"));
+        }
+        Ok(hits)
+    })
+}
+
+/// The segment driver under [`trial_factor_with`]: `test` gets each segment
+/// with its sieve roots and may sieve and test it anywhere (the GPU, for
+/// example). Every q it returns must be 2kp + 1 for a k in the segment and
+/// is checked again exactly before it is reported.
+pub fn trial_factor_segments(
+    p: u32,
+    bit_lo: u32,
+    bit_hi: u32,
+    from_k: Option<u128>,
+    stop: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut(u128),
+    test: &mut TfSegmentTester<'_>,
 ) -> Result<TfOutcome, String> {
     crate::exponent::validate(p).map_err(|e| e.to_string())?;
     if !(bit_lo < bit_hi && bit_hi <= 120) {
@@ -138,17 +196,23 @@ pub fn trial_factor_with(
     let mut k0 = from_k.unwrap_or(k_lo).max(k_lo);
     // Sieving could strike a candidate equal to a sieve prime; such small
     // ranges are tested without the sieve.
-    let sieve: Vec<u64> = if two_p * k_lo + 1 > u128::from(SIEVE_BOUND) {
+    let sieve: Vec<(u64, u64)> = if two_p * k_lo + 1 > u128::from(SIEVE_BOUND) {
         primes_below(SIEVE_BOUND)
             .into_iter()
             .skip(1) // 2: every q is odd
             .filter(|&s| s != u64::from(p))
+            .map(|s| {
+                // q = 2kp + 1 = 0 mod s  <=>  k = -(2p)^-1 mod s.
+                let inv =
+                    mod_inverse((two_p % u128::from(s)) as u64, s).expect("s does not divide 2p");
+                (s, (s - inv) % s)
+            })
             .collect()
     } else {
         Vec::new()
     };
     let mut factors = Vec::new();
-    let mut bad = vec![false; SEGMENT];
+    let mut roots = Vec::with_capacity(sieve.len());
     while k0 < k_end {
         if stop() {
             return Ok(TfOutcome {
@@ -161,29 +225,29 @@ pub fn trial_factor_with(
             });
         }
         let len = ((k_end - k0).min(SEGMENT as u128)) as usize;
-        bad[..len].fill(false);
-        for &s in &sieve {
-            // q = 2kp + 1 = 0 mod s  <=>  k = -(2p)^-1 mod s.
+        roots.clear();
+        roots.extend(sieve.iter().map(|&(s, root)| {
             let s128 = u128::from(s);
-            let inv = mod_inverse((two_p % s128) as u64, s).expect("s does not divide 2p");
-            let root = (s - inv) % s;
             let first = (u128::from(root) + s128 - k0 % s128) % s128;
-            let mut i = first as usize;
-            while i < len {
-                bad[i] = true;
-                i += s as usize;
-            }
-        }
-        let cands: Vec<u128> = bad[..len]
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| !**b)
-            .map(|(i, _)| two_p * (k0 + i as u128) + 1)
-            .filter(|q| matches!(q & 7, 1 | 7))
-            .collect();
-        for q in test(p, &cands)? {
-            if !cands.contains(&q) {
-                return Err(format!("the tester returned {q}, which is not a candidate"));
+            (s as u32, first as u32)
+        }));
+        let seg = TfSegment {
+            k0,
+            len,
+            roots: &roots,
+        };
+        let mut hits = test(p, &seg)?;
+        hits.sort_unstable();
+        hits.dedup();
+        for q in hits {
+            let in_segment = q % two_p == 1 && {
+                let k = q / two_p;
+                k >= k0 && k < k0 + len as u128
+            };
+            if !in_segment {
+                return Err(format!(
+                    "the tester returned {q}, which is not in the segment"
+                ));
             }
             let f = q.to_string();
             let c = crate::worktodo::check_factor(p, &f)?;
