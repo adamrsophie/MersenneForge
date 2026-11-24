@@ -76,6 +76,12 @@ pub struct TfOutcome {
 const SEGMENT: usize = 1 << 16;
 /// Sieve primes are below this bound.
 const SIEVE_BOUND: u64 = 1 << 16;
+/// mfaktc's class count, 4 * 3 * 5 * 7 * 11: k = c + 4620 i keeps q mod 8
+/// and q mod 3, 5, 7, 11 fixed within a class, so only the 960 classes
+/// whose q can divide 2^p - 1 are sieved at all.
+pub const TF_CLASSES: u32 = 4620;
+/// Primes the class split removes.
+const CLASS_PRIMES: [u64; 4] = [3, 5, 7, 11];
 
 /// Trial factor 2^p - 1 by every q = 2kp + 1 with 2^bit_lo <= q < 2^bit_hi,
 /// starting at k = `from_k` when resuming. `stop` is polled once per segment;
@@ -114,16 +120,41 @@ pub fn divides(p: u32, q: u128) -> bool {
 /// in, the ones for which 2^p = 1 mod q out.
 pub type TfTester<'a> = dyn FnMut(u32, &[u128]) -> Result<Vec<u128>, String> + 'a;
 
-/// One sieve segment: k0 + i for i < len, and for each sieve prime s the
-/// first i with s | 2 (k0 + i) p + 1 (every s-th i after it also has it).
+/// One sieve segment: k0 + i stride for i < len, and for each sieve prime
+/// s the first i with s | 2 (k0 + i stride) p + 1 (every s-th i after it
+/// also has it). The stride is 1, or [`TF_CLASSES`] for one class.
 pub struct TfSegment<'a> {
     pub k0: u128,
     pub len: usize,
+    pub stride: u32,
     /// (s, first index); the index may be at or past `len`.
     pub roots: &'a [(u32, u32)],
 }
 
 impl TfSegment<'_> {
+    /// The k of index i.
+    pub fn k(&self, i: usize) -> u128 {
+        self.k0 + i as u128 * u128::from(self.stride)
+    }
+
+    /// One past the last k of the segment (k0 when it is empty).
+    pub fn k_end(&self) -> u128 {
+        if self.len == 0 {
+            self.k0
+        } else {
+            self.k(self.len - 1) + 1
+        }
+    }
+
+    /// The index of k, when k is in the segment.
+    pub fn index(&self, k: u128) -> Option<usize> {
+        let s = u128::from(self.stride);
+        (k >= self.k0 && (k - self.k0) % s == 0)
+            .then(|| (k - self.k0) / s)
+            .filter(|&i| i < self.len as u128)
+            .map(|i| i as usize)
+    }
+
     /// The candidates q = 2kp + 1 of the segment that survive the sieve and
     /// are +-1 mod 8, in increasing order.
     pub fn candidates(&self, p: u32) -> Vec<u128> {
@@ -139,7 +170,7 @@ impl TfSegment<'_> {
         bad.iter()
             .enumerate()
             .filter(|(_, b)| !**b)
-            .map(|(i, _)| two_p * (self.k0 + i as u128) + 1)
+            .map(|(i, _)| two_p * self.k(i) + 1)
             .filter(|q| matches!(q & 7, 1 | 7))
             .collect()
     }
@@ -213,38 +244,12 @@ pub fn trial_factor_segments(
     };
     let mut factors = Vec::new();
     let mut roots = Vec::with_capacity(sieve.len());
-    while k0 < k_end {
-        if stop() {
-            return Ok(TfOutcome {
-                exponent: p,
-                bit_lo,
-                bit_hi,
-                factors,
-                complete: false,
-                next_k: k0,
-            });
-        }
-        let len = ((k_end - k0).min(SEGMENT as u128)) as usize;
-        roots.clear();
-        roots.extend(sieve.iter().map(|&(s, root)| {
-            let s128 = u128::from(s);
-            let first = (u128::from(root) + s128 - k0 % s128) % s128;
-            (s as u32, first as u32)
-        }));
-        let seg = TfSegment {
-            k0,
-            len,
-            roots: &roots,
-        };
-        let mut hits = test(p, &seg)?;
+    let mut run = |seg: &TfSegment<'_>, factors: &mut Vec<String>| -> Result<(), String> {
+        let mut hits = test(p, seg)?;
         hits.sort_unstable();
         hits.dedup();
         for q in hits {
-            let in_segment = q % two_p == 1 && {
-                let k = q / two_p;
-                k >= k0 && k < k0 + len as u128
-            };
-            if !in_segment {
+            if q % two_p != 1 || seg.index(q / two_p).is_none() {
                 return Err(format!(
                     "the tester returned {q}, which is not in the segment"
                 ));
@@ -258,9 +263,78 @@ pub fn trial_factor_segments(
             }
             factors.push(f);
         }
-        k0 += len as u128;
-        progress(k0);
+        Ok(())
+    };
+    let stopped = |factors: Vec<String>, next_k| TfOutcome {
+        exponent: p,
+        bit_lo,
+        bit_hi,
+        factors,
+        complete: false,
+        next_k,
+    };
+    if sieve.is_empty() {
+        while k0 < k_end {
+            if stop() {
+                return Ok(stopped(factors, k0));
+            }
+            let len = ((k_end - k0).min(SEGMENT as u128)) as usize;
+            let seg = TfSegment {
+                k0,
+                len,
+                stride: 1,
+                roots: &[],
+            };
+            run(&seg, &mut factors)?;
+            k0 += len as u128;
+            progress(k0);
+        }
+    } else {
+        // Blocks of TF_CLASSES * SEGMENT k values, each split into its
+        // classes (as mfaktc does); progress moves a whole block at a time,
+        // and a run stopped inside a block resumes at its start.
+        let classes = u128::from(TF_CLASSES);
+        // (s, root, 1 / TF_CLASSES mod s) for the primes the classes leave.
+        let sieve: Vec<(u64, u64, u64)> = sieve
+            .iter()
+            .filter(|(s, _)| !CLASS_PRIMES.contains(s))
+            .map(|&(s, root)| {
+                let inv = mod_inverse(u64::from(TF_CLASSES) % s, s).expect("s > 11");
+                (s, root, inv)
+            })
+            .collect();
+        while k0 < k_end {
+            let span = (k_end - k0).min(classes * SEGMENT as u128);
+            for c in 0..classes.min(span) {
+                if stop() {
+                    return Ok(stopped(factors, k0));
+                }
+                let kc = k0 + c;
+                let q = two_p * kc + 1;
+                if !matches!(q & 7, 1 | 7) || CLASS_PRIMES.iter().any(|&s| q % u128::from(s) == 0) {
+                    continue;
+                }
+                let len = (span - c).div_ceil(classes) as usize;
+                roots.clear();
+                roots.extend(sieve.iter().map(|&(s, root, inv)| {
+                    let s128 = u128::from(s);
+                    // kc + i C = root mod s  <=>  i = (root - kc) / C mod s.
+                    let d = (u128::from(root) + s128 - kc % s128) % s128;
+                    (s as u32, (d * u128::from(inv) % s128) as u32)
+                }));
+                let seg = TfSegment {
+                    k0: kc,
+                    len,
+                    stride: TF_CLASSES,
+                    roots: &roots,
+                };
+                run(&seg, &mut factors)?;
+            }
+            k0 += span;
+            progress(k0);
+        }
     }
+    factors.sort_by_key(|f| f.parse::<u128>().unwrap_or(u128::MAX));
     Ok(TfOutcome {
         exponent: p,
         bit_lo,
@@ -1776,6 +1850,40 @@ mod tests {
         // well above the sieve bound.
         assert_eq!(tf(67, 27, 28), vec!["193707721".to_string()]);
         assert!(tf(67, 26, 27).is_empty());
+    }
+
+    /// The class split finds exactly the divisors a plain scan of every k
+    /// finds, less those with a prime factor below the sieve bound, and a
+    /// resumed run picks up at a block start.
+    #[test]
+    fn class_split_matches_a_plain_scan() {
+        for (p, lo, hi) in [
+            (67u32, 17u32, 28u32),
+            (101, 17, 27),
+            (113, 18, 27),
+            (11, 17, 26),
+        ] {
+            let two_p = 2 * u128::from(p);
+            let small = primes_below(SIEVE_BOUND);
+            let k_lo = ((1u128 << lo) - 1).div_ceil(two_p);
+            let k_hi = ((1u128 << hi) - 1).div_ceil(two_p);
+            let want: Vec<String> = (k_lo..k_hi)
+                .map(|k| two_p * k + 1)
+                .filter(|&q| divides(p, q))
+                .filter(|&q| small.iter().all(|&s| q % u128::from(s) != 0))
+                .map(|q| q.to_string())
+                .collect();
+            let got = trial_factor(p, lo, hi, None, &|| false, &mut |_| {}).unwrap();
+            assert!(got.complete);
+            assert_eq!(got.factors, want, "p = {p}");
+        }
+        // The scan is not vacuous: 2^67 - 1's first factor is in range.
+        assert_eq!(
+            trial_factor(67, 17, 28, None, &|| false, &mut |_| {})
+                .unwrap()
+                .factors,
+            ["193707721"]
+        );
     }
 
     #[test]

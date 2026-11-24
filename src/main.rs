@@ -2275,7 +2275,7 @@ fn tf_on_gpu(
         &mut |_| {},
         &mut |p, seg| {
             // The whole segment below 2^95: sieve and test it on the device.
-            let top = 2 * u128::from(p) * (seg.k0 + seg.len as u128) + 1;
+            let top = 2 * u128::from(p) * seg.k_end() + 1;
             if top < Q_LIMIT {
                 return Ok(match tf.test_segment(p, seg)? {
                     Some(h) => h,

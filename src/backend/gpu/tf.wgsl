@@ -159,6 +159,10 @@ struct SegParams {
     k0y: u32,
     k0z: u32,
     cap: u32,    // hit slots after SHITS[0]
+    stride: u32, // k step between indices: 1, or 4620 for one class
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
 }
 
 @group(0) @binding(3) var<uniform> S: SegParams;
@@ -186,11 +190,14 @@ fn tf_seg(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workgroups) 
         if ((atomicLoad(&BITS[i >> 5u]) & (1u << (i & 31u))) != 0u) {
             continue;
         }
-        // k = k0 + i, then k p in three words (the host keeps q < 2^95).
-        let kx = S.k0x + i;
-        let c0 = select(0u, 1u, kx < i);
-        let ky = S.k0y + c0;
-        let c1 = select(0u, 1u, ky < c0);
+        // k = k0 + i stride, then k p in three words (the host keeps
+        // q < 2^95).
+        let d = mul32(i, S.stride);
+        let kx = S.k0x + d.x;
+        let c0 = select(0u, 1u, kx < d.x);
+        let dy = d.y + c0;
+        let ky = S.k0y + dy;
+        let c1 = select(0u, 1u, ky < dy || dy < c0);
         let kz = S.k0z + c1;
         let a = mul32(kx, S.p);
         let b = mul32(ky, S.p);

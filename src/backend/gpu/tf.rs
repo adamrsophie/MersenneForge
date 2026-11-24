@@ -196,9 +196,7 @@ impl GpuTf {
             return Ok(Some(Vec::new()));
         }
         let two_p = 2 * u128::from(p);
-        let last = (seg.k0 + seg.len as u128 - 1)
-            .checked_mul(two_p)
-            .map(|x| x + 1);
+        let last = (seg.k_end() - 1).checked_mul(two_p).map(|x| x + 1);
         if last.is_none_or(|q| q >= Q_LIMIT) {
             return Err("GPU trial factoring takes candidates below 2^95".into());
         }
@@ -214,6 +212,10 @@ impl GpuTf {
             (k0 >> 32) as u32,
             (k0 >> 64) as u32,
             CAP,
+            seg.stride,
+            0,
+            0,
+            0,
         ];
         let mut roots: Vec<u32> = seg.roots.iter().flat_map(|&(s, f)| [s, f]).collect();
         if roots.is_empty() {
@@ -278,7 +280,7 @@ impl GpuTf {
             if i >= len {
                 return Err(format!("TF segment kernel returned index {i} of {len}"));
             }
-            found.push(two_p * (k0 + u128::from(i)) + 1);
+            found.push(two_p * seg.k(i as usize) + 1);
         }
         found.sort_unstable();
         found.dedup();
@@ -402,6 +404,7 @@ mod tests {
             let seg = TfSegment {
                 k0: k - 1000,
                 len: 4096,
+                stride: 1,
                 roots: &[],
             };
             let got = tf.test_segment(p, &seg).unwrap().unwrap();
