@@ -19,6 +19,7 @@ fn jacobi_catches_about_half_of_bit_flips() {
         jacobi: JacobiCadence::EveryLog,
         checkpoint: None,
         max_batch: 1000,
+        shift: 0,
     };
     let (mut detected, mut missed) = (0, 0);
     for bit in 0..64u32 {
@@ -76,6 +77,7 @@ fn huge_batch_sizes_stop_at_the_boundaries() {
                     jacobi: JacobiCadence::EveryLog,
                     checkpoint: None,
                     max_batch,
+                    shift: 0,
                 };
                 let mut be = CpuBackend::new(p).unwrap();
                 let r = run_ll(

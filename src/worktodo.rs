@@ -554,8 +554,8 @@ pub struct ProofInfo {
 /// A result line in the JSON form upstream PRPLL appends to its results
 /// file, with this program's name. Fields upstream writes that this program
 /// has no counterpart for (`fft-type`, `fft-length`, `user`, `uid`) are
-/// left out rather than invented. LL lines keep upstream's `shift-count` 0
-/// and `error-code` "00000000". `program.port` is PrimeNet's numeric
+/// left out rather than invented. LL lines carry the run's `shift-count`
+/// (0 without one) and `error-code` "00000000". `program.port` is PrimeNet's numeric
 /// platform code, as upstream writes it; the backend is a separate
 /// `program.backend` field. Error counts cover the whole run, earlier
 /// sessions included.
@@ -609,7 +609,7 @@ pub fn result_line(
         WorkKind::Ll => {
             put("worktype", "LL".into());
             put("res64", r.res64.clone().into());
-            put("shift-count", 0.into());
+            put("shift-count", ev.shift.into());
             put("error-code", "00000000".into());
             if ev.errors_total > 0 {
                 put("errors", serde_json::json!({"jacobi": ev.errors_total}));

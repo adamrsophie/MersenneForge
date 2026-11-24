@@ -50,6 +50,15 @@ pub struct LlConfig {
     pub jacobi: JacobiCadence,
     pub checkpoint: Option<PathBuf>,
     pub max_batch: u64,
+    /// Prime95's shift count, as for PRP: the backend holds every value
+    /// rotated, starting at this many bits. Below p; 0 is none and is left
+    /// out of the serialized configuration.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub shift: u32,
+}
+
+fn is_zero(x: &u32) -> bool {
+    *x == 0
 }
 
 impl Default for LlConfig {
@@ -59,6 +68,7 @@ impl Default for LlConfig {
             jacobi: JacobiCadence::Auto,
             checkpoint: None,
             max_batch: 1000,
+            shift: 0,
         }
     }
 }
@@ -116,11 +126,36 @@ pub fn validate(p: u32, cfg: &LlConfig) -> Result<(), ProtocolError> {
             "log step and max batch must be positive".into(),
         ));
     }
+    if cfg.shift != 0 && cfg.shift >= p {
+        return Err(ProtocolError::Config(format!(
+            "shift count {} must be below p = {p}",
+            cfg.shift
+        )));
+    }
     Ok(())
 }
 
 /// Run (or resume) a Lucas-Lehmer test of M_p.
 pub fn run_ll<B: Backend>(
+    be: &mut B,
+    p: u32,
+    cfg: &LlConfig,
+    requested: serde_json::Value,
+    resume: Option<&Checkpoint>,
+    ctl: &mut Control,
+) -> Result<RunReport, ProtocolError> {
+    if cfg.shift == 0 {
+        return run_ll_on(be, p, cfg, requested, resume, ctl);
+    }
+    validate(p, cfg)?;
+    let mut sh =
+        crate::backend::shift::Shifted::new(be, cfg.shift).map_err(ProtocolError::Backend)?;
+    let mut r = run_ll_on(&mut sh, p, cfg, requested, resume, ctl)?;
+    r.evidence.shift = cfg.shift;
+    Ok(r)
+}
+
+fn run_ll_on<B: Backend>(
     be: &mut B,
     p: u32,
     cfg: &LlConfig,

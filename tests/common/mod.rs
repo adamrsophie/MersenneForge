@@ -44,6 +44,7 @@ pub fn ll_cfg(dir: &Path) -> LlConfig {
         jacobi: JacobiCadence::EveryLog,
         checkpoint: Some(dir.join("ckpt").join("ll.ckpt")),
         max_batch: 1000,
+        shift: 0,
     }
 }
 

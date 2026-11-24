@@ -9,8 +9,9 @@
 //! every bit in another place, so a systematic arithmetic error cannot
 //! give both runs the same residue.
 //!
-//! LL is refused: its `- 2` would need the constant rotated by the
-//! register's shift on the device.
+//! LL works too: after a squaring the register holds v^2 * 2^(2s), so
+//! the `- 2` becomes `- 2^(2s + 1)`, which is applied to the rotated value
+//! between squarings.
 
 use super::{Backend, BackendError, BackendIdentity, BackendResult, Reg};
 use crate::residue::Residue;
@@ -112,10 +113,30 @@ impl<B: Backend + ?Sized> Backend for Shifted<'_, B> {
         Ok(())
     }
 
-    fn ll_step(&mut self, _: Reg, _: u64) -> BackendResult<()> {
-        Err(BackendError::Unsupported(
-            "LL with a shift count is not supported".into(),
-        ))
+    fn ll_step(&mut self, r: Reg, n: u64) -> BackendResult<()> {
+        let p = self.exponent();
+        let modulus = crate::residue::modulus(p);
+        for _ in 0..n {
+            let s = self.of(r)?;
+            if s == 0 {
+                // Unrotated (a run started without a shift reached here
+                // only through a zero register): the plain step is exact.
+                self.inner.ll_step(r, 1)?;
+                continue;
+            }
+            self.inner.square(r, 1)?;
+            let t = ((u64::from(s) * 2) % u64::from(p)) as u32;
+            // ponytail: one export and import per iteration, a host round
+            // trip on the device backends; a device side subtraction of a
+            // single power of two would remove it.
+            let k = (t + 1) % p;
+            let x = self.inner.export(r)?.to_biguint();
+            let c = BigUint::from(1u32) << k;
+            let d = if x >= c { x - c } else { x + &modulus - c };
+            self.inner.import(r, &Residue::from_biguint(p, &d))?;
+            self.shift.insert(r, t);
+        }
+        Ok(())
     }
 
     fn mul(&mut self, dst: Reg, src: Reg) -> BackendResult<()> {
@@ -196,6 +217,20 @@ mod tests {
         assert!(want.3 && !want.2);
         assert!(want.1.is_zero());
         assert!(Shifted::new(&mut plain, 127).is_err());
+        // LL steps through every starting shift give the plain residues.
+        for start in [0, 1, 63, 126] {
+            let mut base = CpuBackend::new(p).unwrap();
+            let mut sh = Shifted::new(&mut base, start).unwrap();
+            let mut plain = CpuBackend::new(p).unwrap();
+            let four = Residue::from_u64(p, 4);
+            let (a, b) = (sh.alloc().unwrap(), plain.alloc().unwrap());
+            sh.import(a, &four).unwrap();
+            plain.import(b, &four).unwrap();
+            sh.ll_step(a, 125).unwrap();
+            plain.ll_step(b, 125).unwrap();
+            assert_eq!(sh.export(a).unwrap(), plain.export(b).unwrap());
+            assert!(plain.export(b).unwrap().is_zero(), "M127 is prime");
+        }
         let y = Residue::from_u64(p, 0x1234_5678_9abc);
         assert_eq!(rotate_left(&rotate_left(&y, 100), 27), y);
     }

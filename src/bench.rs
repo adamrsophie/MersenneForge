@@ -504,6 +504,7 @@ fn engine_run(
                 },
                 checkpoint: checkpoint.clone(),
                 max_batch: 1000,
+                shift: 0,
             };
             run_ll(&mut be, p, &cfg, serde_json::json!({}), None, &mut ctl)
         }

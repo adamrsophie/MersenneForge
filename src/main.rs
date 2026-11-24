@@ -185,8 +185,8 @@ enum Cmd {
         /// Skip verifying the generated proof.
         #[arg(long)]
         no_proof_verify: bool,
-        /// PRP shift count, below p: the backend works on every value
-        /// rotated by this many bits (Prime95's shift count).
+        /// Shift count, below p: the backend works on every value rotated
+        /// by this many bits (Prime95's shift count). PRP and LL.
         #[arg(long, default_value_t = 0)]
         shift: u32,
         #[arg(long)]
@@ -265,7 +265,8 @@ enum Cmd {
         proof_dir: Option<PathBuf>,
         #[arg(long)]
         proof_power: Option<u32>,
-        /// Shift count for PRP assignments (see `run --shift`); 0 is none.
+        /// Shift count for PRP and LL assignments (see `run --shift`); 0 is
+        /// none.
         /// Below every exponent in the queue, or a line fails.
         #[arg(long, default_value_t = 0)]
         shift: u32,
@@ -761,9 +762,6 @@ fn cmd_run(
             (r, serde_json::to_value(eff).expect("serializes"))
         }
         Test::Ll => {
-            if shift != 0 {
-                return Err(fail(EXIT_UNSUPPORTED, "--shift applies to PRP, not LL"));
-            }
             if proof_dir.is_some() || proof_power.is_some() {
                 return Err(fail(
                     EXIT_UNSUPPORTED,
@@ -779,6 +777,7 @@ fn cmd_run(
                 },
                 checkpoint: ckpt.clone(),
                 max_batch: 1000,
+                shift,
             };
             let r = ll::run_ll(&mut be, p, &cfg, requested.clone(), None, &mut ctl)
                 .map_err(protocol_failure)?;
@@ -2106,6 +2105,7 @@ fn cmd_work(w: &WorkArgs) -> Result<u8, Failure> {
                         jacobi: JacobiCadence::Auto,
                         checkpoint: Some(ckpt.clone()),
                         max_batch: 1000,
+                        shift: w.shift,
                     },
                     json!({"assignment": a}),
                     None,

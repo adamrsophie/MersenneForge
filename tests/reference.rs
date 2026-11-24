@@ -21,6 +21,7 @@ fn engine_verdicts<B: Backend>(mut be: B, p: u32) -> (Verdict, Verdict) {
         jacobi: JacobiCadence::EveryLog,
         checkpoint: None,
         max_batch: 1000,
+        shift: 0,
     };
     let block = if p < 64 { 2 } else { 16 };
     let prp = PrpConfig {
@@ -234,6 +235,56 @@ fn shifted_prp_matches_the_unshifted_run() {
     };
     let mut be = CpuBackend::new(127).unwrap();
     assert!(run_prp(
+        &mut be,
+        127,
+        &bad,
+        serde_json::json!({}),
+        None,
+        &mut Control::default()
+    )
+    .is_err());
+}
+
+/// A shifted LL run, with Jacobi checks at every log step, gives the same
+/// final residue and verdict as an unshifted one; a shift of p is refused.
+#[test]
+fn shifted_ll_matches_the_unshifted_run() {
+    for (p, shift) in [(1277u32, 1u32), (1279, 1000), (2203, 2202)] {
+        let plain = LlConfig {
+            log_step: 100,
+            jacobi: JacobiCadence::EveryLog,
+            checkpoint: None,
+            max_batch: 1000,
+            shift: 0,
+        };
+        let shifted = LlConfig {
+            shift,
+            ..plain.clone()
+        };
+        let run = |cfg: &LlConfig| {
+            let mut be = DwtBackend::new(p).unwrap();
+            run_ll(
+                &mut be,
+                p,
+                cfg,
+                serde_json::json!({}),
+                None,
+                &mut Control::default(),
+            )
+            .unwrap()
+        };
+        let (a, b) = (run(&plain), run(&shifted));
+        let (ra, rb) = (a.result.unwrap(), b.result.unwrap());
+        assert_eq!(ra.final_residue, rb.final_residue, "M{p}");
+        assert_eq!(ra.verdict, rb.verdict, "M{p}");
+        assert_eq!(b.evidence.shift, shift);
+    }
+    let bad = LlConfig {
+        shift: 127,
+        ..LlConfig::default()
+    };
+    let mut be = CpuBackend::new(127).unwrap();
+    assert!(run_ll(
         &mut be,
         127,
         &bad,
