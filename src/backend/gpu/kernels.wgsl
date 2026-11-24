@@ -238,24 +238,32 @@ fn weight_packed(@builtin(global_invocation_id) g: vec3<u32>, @builtin(num_workg
     }
 }
 
+// Storage position of frequency k: the forward transform leaves its output
+// in bit-reversed order, and the inverse reads that order.
+fn br(k: u32, m: u32) -> u32 {
+    return reverseBits(k) >> (32u - countTrailingZeros(m));
+}
+
 fn pointwise_packed(k: u32, m: u32, product: bool) {
     let j = (m - k) % m;
+    let pk = br(k, m);
+    let pj = br(j, m);
     let w = TW[k];
-    let x = untangle(T[k], conj(T[j]), w);
+    let x = untangle(T[pk], conj(T[pj]), w);
     var y0: vec2<u32>;
     var y1: vec2<u32>;
     if (product) {
-        let x2 = untangle(T2[k], conj(T2[j]), w);
+        let x2 = untangle(T2[pk], conj(T2[pj]), w);
         y0 = cmul(x[0], x2[0]);
         y1 = cmul(x[1], x2[1]);
     } else {
         y0 = csqr(x[0]);
         y1 = csqr(x[1]);
     }
-    T[k] = retangle(y0, y1, conj(w));
+    T[pk] = retangle(y0, y1, conj(w));
     // Y[m - k] = conj Y[k + m], Y[n - k] = conj Y[k], w^-(m - k) = -w^k.
     if (k != 0u && j != k) {
-        T[j] = retangle(conj(y1), conj(y0), neg(w));
+        T[pj] = retangle(conj(y1), conj(y0), neg(w));
     }
 }
 
