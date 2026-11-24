@@ -46,4 +46,4 @@ Note: the changes after the validation record of 2026-11-19 were written while t
 | F38 | Search policy research | not started | optional |
 | F39 | CERT work | CI tested | `Cert=` lines run first, as gpuowl does, from `M<p>.cert` through the Gerbicz checked PRP engine; SHA3-256 hash in Prime95's form |
 | F40 | Self test | CI tested | `selftest`: LL and PRP of small exponents against the host reference, CERT style squaring chains, known factors, P+1; `--full` adds larger exponents |
-| F41 | Longer wgpu transforms | written | lengths 2^23 and 2^24 raise the wgpu range from p = 15,503,945 to 40,894,464 (the end of the GF((2^31 - 1)^2) field); not yet run on a device; wavefront exponents need another modulus |
+| F41 | Longer wgpu transforms | written | lengths 2^23 and 2^24 raise the GF((2^31 - 1)^2) field to p = 40,894,464; a second field, GF((2^61 - 1)^2), covers that field's two gaps and everything above it, up to 301,989,546, so wavefront exponents run at length 2^23; GPU tests run on Mesa llvmpipe in CI, not yet on a hardware GPU |

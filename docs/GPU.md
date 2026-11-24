@@ -80,13 +80,48 @@ vacuous).
 | 8388608 | 26214400 | 3..4 | 10 |
 | 16777216 | 40894464 | 2..3 | 15 |
 
-Supported exponents: **8 ..= 40894464** (`supported_exponents()`), proven
-contiguous by an exhaustive unit test. The cap n <= 2^24 keeps the largest
-buffer (n elements of 8 bytes, 128 MiB) inside the WebGPU default storage
-binding limit of 128 MiB. It is also the end of this field: above 2^24 the
-bound leaves words narrower than 2 bits, so wavefront exponents (above
-100,000,000) need a different modulus or a CRT of two. Lengths 2^23 and 2^24
-are written but have not been run on a device. `GpuBackend::new` also checks the real adapter
+This field ends at p = 40,894,464: above 2^24 the bound leaves words
+narrower than 2 bits. It also has two gaps below that, 15,503,946 to
+16,777,215 and 26,214,401 to 33,554,431, where the narrowest words of one
+length are already too wide and the next length would need words of 1 bit.
+The wide field below covers the gaps and everything above.
+
+## The wide field, GF((2^61 - 1)^2)
+
+`wide.rs` (host model, plan, tables) and `kernels61.wgsl` repeat the
+construction with q = 2^61 - 1. q = 3 mod 4 again, the 2-power roots of unity
+reach order 2^62, twiddles have norm 1, and 2 has order 61 mod q, so every
+weight is a 61-bit rotation. Elements are pairs of u32 (16 bytes per GF(q^2)
+element); the product is formed from 16-bit limb products and folded twice
+modulo q. A plan is accepted when 2 S <= 2^59.
+
+The coefficients no longer fit the i32 words of the carry passes, so the
+unweight pass splits each one into D balanced digits (D = ceil(bits(2 S) /
+w_min) + 1) and adds digit j atomically into word k + j; a `clear` pass
+zeroes the words first. The remainder after D - 1 digits is at most 2, so
+every word holds at most D 2^(w_max - 1) + 2, and `new_wide` refuses a plan
+where that or a carry pass value could leave i32. The ordinary carry passes
+then finish.
+
+| n | largest p | word bits | digits D | carry passes |
+|---|---|---|---|---|
+| 65536 | 1441791 | 21..22 | 4 | 2 |
+| 1048576 | 20971514 | 19..20 | 5 | 2 |
+| 2097152 | 40544931 | 19..20 | 5 | 2 |
+| 4194304 | 79691733 | 18..19 | 5 | 2 |
+| 8388608 | 153791089 | 18..19 | 5 | 2 |
+| 16777216 | 301989546 | 17..18 | 5 | 2 |
+
+`GpuBackend::new` uses the 31-bit field where it has a plan and the wide field
+otherwise, so `supported_exponents()` is **8 ..= 301989546** with no gaps
+(an exhaustive unit test checks every exponent up to 40,894,464 against one
+of the two plans). `GpuOptions::wide` or `MERSENNE_FORGE_GPU_WIDE=1` forces
+the wide field everywhere; the packed transform is not available in it, and
+the fused radix 4 stages are. Wavefront exponents (100,000,000 and up) use
+n = 2^23, whose transform buffers are 128 MiB, the WebGPU default storage
+binding limit; n = 2^24 needs an adapter that allows 256 MiB. The plan name
+is `ntt-gf-m61sq n=<len>`. The wide kernels have run only on Mesa llvmpipe
+in continuous integration, not on a hardware GPU. `GpuBackend::new` also checks the real adapter
 limits (storage binding size, buffer size, storage buffers per stage,
 workgroup size) and returns `Unsupported` if the plan does not fit. The
 backend does not check that p is prime; the protocol layer does.
@@ -181,7 +216,8 @@ Only `export`, `equal`, and `sync` read data back.
 
 ## Identity and device selection
 
-* `kind = "gpu"`, `plan = "ntt-gf-m31sq n=<len>"`,
+* `kind = "gpu"`, `plan = "ntt-gf-m31sq n=<len>"` (or `ntt-gf-m61sq` for the
+  wide field),
   `device = "<adapter name> (<api>)"`, `build` contains the crate version,
   the implementation source fingerprint, and the SHA3-256 of the embedded WGSL.
 * `probe()` enumerates Metal, Vulkan, and DX12 adapters. Enumeration is not

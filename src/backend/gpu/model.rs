@@ -302,8 +302,9 @@ pub fn edge(n: u32) -> Option<u32> {
     Some(a)
 }
 
-/// Inclusive exponent range with a plan. The range is contiguous; a unit
-/// test checks every transition between lengths.
+/// Smallest and largest exponent with a plan. The range has two gaps,
+/// 15,503,946 to 16,777,215 and 26,214,401 to 33,554,431, which the wide
+/// field of [`super::wide`] covers; a unit test checks every exponent.
 pub fn supported_range() -> (u32, u32) {
     let mut hi = 0;
     let mut n = N_MIN;
@@ -892,7 +893,11 @@ mod tests {
         assert_eq!(choose_n(hi), Some(N_MAX));
         assert!(choose_n(lo - 1).is_none());
         assert!(choose_n(hi + 1).is_none());
-        // Exhaustive: every p in the range has a plan.
-        assert!((lo..=hi).all(|p| choose_n(p).is_some()));
+        // The 31-bit field has gaps below its top where the narrowest words
+        // of one length hold more than the length allows and the next
+        // length needs words of 2 bits (15,503,946 to 16,777,215 and
+        // 26,214,401 to 33,554,431); the wide field covers them. Exhaustive: every p in the range has one of the two plans.
+        assert!((lo..=hi).all(|p| choose_n(p).is_some() || Plan::new_wide(p).is_some()));
+        assert!(choose_n(30_000_000).is_none() && Plan::new_wide(30_000_000).is_some());
     }
 }
