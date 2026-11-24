@@ -2895,384 +2895,398 @@ fn main() -> ExitCode {
             "stop requested; finishing at the next valid boundary (press Ctrl-C again to abort)"
         );
     });
-    let r = match cli.cmd {
-        Cmd::Doctor { exponent, json } => cmd_doctor(exponent, json),
-        Cmd::Run {
-            test,
-            exponent,
-            backend,
-            device,
-            budget,
-            proof_dir,
-            proof_power,
-            checkpoint_dir,
-            block_size,
-            check_step,
-            log_step,
-            jacobi,
-            no_proof_verify,
-            json,
-        } => cmd_run(
-            test,
-            exponent,
-            backend,
-            device,
-            budget,
-            proof_dir,
-            proof_power,
-            checkpoint_dir,
-            block_size,
-            check_step,
-            log_step,
-            jacobi,
-            no_proof_verify,
-            json,
-        ),
-        Cmd::Resume {
-            checkpoint,
-            budget,
-            device,
-            backend,
-            proof_dir,
-            json,
-        } => cmd_resume(
-            &checkpoint,
-            budget,
-            device,
-            backend.map(BackendArg::kind),
-            proof_dir,
-            json,
-        ),
-        Cmd::Tf {
-            exponent,
-            from,
-            to,
-            gpu,
-            device,
-            json,
-        } => {
-            let stop = || STOP.load(Ordering::SeqCst);
-            let o = if gpu {
-                tf_on_gpu(exponent, from, to, device, &stop)?
-            } else {
-                mersenne_forge::factor::trial_factor(exponent, from, to, None, &stop, &mut |_| {})
+    // A closure so that `?` in an arm ends the command, not `main`.
+    let r = (move || -> Result<u8, Failure> {
+        match cli.cmd {
+            Cmd::Doctor { exponent, json } => cmd_doctor(exponent, json),
+            Cmd::Run {
+                test,
+                exponent,
+                backend,
+                device,
+                budget,
+                proof_dir,
+                proof_power,
+                checkpoint_dir,
+                block_size,
+                check_step,
+                log_step,
+                jacobi,
+                no_proof_verify,
+                json,
+            } => cmd_run(
+                test,
+                exponent,
+                backend,
+                device,
+                budget,
+                proof_dir,
+                proof_power,
+                checkpoint_dir,
+                block_size,
+                check_step,
+                log_step,
+                jacobi,
+                no_proof_verify,
+                json,
+            ),
+            Cmd::Resume {
+                checkpoint,
+                budget,
+                device,
+                backend,
+                proof_dir,
+                json,
+            } => cmd_resume(
+                &checkpoint,
+                budget,
+                device,
+                backend.map(BackendArg::kind),
+                proof_dir,
+                json,
+            ),
+            Cmd::Tf {
+                exponent,
+                from,
+                to,
+                gpu,
+                device,
+                json,
+            } => {
+                let stop = || STOP.load(Ordering::SeqCst);
+                let o = if gpu {
+                    tf_on_gpu(exponent, from, to, device, &stop)?
+                } else {
+                    mersenne_forge::factor::trial_factor(
+                        exponent,
+                        from,
+                        to,
+                        None,
+                        &stop,
+                        &mut |_| {},
+                    )
                     .map_err(|e| fail(2, e))?
-            };
-            if json {
-                println!("{}", serde_json::to_string(&o).expect("serializable"));
-            } else {
-                println!(
-                    "M{exponent} TF {from}-{to}: {} factors {:?}",
-                    if o.complete { "complete," } else { "stopped," },
-                    o.factors
-                );
-            }
-            Ok(if o.complete { 0 } else { EXIT_INCOMPLETE })
-        }
-        Cmd::Pm1 {
-            exponent,
-            b1,
-            b2,
-            backend,
-            device,
-            json,
-        } => {
-            let mut be = open(backend.kind(), exponent, device)?;
-            let stop = || STOP.load(Ordering::SeqCst);
-            let o = mersenne_forge::factor::pm1(be.as_mut(), b1, b2, &stop)
-                .map_err(|e| fail(EXIT_EXECUTION, e))?;
-            if json {
-                println!("{}", serde_json::to_string(&o).expect("serializable"));
-            } else {
-                for n in &o.notes {
-                    println!("note: {n}");
-                }
-                println!("M{exponent} P-1 B1={b1} B2={b2}: factor {:?}", o.factor);
-            }
-            Ok(if o.complete { 0 } else { EXIT_INCOMPLETE })
-        }
-        Cmd::Ecm {
-            exponent,
-            b1,
-            b2,
-            curves,
-            sigma,
-            json,
-        } => {
-            let stop = || STOP.load(Ordering::SeqCst);
-            let o = mersenne_forge::factor::ecm(exponent, b1, b2, curves, sigma, &stop)
-                .map_err(|e| fail(2, e))?;
-            if json {
-                println!("{}", serde_json::to_string(&o).expect("serializable"));
-            } else {
-                for n in &o.notes {
-                    println!("note: {n}");
-                }
-                println!(
-                    "M{exponent} ECM B1={b1}: {} curves, factor {:?} (sigma {:?})",
-                    o.curves, o.factor, o.found_sigma
-                );
-            }
-            Ok(0)
-        }
-        Cmd::Pp1 {
-            exponent,
-            b1,
-            b2,
-            run,
-            json,
-        } => {
-            let stop = || STOP.load(Ordering::SeqCst);
-            let o = mersenne_forge::factor::pp1(exponent, b1, b2, run, &stop)
-                .map_err(|e| fail(2, e))?;
-            if json {
-                println!("{}", serde_json::to_string(&o).expect("serializable"));
-            } else {
-                for n in &o.notes {
-                    println!("note: {n}");
-                }
-                println!(
-                    "M{exponent} P+1 B1={b1} B2={} start {}/{}: factor {:?}",
-                    o.b2, o.start.0, o.start.1, o.factor
-                );
-            }
-            Ok(0)
-        }
-        Cmd::Selftest {
-            backend,
-            device,
-            full,
-            json,
-        } => {
-            let kind = backend.kind();
-            let mut open_one = |p: u32| select::open(kind, p, device).map_err(|e| e.to_string());
-            let stop = || STOP.load(Ordering::SeqCst);
-            let cases = mersenne_forge::selftest::run(&mut open_one, full, &stop);
-            let failed = cases.iter().filter(|c| c.ok == Some(false)).count();
-            if json {
-                println!("{}", serde_json::to_string(&cases).expect("serializable"));
-            } else {
-                for c in &cases {
-                    let mark = match c.ok {
-                        Some(true) => "pass",
-                        Some(false) => "FAIL",
-                        None => "skip",
-                    };
+                };
+                if json {
+                    println!("{}", serde_json::to_string(&o).expect("serializable"));
+                } else {
                     println!(
-                        "{mark} {}{}",
-                        c.name,
-                        if c.detail.is_empty() {
-                            String::new()
-                        } else {
-                            format!(": {}", c.detail)
-                        }
+                        "M{exponent} TF {from}-{to}: {} factors {:?}",
+                        if o.complete { "complete," } else { "stopped," },
+                        o.factors
                     );
                 }
-                println!("{} cases, {failed} failed", cases.len());
+                Ok(if o.complete { 0 } else { EXIT_INCOMPLETE })
             }
-            Ok(if failed == 0 { 0 } else { EXIT_EXECUTION })
-        }
-        Cmd::CheckpointExport { input, output } => {
-            let ck = Checkpoint::load_file(&input)
-                .and_then(Checkpoint::portable)
-                .map_err(|e| fail(EXIT_STATE, e.to_string()))?;
-            if output.exists() {
-                return Err(fail(EXIT_STATE, format!("{} exists", output.display())));
+            Cmd::Pm1 {
+                exponent,
+                b1,
+                b2,
+                backend,
+                device,
+                json,
+            } => {
+                let mut be = open(backend.kind(), exponent, device)?;
+                let stop = || STOP.load(Ordering::SeqCst);
+                let o = mersenne_forge::factor::pm1(be.as_mut(), b1, b2, &stop)
+                    .map_err(|e| fail(EXIT_EXECUTION, e))?;
+                if json {
+                    println!("{}", serde_json::to_string(&o).expect("serializable"));
+                } else {
+                    for n in &o.notes {
+                        println!("note: {n}");
+                    }
+                    println!("M{exponent} P-1 B1={b1} B2={b2}: factor {:?}", o.factor);
+                }
+                Ok(if o.complete { 0 } else { EXIT_INCOMPLETE })
             }
-            ck.save(&output)
-                .map_err(|e| fail(EXIT_STATE, e.to_string()))?;
-            println!(
-                "M{} {} at k = {} written to {}",
-                ck.meta.exponent,
-                ck.meta.protocol,
-                ck.meta.k,
-                output.display()
-            );
-            Ok(0)
-        }
-        Cmd::Verify {
-            proof,
-            backend,
-            exponent,
-            device,
-            budget,
-            json,
-        } => cmd_verify(&proof, backend, exponent, device, budget, json),
-        Cmd::Bench { plan, output } => cmd_bench(&plan, &output),
-        Cmd::Work {
-            worktodo,
-            results,
-            checkpoint_dir,
-            backend,
-            device,
-            budget,
-            proof_dir,
-            proof_power,
-            status_file,
-        } => {
-            let w = WorkArgs {
+            Cmd::Ecm {
+                exponent,
+                b1,
+                b2,
+                curves,
+                sigma,
+                json,
+            } => {
+                let stop = || STOP.load(Ordering::SeqCst);
+                let o = mersenne_forge::factor::ecm(exponent, b1, b2, curves, sigma, &stop)
+                    .map_err(|e| fail(2, e))?;
+                if json {
+                    println!("{}", serde_json::to_string(&o).expect("serializable"));
+                } else {
+                    for n in &o.notes {
+                        println!("note: {n}");
+                    }
+                    println!(
+                        "M{exponent} ECM B1={b1}: {} curves, factor {:?} (sigma {:?})",
+                        o.curves, o.factor, o.found_sigma
+                    );
+                }
+                Ok(0)
+            }
+            Cmd::Pp1 {
+                exponent,
+                b1,
+                b2,
+                run,
+                json,
+            } => {
+                let stop = || STOP.load(Ordering::SeqCst);
+                let o = mersenne_forge::factor::pp1(exponent, b1, b2, run, &stop)
+                    .map_err(|e| fail(2, e))?;
+                if json {
+                    println!("{}", serde_json::to_string(&o).expect("serializable"));
+                } else {
+                    for n in &o.notes {
+                        println!("note: {n}");
+                    }
+                    println!(
+                        "M{exponent} P+1 B1={b1} B2={} start {}/{}: factor {:?}",
+                        o.b2, o.start.0, o.start.1, o.factor
+                    );
+                }
+                Ok(0)
+            }
+            Cmd::Selftest {
+                backend,
+                device,
+                full,
+                json,
+            } => {
+                let kind = backend.kind();
+                let mut open_one =
+                    |p: u32| select::open(kind, p, device).map_err(|e| e.to_string());
+                let stop = || STOP.load(Ordering::SeqCst);
+                let cases = mersenne_forge::selftest::run(&mut open_one, full, &stop);
+                let failed = cases.iter().filter(|c| c.ok == Some(false)).count();
+                if json {
+                    println!("{}", serde_json::to_string(&cases).expect("serializable"));
+                } else {
+                    for c in &cases {
+                        let mark = match c.ok {
+                            Some(true) => "pass",
+                            Some(false) => "FAIL",
+                            None => "skip",
+                        };
+                        println!(
+                            "{mark} {}{}",
+                            c.name,
+                            if c.detail.is_empty() {
+                                String::new()
+                            } else {
+                                format!(": {}", c.detail)
+                            }
+                        );
+                    }
+                    println!("{} cases, {failed} failed", cases.len());
+                }
+                Ok(if failed == 0 { 0 } else { EXIT_EXECUTION })
+            }
+            Cmd::CheckpointExport { input, output } => {
+                let ck = Checkpoint::load_file(&input)
+                    .and_then(Checkpoint::portable)
+                    .map_err(|e| fail(EXIT_STATE, e.to_string()))?;
+                if output.exists() {
+                    return Err(fail(EXIT_STATE, format!("{} exists", output.display())));
+                }
+                ck.save(&output)
+                    .map_err(|e| fail(EXIT_STATE, e.to_string()))?;
+                println!(
+                    "M{} {} at k = {} written to {}",
+                    ck.meta.exponent,
+                    ck.meta.protocol,
+                    ck.meta.k,
+                    output.display()
+                );
+                Ok(0)
+            }
+            Cmd::Verify {
+                proof,
+                backend,
+                exponent,
+                device,
+                budget,
+                json,
+            } => cmd_verify(&proof, backend, exponent, device, budget, json),
+            Cmd::Bench { plan, output } => cmd_bench(&plan, &output),
+            Cmd::Work {
                 worktodo,
                 results,
                 checkpoint_dir,
-                kind: backend.kind(),
+                backend,
                 device,
                 budget,
                 proof_dir,
                 proof_power,
                 status_file,
-            };
-            let r = cmd_work(&w);
-            let code = match &r {
-                Ok(c) => *c,
-                Err(f) => f.code,
-            };
-            w.status("exited", None, json!({"exit_code": code}));
-            r
-        }
-        Cmd::Supervise {
-            config,
-            max_restarts,
-        } => cmd_supervise(&config, max_restarts),
-        Cmd::Tune {
-            exponent,
-            backend,
-            device,
-            iters,
-        } => cmd_tune(exponent, backend.kind(), device, iters),
-        Cmd::Status {
-            worktodo,
-            results,
-            checkpoint_dir,
-            status_file,
-            watch,
-        } => {
-            // --watch: a full screen view on the terminal's alternate screen,
-            // redrawn every N seconds until Ctrl-C, then the screen is
-            // restored. Without it, one plain report.
-            let tty = watch.is_some() && std::io::IsTerminal::is_terminal(&std::io::stdout());
-            if tty {
-                print!("\x1b[?1049h\x1b[?25l");
+            } => {
+                let w = WorkArgs {
+                    worktodo,
+                    results,
+                    checkpoint_dir,
+                    kind: backend.kind(),
+                    device,
+                    budget,
+                    proof_dir,
+                    proof_power,
+                    status_file,
+                };
+                let r = cmd_work(&w);
+                let code = match &r {
+                    Ok(c) => *c,
+                    Err(f) => f.code,
+                };
+                w.status("exited", None, json!({"exit_code": code}));
+                r
             }
-            loop {
+            Cmd::Supervise {
+                config,
+                max_restarts,
+            } => cmd_supervise(&config, max_restarts),
+            Cmd::Tune {
+                exponent,
+                backend,
+                device,
+                iters,
+            } => cmd_tune(exponent, backend.kind(), device, iters),
+            Cmd::Status {
+                worktodo,
+                results,
+                checkpoint_dir,
+                status_file,
+                watch,
+            } => {
+                // --watch: a full screen view on the terminal's alternate screen,
+                // redrawn every N seconds until Ctrl-C, then the screen is
+                // restored. Without it, one plain report.
+                let tty = watch.is_some() && std::io::IsTerminal::is_terminal(&std::io::stdout());
                 if tty {
-                    print!("\x1b[H\x1b[2J");
-                    println!(
-                        "mersenne-forge status, every {} s (Ctrl-C to quit)\n",
-                        watch.unwrap_or(1).max(1)
-                    );
+                    print!("\x1b[?1049h\x1b[?25l");
                 }
-                print_status(&worktodo, &results, checkpoint_dir.as_deref(), &status_file);
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-                match watch {
-                    Some(n) if !STOP.load(Ordering::SeqCst) => {
-                        let until = std::time::Instant::now() + Duration::from_secs(n.max(1));
-                        while std::time::Instant::now() < until && !STOP.load(Ordering::SeqCst) {
-                            std::thread::sleep(Duration::from_millis(100));
-                        }
+                loop {
+                    if tty {
+                        print!("\x1b[H\x1b[2J");
+                        println!(
+                            "mersenne-forge status, every {} s (Ctrl-C to quit)\n",
+                            watch.unwrap_or(1).max(1)
+                        );
                     }
-                    _ => break,
-                }
-                if STOP.load(Ordering::SeqCst) {
-                    break;
-                }
-            }
-            if tty {
-                print!("\x1b[?25h\x1b[?1049l");
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-            }
-            Ok(0)
-        }
-        Cmd::PrimenetV5 { state_dir, action } => cmd_primenet_v5(&state_dir, action),
-        Cmd::Primenet {
-            user,
-            password_file,
-            worktodo,
-            results,
-            proof_dir,
-            worktype,
-            ahead,
-            state_dir,
-        } => cmd_primenet(
-            &user,
-            &password_file,
-            &worktodo,
-            &results,
-            proof_dir,
-            worktype.as_deref(),
-            ahead,
-            &state_dir,
-        ),
-        Cmd::Power { source, device } => mersenne_forge::evidence::sample_power(&source, device)
-            .map(|w| {
-                println!("{w:.3} W");
-                0
-            })
-            .map_err(|e| fail(EXIT_UNSUPPORTED, e)),
-        Cmd::CheckFactor {
-            exponent,
-            factor,
-            json,
-        } => mersenne_forge::worktodo::check_factor(exponent, &factor)
-            .map_err(|e| fail(2, e))
-            .map(|c| {
-                if json {
-                    println!("{}", serde_json::to_string(&c).expect("json"));
-                } else {
-                    println!(
-                        "{} {} M{}{}",
-                        c.factor,
-                        if c.divides {
-                            "divides"
-                        } else {
-                            "does not divide"
-                        },
-                        c.exponent,
-                        if c.divides && !c.proper {
-                            " but is not a proper factor (it is 1 or M_p itself)"
-                        } else {
-                            ""
+                    print_status(&worktodo, &results, checkpoint_dir.as_deref(), &status_file);
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    match watch {
+                        Some(n) if !STOP.load(Ordering::SeqCst) => {
+                            let until = std::time::Instant::now() + Duration::from_secs(n.max(1));
+                            while std::time::Instant::now() < until && !STOP.load(Ordering::SeqCst)
+                            {
+                                std::thread::sleep(Duration::from_millis(100));
+                            }
                         }
+                        _ => break,
+                    }
+                    if STOP.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+                if tty {
+                    print!("\x1b[?25h\x1b[?1049l");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+                Ok(0)
+            }
+            Cmd::PrimenetV5 { state_dir, action } => cmd_primenet_v5(&state_dir, action),
+            Cmd::Primenet {
+                user,
+                password_file,
+                worktodo,
+                results,
+                proof_dir,
+                worktype,
+                ahead,
+                state_dir,
+            } => cmd_primenet(
+                &user,
+                &password_file,
+                &worktodo,
+                &results,
+                proof_dir,
+                worktype.as_deref(),
+                ahead,
+                &state_dir,
+            ),
+            Cmd::Power { source, device } => {
+                mersenne_forge::evidence::sample_power(&source, device)
+                    .map(|w| {
+                        println!("{w:.3} W");
+                        0
+                    })
+                    .map_err(|e| fail(EXIT_UNSUPPORTED, e))
+            }
+            Cmd::CheckFactor {
+                exponent,
+                factor,
+                json,
+            } => mersenne_forge::worktodo::check_factor(exponent, &factor)
+                .map_err(|e| fail(2, e))
+                .map(|c| {
+                    if json {
+                        println!("{}", serde_json::to_string(&c).expect("json"));
+                    } else {
+                        println!(
+                            "{} {} M{}{}",
+                            c.factor,
+                            if c.divides {
+                                "divides"
+                            } else {
+                                "does not divide"
+                            },
+                            c.exponent,
+                            if c.divides && !c.proper {
+                                " but is not a proper factor (it is 1 or M_p itself)"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
+                    if c.accepted() {
+                        0
+                    } else {
+                        EXIT_REJECTED
+                    }
+                }),
+            Cmd::BenchRender { input, output } => bench::render(&input, &output)
+                .map(|out| {
+                    println!(
+                        "{} observations written to {}",
+                        out.observations.len(),
+                        output.display()
                     );
-                }
-                if c.accepted() {
                     0
-                } else {
-                    EXIT_REJECTED
-                }
-            }),
-        Cmd::BenchRender { input, output } => bench::render(&input, &output)
-            .map(|out| {
-                println!(
-                    "{} observations written to {}",
-                    out.observations.len(),
-                    output.display()
-                );
-                0
-            })
-            .map_err(|e| fail(EXIT_STATE, e)),
-        Cmd::BenchAnalyze {
-            input,
-            baseline,
-            candidate,
-            metric,
-            seed,
-        } => {
-            let text = std::fs::read_to_string(&input)
-                .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", input.display())));
-            text.and_then(|t| {
-                serde_json::from_str::<bench::BenchOutput>(&t)
-                    .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", input.display())))
-            })
-            .and_then(|out| {
-                mersenne_forge::evidence::analyze(&out, baseline, candidate, &metric, seed)
-                    .map_err(|e| fail(2, e))
-            })
-            .map(|v| {
-                println!("{}", serde_json::to_string_pretty(&v).expect("json"));
-                0
-            })
+                })
+                .map_err(|e| fail(EXIT_STATE, e)),
+            Cmd::BenchAnalyze {
+                input,
+                baseline,
+                candidate,
+                metric,
+                seed,
+            } => {
+                let text = std::fs::read_to_string(&input)
+                    .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", input.display())));
+                text.and_then(|t| {
+                    serde_json::from_str::<bench::BenchOutput>(&t)
+                        .map_err(|e| fail(EXIT_STATE, format!("{}: {e}", input.display())))
+                })
+                .and_then(|out| {
+                    mersenne_forge::evidence::analyze(&out, baseline, candidate, &metric, seed)
+                        .map_err(|e| fail(2, e))
+                })
+                .map(|v| {
+                    println!("{}", serde_json::to_string_pretty(&v).expect("json"));
+                    0
+                })
+            }
         }
-    };
+    })();
     match r {
         Ok(code) => ExitCode::from(code),
         Err(f) => {
