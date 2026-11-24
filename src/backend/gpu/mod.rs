@@ -10,6 +10,7 @@
 
 pub mod model;
 pub mod tf;
+pub mod wide;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -25,6 +26,8 @@ use model::Plan;
 
 /// The embedded WGSL source. Its SHA3-256 is part of the backend identity.
 pub const KERNELS: &str = include_str!("kernels.wgsl");
+/// The GF((2^61 - 1)^2) kernels of [`wide`].
+pub const KERNELS61: &str = include_str!("kernels61.wgsl");
 
 const WG: u32 = 256;
 /// Work budget per submission, in transform elements times dispatches. On the
@@ -46,6 +49,9 @@ pub struct GpuOptions {
     /// Two words per element and a half length transform (also enabled by
     /// MERSENNE_FORGE_GPU_PACKED=1); see `weight_packed` in the kernels.
     pub packed: bool,
+    /// The GF((2^61 - 1)^2) field even where the 31-bit field has a plan
+    /// (also enabled by MERSENNE_FORGE_GPU_WIDE=1).
+    pub wide: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -65,9 +71,16 @@ pub struct GpuProbe {
     pub notes: Vec<String>,
 }
 
-/// Inclusive range of exponents with a plan (see [`model::supported_range`]).
+/// Inclusive range of exponents with a plan.
+/// The GF((2^31 - 1)^2) field covers the low part; the wide field of
+/// [`wide`] takes over above it.
 pub fn supported_exponents() -> (u32, u32) {
-    model::supported_range()
+    (model::supported_range().0, wide::top())
+}
+
+/// The plan for p: the 31-bit field when it has one, else the wide field.
+pub fn plan_for(p: u32) -> Option<Plan> {
+    Plan::new(p).or_else(|| Plan::new_wide(p))
 }
 
 /// Whether fused radix 4 stages were asked for (MERSENNE_FORGE_GPU_RADIX4=1).
@@ -75,13 +88,22 @@ fn radix4_requested() -> bool {
     std::env::var("MERSENNE_FORGE_GPU_RADIX4").is_ok_and(|v| v == "1")
 }
 
+/// Whether the wide field was asked for (MERSENNE_FORGE_GPU_WIDE=1).
+fn wide_requested() -> bool {
+    std::env::var("MERSENNE_FORGE_GPU_WIDE").is_ok_and(|v| v == "1")
+}
+
 /// Whether the packed transform was asked for (MERSENNE_FORGE_GPU_PACKED=1).
 fn packed_requested() -> bool {
     std::env::var("MERSENNE_FORGE_GPU_PACKED").is_ok_and(|v| v == "1")
 }
 
-fn plan_name(n: u32) -> String {
-    format!("ntt-gf-m31sq n={n}")
+fn plan_name(plan: &Plan) -> String {
+    if plan.wide {
+        format!("ntt-gf-m61sq n={}", plan.n)
+    } else {
+        format!("ntt-gf-m31sq n={}", plan.n)
+    }
 }
 
 /// Uniform parameter blocks of 16 bytes: the base and LL blocks plus one per
@@ -98,31 +120,33 @@ fn uniform_bytes(log_n: u32) -> u64 {
 /// creates for the time of one read.
 pub fn memory_estimate(p: u32) -> BackendResult<MemoryEstimate> {
     let (lo, hi) = supported_exponents();
-    let n = model::choose_n(p).ok_or_else(|| {
+    let plan = plan_for(p).ok_or_else(|| {
         BackendError::Unsupported(format!(
             "exponent {p} is outside the GPU backend range {lo}..={hi}"
         ))
     })?;
-    let n64 = u64::from(n);
+    let n64 = u64::from(plan.n);
+    // Wide field elements are 16 bytes instead of 8.
+    let elt = if plan.wide { 16 } else { 8 };
     Ok(MemoryEstimate {
-        plan: plan_name(n),
+        plan: plan_name(&plan),
         bytes_per_register: 4 * n64,
-        fixed_bytes: 2 * 8 * n64
+        fixed_bytes: 2 * elt * n64
             + 2 * 4 * n64
-            + 4 * n64
+            + elt / 2 * n64
             + 4 * n64
             + 16
-            + uniform_bytes(n.trailing_zeros())
+            + uniform_bytes(plan.log_n)
             + 4 * n64,
         on_device: true,
     })
 }
 
 pub fn kernel_source_hash() -> String {
-    Sha3_256::digest(KERNELS.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    let mut h = Sha3_256::new();
+    h.update(KERNELS.as_bytes());
+    h.update(KERNELS61.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 const BACKENDS: wgpu::Backends = wgpu::Backends::METAL
@@ -197,7 +221,7 @@ pub fn probe() -> GpuProbe {
     let (lo, hi) = supported_exponents();
     GpuProbe {
         devices,
-        transform: "NTT GF(M31^2)".into(),
+        transform: "NTT GF(M31^2), NTT GF(M61^2) above its range".into(),
         kernel_source_hash: kernel_source_hash(),
         notes: vec![
             format!("supported exponents {lo}..={hi}"),
@@ -262,13 +286,20 @@ struct Pipes {
     sqr: wgpu::ComputePipeline,
     pmul: wgpu::ComputePipeline,
     unweight: wgpu::ComputePipeline,
-    weight_packed: wgpu::ComputePipeline,
-    sqr_packed: wgpu::ComputePipeline,
-    pmul_packed: wgpu::ComputePipeline,
-    unweight_packed: wgpu::ComputePipeline,
+    /// The packed transform; the 31-bit field only.
+    packed: Option<PackedPipes>,
+    /// Zeroes the words the wide unweight adds into; the wide field only.
+    clear: Option<wgpu::ComputePipeline>,
     carry: wgpu::ComputePipeline,
     #[cfg_attr(not(test), allow(dead_code))]
     mulmod_test: wgpu::ComputePipeline,
+}
+
+struct PackedPipes {
+    weight: wgpu::ComputePipeline,
+    sqr: wgpu::ComputePipeline,
+    pmul: wgpu::ComputePipeline,
+    unweight: wgpu::ComputePipeline,
 }
 
 struct RegBuf {
@@ -315,7 +346,8 @@ fn lock(m: &Mutex<Option<BackendError>>) -> std::sync::MutexGuard<'_, Option<Bac
 impl GpuBackend {
     pub fn new(p: u32, opts: &GpuOptions) -> BackendResult<GpuBackend> {
         let (lo, hi) = supported_exponents();
-        let plan = Plan::new(p).ok_or_else(|| {
+        let wide = opts.wide || wide_requested();
+        let plan = if wide { Plan::new_wide(p) } else { plan_for(p) }.ok_or_else(|| {
             BackendError::Unsupported(format!(
                 "exponent {p} is outside the GPU backend range {lo}..={hi}"
             ))
@@ -325,7 +357,8 @@ impl GpuBackend {
         let device_name = format!("{} ({:?})", info.name, info.backend);
         let limits = adapter.limits();
         let n = u64::from(plan.n);
-        let need = 8 * n;
+        let elt: u64 = if plan.wide { 16 } else { 8 };
+        let need = elt * n;
         if need > limits.max_storage_buffer_binding_size
             || need > limits.max_buffer_size
             || limits.max_storage_buffers_per_shader_stage < 7
@@ -360,9 +393,10 @@ impl GpuBackend {
         });
 
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let kernels = if plan.wide { KERNELS61 } else { KERNELS };
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("kernels"),
-            source: wgpu::ShaderSource::Wgsl(KERNELS.into()),
+            source: wgpu::ShaderSource::Wgsl(kernels.into()),
         });
         let storage = |read_only| wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Storage { read_only },
@@ -421,10 +455,13 @@ impl GpuBackend {
             sqr: pipe("sqr"),
             pmul: pipe("pmul"),
             unweight: pipe("unweight"),
-            weight_packed: pipe("weight_packed"),
-            sqr_packed: pipe("sqr_packed"),
-            pmul_packed: pipe("pmul_packed"),
-            unweight_packed: pipe("unweight_packed"),
+            packed: (!plan.wide).then(|| PackedPipes {
+                weight: pipe("weight_packed"),
+                sqr: pipe("sqr_packed"),
+                pmul: pipe("pmul_packed"),
+                unweight: pipe("unweight_packed"),
+            }),
+            clear: plan.wide.then(|| pipe("clear")),
             carry: pipe("carry"),
             mulmod_test: pipe("mulmod_test"),
         };
@@ -452,13 +489,21 @@ impl GpuBackend {
             })
         };
         let copy = wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
-        let tw: Vec<u32> = model::twiddles(plan.n)
-            .iter()
-            .flat_map(|w| [w.re, w.im])
-            .collect();
+        let tw: Vec<u32> = if plan.wide {
+            let lo_hi = |v: u64| [v as u32, (v >> 32) as u32];
+            wide::twiddles(plan.n)
+                .iter()
+                .flat_map(|w| lo_hi(w.re).into_iter().chain(lo_hi(w.im)))
+                .collect()
+        } else {
+            model::twiddles(plan.n)
+                .iter()
+                .flat_map(|w| [w.re, w.im])
+                .collect()
+        };
         let (t, t2) = (
-            storage_buf("t", 8 * n, copy),
-            storage_buf("t2", 8 * n, copy),
+            storage_buf("t", elt * n, copy),
+            storage_buf("t2", elt * n, copy),
         );
         let s = [
             storage_buf("s0", 4 * n, copy),
@@ -476,12 +521,14 @@ impl GpuBackend {
             wt,
             err,
         };
-        let base = sh.params([plan.n, 0, 0, 0]);
-        let ll = sh.params([plan.n, 0, 0, 2]);
+        // The wide unweight reads its digit count from the m field; the
+        // other kernels these blocks drive do not read it.
+        let base = sh.params([plan.n, plan.digits, 0, 0]);
+        let ll = sh.params([plan.n, plan.digits, 0, 2]);
         // Transform length: n, or n / 2 when packed. The twiddle stride
         // stays n / (2 m): a length L stage with half block m uses w_L^j =
         // w_n^(j n / L), and the table holds powers of w_n.
-        let packed = opts.packed || packed_requested();
+        let packed = !plan.wide && (opts.packed || packed_requested());
         let tlen = if packed { plan.n / 2 } else { plan.n };
         let mut bg_dif = Vec::new();
         let mut bg_dit = Vec::new();
@@ -573,10 +620,9 @@ impl GpuBackend {
     /// Weight `load`'s register into T and transform it.
     fn encode_forward(&self, pass: &mut wgpu::ComputePass, load: &wgpu::BindGroup) {
         let n = self.tlen();
-        if self.packed {
-            self.dispatch(pass, &self.pipes.weight_packed, load, n);
-        } else {
-            self.dispatch(pass, &self.pipes.weight, load, n);
+        match self.packed_pipes() {
+            Some(pk) => self.dispatch(pass, &pk.weight, load, n),
+            None => self.dispatch(pass, &self.pipes.weight, load, n),
         }
         if let Some((fwd, _)) = &self.fused {
             for (four, bg) in fwd {
@@ -594,6 +640,11 @@ impl GpuBackend {
     }
 
     /// Inverse transform T, unweight, carry, and store into `dst`.
+    /// The packed kernels, when the packed transform is on.
+    fn packed_pipes(&self) -> Option<&PackedPipes> {
+        self.pipes.packed.as_ref().filter(|_| self.packed)
+    }
+
     /// Transform length: n, or n / 2 when packed.
     fn tlen(&self) -> u32 {
         if self.packed {
@@ -605,11 +656,11 @@ impl GpuBackend {
 
     /// Pointwise square of T, or product with T2.
     fn encode_pointwise(&self, pass: &mut wgpu::ComputePass, product: bool) {
-        let (pipe, count) = match (self.packed, product) {
-            (false, false) => (&self.pipes.sqr, self.plan.n),
-            (false, true) => (&self.pipes.pmul, self.plan.n),
-            (true, false) => (&self.pipes.sqr_packed, self.plan.n / 4 + 1),
-            (true, true) => (&self.pipes.pmul_packed, self.plan.n / 4 + 1),
+        let (pipe, count) = match (self.packed_pipes(), product) {
+            (None, false) => (&self.pipes.sqr, self.plan.n),
+            (None, true) => (&self.pipes.pmul, self.plan.n),
+            (Some(pk), false) => (&pk.sqr, self.plan.n / 4 + 1),
+            (Some(pk), true) => (&pk.pmul, self.plan.n / 4 + 1),
         };
         self.dispatch(pass, pipe, &self.bg_base, count);
     }
@@ -633,10 +684,12 @@ impl GpuBackend {
             }
         }
         let n = self.plan.n;
-        if self.packed {
-            self.dispatch(pass, &self.pipes.unweight_packed, unweight, n / 2);
-        } else {
-            self.dispatch(pass, &self.pipes.unweight, unweight, n);
+        if let Some(clear) = &self.pipes.clear {
+            self.dispatch(pass, clear, unweight, n);
+        }
+        match self.packed_pipes() {
+            Some(pk) => self.dispatch(pass, &pk.unweight, unweight, n / 2),
+            None => self.dispatch(pass, &self.pipes.unweight, unweight, n),
         }
         for t in 1..self.plan.passes {
             self.dispatch(
@@ -748,7 +801,7 @@ impl Backend for GpuBackend {
                 kernel_source_hash()
             ),
             plan: {
-                let mut name = plan_name(self.plan.n);
+                let mut name = plan_name(&self.plan);
                 if self.packed {
                     name.push_str(" packed");
                 }
@@ -1037,7 +1090,8 @@ mod tests {
                 Err(BackendError::Unsupported(_))
             ));
         }
-        for p in [lo, 127, 4423, 86243, model::edge(1 << 16).unwrap()] {
+        let past = model::supported_range().1 + 1;
+        for p in [lo, 127, 4423, 86243, model::edge(1 << 16).unwrap(), past] {
             let m = memory_estimate(p).unwrap();
             let mut g = backend(p);
             assert_eq!(m.plan, g.identity().plan, "p={p}");
@@ -1060,7 +1114,11 @@ mod tests {
 
     #[test]
     fn batches_hold_several_iterations_at_every_length() {
-        for p in [127, model::edge(1 << 16).unwrap(), supported_exponents().1] {
+        for p in [
+            127,
+            model::edge(1 << 16).unwrap(),
+            model::supported_range().1,
+        ] {
             assert!(backend(p).iters_per_submit >= MIN_ITERS_PER_SUBMIT, "p={p}");
         }
     }

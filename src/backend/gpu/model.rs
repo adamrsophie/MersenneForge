@@ -233,6 +233,12 @@ pub struct Plan {
     pub z_bound: u64,
     /// Carry passes per operation.
     pub passes: u32,
+    /// The GF((2^61 - 1)^2) field of [`super::wide`] instead of
+    /// GF((2^31 - 1)^2).
+    pub wide: bool,
+    /// Wide plans: balanced digits each unweighted coefficient is split
+    /// into (see [`super::wide::digits`]); 0 otherwise.
+    pub digits: u32,
 }
 
 /// The proven coefficient bound 2 S for (p, n), or None if the layout is not
@@ -329,6 +335,8 @@ impl Plan {
             w_max: p.div_ceil(n),
             z_bound,
             passes: 0,
+            wide: false,
+            digits: 0,
         };
         for k in 0..n64 {
             let b = pos(k);

@@ -40,14 +40,23 @@ impl Rng {
     }
 }
 
-/// Transform length from the documented plan string "ntt-gf-m31sq n=<len>".
+/// Transform length from the documented plan string "ntt-gf-m31sq n=<len>"
+/// (or "ntt-gf-m61sq n=<len>" for the wide field).
 fn plan_len(g: &GpuBackend) -> u32 {
-    g.identity()
-        .plan
-        .strip_prefix("ntt-gf-m31sq n=")
+    let id = g.identity().plan;
+    id.strip_prefix("ntt-gf-m31sq n=")
+        .or_else(|| id.strip_prefix("ntt-gf-m61sq n="))
+        .unwrap()
+        .split(' ')
+        .next()
         .unwrap()
         .parse()
         .unwrap()
+}
+
+/// Largest exponent of the 31-bit field (length 2^24).
+fn narrow_top() -> u32 {
+    gpu::model::supported_range().1
 }
 
 /// Values whose balanced words (layout b_k = ceil(p k / n), documented in
@@ -100,7 +109,7 @@ fn probe_lists_an_adapter_and_hashes_the_kernels() {
     let pr = gpu::probe();
     assert!(!pr.devices.is_empty(), "no adapter enumerated");
     assert_eq!(pr.kernel_source_hash.len(), 64);
-    assert_eq!(pr.transform, "NTT GF(M31^2)");
+    assert!(pr.transform.starts_with("NTT GF(M31^2)"));
     let g = gpu(521);
     let id = g.identity();
     assert_eq!(id.kind, "gpu");
@@ -121,7 +130,7 @@ fn exponents() -> Vec<u32> {
         ps.push(gpu::model::edge(1 << log_n).unwrap());
     }
     ps.push(1_000_003);
-    ps.push(gpu::supported_exponents().1);
+    ps.push(narrow_top());
     ps
 }
 
@@ -198,7 +207,7 @@ fn repeated_squaring_from_extreme_words() {
         (gpu::model::edge(1 << 10).unwrap(), 20),
         (gpu::model::edge(1 << 16).unwrap(), 20),
         (gpu::model::edge(1 << 22).unwrap(), 5),
-        (gpu::supported_exponents().1, 3),
+        (narrow_top(), 3),
     ] {
         let m = modulus(p);
         let mut g = gpu(p);
@@ -352,4 +361,59 @@ fn error_paths() {
     g.square(a, 1).unwrap();
     assert_eq!(g.export(a).unwrap(), Residue::from_u64(521, 49));
     g.sync().unwrap();
+}
+
+fn wide_gpu(p: u32) -> GpuBackend {
+    GpuBackend::new(
+        p,
+        &GpuOptions {
+            wide: true,
+            ..GpuOptions::default()
+        },
+    )
+    .expect("wide GPU backend")
+}
+
+/// The GF((2^61 - 1)^2) kernels: forced on small exponents, and chosen on
+/// their own just past the end of the 31-bit field.
+#[test]
+fn wide_field_matches_bigint() {
+    let mut rng = Rng(61);
+    assert!(gpu::supported_exponents().1 > 140_000_000);
+    let past = narrow_top() + 1;
+    for (p, k) in [
+        (89u32, 20u64),
+        (1279, 20),
+        (4423, 10),
+        (86243, 5),
+        (past, 2),
+    ] {
+        let m = modulus(p);
+        let mut g = if p == past { gpu(p) } else { wide_gpu(p) };
+        assert!(g.identity().plan.starts_with("ntt-gf-m61sq"), "p={p}");
+        let n = plan_len(&g);
+        let (a, b) = (g.alloc().unwrap(), g.alloc().unwrap());
+        let mut vals = special_values(p);
+        vals.extend(extreme_values(p, n));
+        vals.push(rng.big(p));
+        for v in &vals {
+            let x = res(p, v);
+            g.import(a, &x).unwrap();
+            assert_eq!(g.export(a).unwrap(), x, "round trip p={p}");
+        }
+        for v in extreme_values(p, n).into_iter().chain([rng.big(p)]) {
+            let mut want = v.clone();
+            for _ in 0..k {
+                want = &want * &want % &m;
+            }
+            g.import(a, &res(p, &v)).unwrap();
+            g.square(a, k).unwrap();
+            assert_eq!(g.export(a).unwrap(), res(p, &want), "square p={p} n={n}");
+        }
+        let (x, y) = (rng.big(p), rng.big(p));
+        g.import(a, &res(p, &x)).unwrap();
+        g.import(b, &res(p, &y)).unwrap();
+        g.mul(a, b).unwrap();
+        assert_eq!(g.export(a).unwrap(), res(p, &(&x * &y % &m)), "mul p={p}");
+    }
 }

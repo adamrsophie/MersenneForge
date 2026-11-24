@@ -51,6 +51,10 @@ const BUILD_SOURCES: &[(&str, &[u8])] = &[
         include_bytes!("backend/gpu/kernels.wgsl"),
     ),
     (
+        "src/backend/gpu/kernels61.wgsl",
+        include_bytes!("backend/gpu/kernels61.wgsl"),
+    ),
+    (
         "src/backend/gpu/mod.rs",
         include_bytes!("backend/gpu/mod.rs"),
     ),
@@ -62,6 +66,10 @@ const BUILD_SOURCES: &[(&str, &[u8])] = &[
     (
         "src/backend/gpu/tf.wgsl",
         include_bytes!("backend/gpu/tf.wgsl"),
+    ),
+    (
+        "src/backend/gpu/wide.rs",
+        include_bytes!("backend/gpu/wide.rs"),
     ),
     ("src/backend/mod.rs", include_bytes!("backend/mod.rs")),
     ("src/backend/shift.rs", include_bytes!("backend/shift.rs")),

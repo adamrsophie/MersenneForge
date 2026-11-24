@@ -2507,6 +2507,7 @@ fn cmd_tune(p: u32, kind: BackendKind, device: Option<u32>, iters: u64) -> Resul
                         device,
                         radix4,
                         packed,
+                        ..GpuOptions::default()
                     },
                 )
                 .map_err(unsupported)?;
