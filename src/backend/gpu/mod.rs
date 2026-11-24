@@ -279,6 +279,9 @@ struct RegBuf {
     finish: wgpu::BindGroup,
 }
 
+/// (radix 4, bind group) for each fused pass of one direction.
+type FusedPasses = Vec<(bool, wgpu::BindGroup)>;
+
 pub struct GpuBackend {
     plan: Plan,
     sh: Shared,
@@ -292,7 +295,7 @@ pub struct GpuBackend {
     bg_dit: Vec<wgpu::BindGroup>,
     /// Opt-in fused stages: (radix 4, bind group) per pass, forward and
     /// inverse. None: one pass per stage.
-    fused: Option<(Vec<(bool, wgpu::BindGroup)>, Vec<(bool, wgpu::BindGroup)>)>,
+    fused: Option<(FusedPasses, FusedPasses)>,
     /// Packed transform: the NTT runs at length n / 2.
     packed: bool,
     bg_carry: [wgpu::BindGroup; 2],
