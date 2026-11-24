@@ -113,10 +113,11 @@ fn probe_lists_an_adapter_and_hashes_the_kernels() {
 
 /// Exponents spanning many lengths, including word-unaligned ones, the
 /// largest exponent of several lengths (worst case for the bound), lengths
-/// 2^16 and 2^18, and the largest supported exponent (length 2^22).
+/// 2^16 and 2^18, the largest exponent of length 2^22, and the largest
+/// supported exponent (length 2^24).
 fn exponents() -> Vec<u32> {
     let mut ps = vec![8, 11, 31, 61, 89, 127, 521, 1279, 4423, 9941, 44497];
-    for log_n in [2, 6, 10, 14, 16] {
+    for log_n in [2, 6, 10, 14, 16, 22] {
         ps.push(gpu::model::edge(1 << log_n).unwrap());
     }
     ps.push(1_000_003);
@@ -191,12 +192,13 @@ fn batched_squarings_in_one_call_and_split() {
 
 #[test]
 fn repeated_squaring_from_extreme_words() {
-    // The largest supported exponent (n = 2^22, 10 carry passes) gets a
+    // The largest supported exponent (n = 2^24, 15 carry passes) gets a
     // shorter batch because each bigint squaring there is slow.
     for (p, k) in [
         (gpu::model::edge(1 << 10).unwrap(), 20),
         (gpu::model::edge(1 << 16).unwrap(), 20),
-        (gpu::supported_exponents().1, 5),
+        (gpu::model::edge(1 << 22).unwrap(), 5),
+        (gpu::supported_exponents().1, 3),
     ] {
         let m = modulus(p);
         let mut g = gpu(p);

@@ -64,9 +64,10 @@ pub const Z_LIMIT: u64 = 1 << 29;
 /// Smallest transform length.
 pub const N_MIN: u32 = 4;
 /// Largest transform length. Its largest buffer (n elements of 8 bytes,
-/// 32 MiB) fits the WebGPU default storage binding limit of 128 MiB; the
-/// backend also checks the real adapter limits.
-pub const N_MAX: u32 = 1 << 22;
+/// 128 MiB) just fits the WebGPU default storage binding limit of 128 MiB;
+/// the backend also checks the real adapter limits. Above 2^24 no plan has
+/// words of at least `W_MIN` bits, so a longer transform needs another field.
+pub const N_MAX: u32 = 1 << 24;
 /// Smallest word width a plan may use (keeps the carry pass count bounded).
 pub const W_MIN: u32 = 2;
 
@@ -879,7 +880,8 @@ mod tests {
     #[test]
     fn supported_range_is_contiguous() {
         let (lo, hi) = supported_range();
-        assert!(lo >= 8 && hi > 10_000_000, "{lo} {hi}");
+        assert!(lo >= 8 && hi > 40_000_000, "{lo} {hi}");
+        assert_eq!(choose_n(hi), Some(N_MAX));
         assert!(choose_n(lo - 1).is_none());
         assert!(choose_n(hi + 1).is_none());
         // Exhaustive: every p in the range has a plan.

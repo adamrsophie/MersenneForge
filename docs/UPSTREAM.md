@@ -50,7 +50,7 @@ no code was copied. Status words are those of [STATUS.md](STATUS.md):
 | Upstream feature | Where | Here |
 |---|---|---|
 | Gerbicz checked PRP, proofs (version 2), LL with Jacobi check | Prime95, gpuowl | done |
-| Wavefront exponents (above 100,000,000) on a GPU | gpuowl | not yet: the wgpu backend's transform tops out a little above p = 10,000,000 (see `doctor`); the CPU backends and the CUDA backend reach further, CUDA unrun |
+| Wavefront exponents (above 100,000,000) on a GPU | gpuowl | not yet: the wgpu backend tops out at p = 40,894,464 (transform length 2^24, the end of its GF((2^31 - 1)^2) field; lengths above 2^22 written, not run); reaching 100,000,000 needs another modulus. The CUDA backend reaches further, unrun |
 | Speed comparable to gpuowl and Prime95 | gpuowl, Prime95 | not measured: no tuned baseline has been run (STATUS F16) |
 | CERT squarings with SHA3-256 hash | Prime95, gpuowl | written |
 | GPU trial factoring to 2^95 | mfaktc, mfakto | written (WGSL, three word Montgomery); no CUDA or OpenCL kernel |

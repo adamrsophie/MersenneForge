@@ -61,7 +61,7 @@ and 2^c <= 2, Cauchy and Schwarz give
 
 A plan (p, n) is accepted only if 2 S <= 2^29, which is half of the exact
 recovery limit 2^30 - 1: one bit of explicit margin. The backend uses the
-smallest power-of-two n in [4, 2^22] that satisfies the bound with every
+smallest power-of-two n in [4, 2^24] that satisfies the bound with every
 word at least 2 bits wide. Unit tests check, at the largest p of several n,
 that words all at +W_k or all at -W_k give exactly the i64 convolution, and
 that slightly larger words give wrong coefficients (so the check is not
@@ -77,11 +77,16 @@ vacuous).
 | 262144 | 1551564 | 5..6 | 6 |
 | 1048576 | 5076519 | 4..5 | 8 |
 | 4194304 | 15503945 | 3..4 | 10 |
+| 8388608 | 26214400 | 3..4 | 10 |
+| 16777216 | 40894464 | 2..3 | 15 |
 
-Supported exponents: **8 ..= 15503945** (`supported_exponents()`), proven
-contiguous by an exhaustive unit test. The cap n <= 2^22 keeps the largest
-buffer (n elements of 8 bytes, 32 MiB) inside the WebGPU default storage
-binding limit of 128 MiB. `GpuBackend::new` also checks the real adapter
+Supported exponents: **8 ..= 40894464** (`supported_exponents()`), proven
+contiguous by an exhaustive unit test. The cap n <= 2^24 keeps the largest
+buffer (n elements of 8 bytes, 128 MiB) inside the WebGPU default storage
+binding limit of 128 MiB. It is also the end of this field: above 2^24 the
+bound leaves words narrower than 2 bits, so wavefront exponents (above
+100,000,000) need a different modulus or a CRT of two. Lengths 2^23 and 2^24
+are written but have not been run on a device. `GpuBackend::new` also checks the real adapter
 limits (storage binding size, buffer size, storage buffers per stage,
 workgroup size) and returns `Unsupported` if the plan does not fit. The
 backend does not check that p is prime; the protocol layer does.
@@ -93,13 +98,14 @@ backend does not check that p is prime; the protocol layer does.
 sizes of the buffers a real backend creates:
 
 * per resident register: n words of 4 bytes, **4 n bytes** (16 MiB at
-  n = 2^22).
+  n = 2^22, 64 MiB at n = 2^24).
 * fixed per backend: two transform buffers (8 n bytes each), two carry
   buffers (4 n each), the twiddle table (n / 2 elements of 8 bytes), the word
   table (4 n), 16 bytes of fault flags, 16 bytes of uniform parameters for
   each of the 2 + 2 log2(n) parameter blocks, and the 4 n byte staging buffer
   that `export` creates for one read: **36 n + 16 (3 + 2 log2(n)) bytes**
-  (144 MiB plus 752 bytes at n = 2^22).
+  (144 MiB plus 752 bytes at n = 2^22, 576 MiB plus 816 bytes at
+  n = 2^24).
 
 Memory the driver and `wgpu` use internally (pipelines, bind groups, command
 buffers) is not counted.
