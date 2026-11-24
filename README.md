@@ -77,6 +77,7 @@ mersenne-forge resume --checkpoint M44497.portable.ckpt --backend cpu
 mersenne-forge supervise --config workers.json
 mersenne-forge status --worktodo worktodo.txt --results results.json.txt --checkpoint-dir work/ckpt
 mersenne-forge status --worktodo worktodo.txt --results results.json.txt --serve 127.0.0.1:8080   # web page, loopback only
+mersenne-forge ui --worktodo worktodo.txt --results results.json.txt --checkpoint-dir work/ckpt --status-file w1.json   # control page, loopback only
 mersenne-forge tune --exponent 1000003 --backend dwt
 mersenne-forge power --source rapl
 ```

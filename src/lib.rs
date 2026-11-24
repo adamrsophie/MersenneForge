@@ -96,6 +96,8 @@ const BUILD_SOURCES: &[(&str, &[u8])] = &[
     ("src/run.rs", include_bytes!("run.rs")),
     ("src/select.rs", include_bytes!("select.rs")),
     ("src/selftest.rs", include_bytes!("selftest.rs")),
+    ("src/ui.html", include_bytes!("ui.html")),
+    ("src/ui.rs", include_bytes!("ui.rs")),
     ("src/worktodo.rs", include_bytes!("worktodo.rs")),
 ];
 
@@ -137,7 +139,7 @@ mod build_tests {
                     collect(root, &path, files);
                 } else if matches!(
                     path.extension().and_then(|s| s.to_str()),
-                    Some("rs" | "cu" | "wgsl")
+                    Some("rs" | "cu" | "wgsl" | "html")
                 ) {
                     files.push(
                         path.strip_prefix(root)

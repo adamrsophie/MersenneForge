@@ -1455,3 +1455,88 @@ fn status_serves_a_local_page() {
         "a foreign Host is refused"
     );
 }
+
+/// `ui` serves the control page and its JSON, appends a checked line to the
+/// worktodo file, and refuses a POST from another origin.
+#[test]
+fn ui_serves_the_control_page_and_appends_lines() {
+    use std::io::{BufRead, Read, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let todo = dir.path().join("worktodo.txt");
+    let results = dir.path().join("results.txt");
+    std::fs::write(&todo, "PRP=1,2,127,-1\nTest=128\n").unwrap();
+    std::fs::write(
+        &results,
+        "{\"exponent\":127,\"worktype\":\"LL\",\"status\":\"P\"}\n",
+    )
+    .unwrap();
+    let exe = env!("CARGO_BIN_EXE_mersenne-forge");
+    let mut child = std::process::Command::new(exe)
+        .args([
+            "ui",
+            "--worktodo",
+            s(&todo),
+            "--results",
+            s(&results),
+            "--addr",
+            "127.0.0.1:0",
+        ])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(child.stderr.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let url = line
+        .split("http://")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    let (addr, base) = url.split_once('/').unwrap();
+    let base = format!("/{base}");
+    let ask = |method: &str, path: &str, origin: &str, body: &str| {
+        let mut c = std::net::TcpStream::connect(addr).unwrap();
+        write!(
+            c,
+            "{method} {base}{path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: {origin}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut r = String::new();
+        c.read_to_string(&mut r).unwrap();
+        r
+    };
+    let own = format!("http://{addr}");
+    let page = ask("GET", "", &own, "");
+    let added = ask("POST", "api/queue", &own, "Test=521");
+    let refused = ask("POST", "api/queue", &own, "Test=4");
+    let foreign = ask("POST", "api/queue", "http://attacker.example", "Test=607");
+    let state = ask("GET", "api/state", &own, "");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        page.starts_with("HTTP/1.1 200") && page.contains("MersenneForge"),
+        "{page}"
+    );
+    assert!(page.contains("Content-Security-Policy"));
+    assert!(
+        added.starts_with("HTTP/1.1 200") && added.contains("\"ok\":true"),
+        "{added}"
+    );
+    assert!(refused.starts_with("HTTP/1.1 400"), "{refused}");
+    assert!(foreign.starts_with("HTTP/1.1 403"), "{foreign}");
+    let body = state.split("\r\n\r\n").nth(1).unwrap();
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    let q = v["queue"].as_array().unwrap();
+    assert_eq!(q.len(), 3, "{v}");
+    assert_eq!(q[1]["runnable"], false);
+    assert_eq!(q[2]["line"], "Test=521");
+    assert_eq!(v["results"][0]["exponent"], 127);
+    assert_eq!(
+        std::fs::read_to_string(&todo).unwrap(),
+        "PRP=1,2,127,-1\nTest=128\nTest=521\n"
+    );
+}

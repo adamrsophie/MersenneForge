@@ -27,6 +27,8 @@ use mersenne_forge::prp::{self, PrpConfig};
 use mersenne_forge::run::{Control, ProcessState, ProofStage, ProtocolError, RunReport};
 use mersenne_forge::select::{self, BackendKind};
 
+mod ui;
+
 static STOP: AtomicBool = AtomicBool::new(false);
 
 const EXIT_INCOMPLETE: u8 = 3;
@@ -285,6 +287,23 @@ enum Cmd {
         /// Restarts allowed per worker before it is given up on.
         #[arg(long, default_value_t = 5)]
         max_restarts: u32,
+    },
+    /// Open the control page: a local web app with the workers, the queue,
+    /// results, and devices, which can also add assignments to the
+    /// worktodo file. Loopback addresses only, behind a random per-run URL
+    /// token; runs until Ctrl-C.
+    Ui {
+        #[arg(long, default_value = "worktodo.txt")]
+        worktodo: PathBuf,
+        #[arg(long, default_value = "results.txt")]
+        results: PathBuf,
+        #[arg(long)]
+        checkpoint_dir: Option<PathBuf>,
+        /// Worker status files to show (from `work --status-file`).
+        #[arg(long)]
+        status_file: Vec<PathBuf>,
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: std::net::SocketAddr,
     },
     /// Print queue, checkpoint, and worker state; with --watch, refresh
     /// every N seconds until Ctrl-C.
@@ -2828,112 +2847,27 @@ fn status_text(
     out
 }
 
-/// Serve `text()` over HTTP on a loopback address until Ctrl-C:
-/// `/<token>/` is an HTML page that reloads every 5 s, `/<token>/status.txt`
-/// the plain text, where the token is random per run and printed at start
-/// (other local users and web pages cannot guess the URL). A request whose
-/// Host header is not this address or localhost is refused, which stops DNS
-/// rebinding. Any other path is 404; only GET and HEAD are answered.
-/// Requests are handled one at a time. ponytail: a single threaded loop with no keep-alive; a
-/// slow client delays the next one by at most the 5 s read timeout.
+/// Serve the status on a loopback address until Ctrl-C (see `ui::serve`
+/// for the safeguards): `/<token>/` is an HTML page that reloads every 5 s,
+/// `/<token>/status.txt` the plain text. Only GET and HEAD are answered.
 fn serve_status(addr: std::net::SocketAddr, text: impl Fn() -> String) -> Result<u8, Failure> {
-    use std::io::{Read, Write};
-    // The page shows local paths and queue contents: never on a public
-    // interface.
-    if !addr.ip().is_loopback() {
-        return Err(fail(
-            2,
-            format!("--serve {addr}: only loopback addresses are allowed"),
-        ));
-    }
-    let listener = std::net::TcpListener::bind(addr)
-        .map_err(|e| fail(EXIT_STATE, format!("--serve {addr}: {e}")))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| fail(EXIT_STATE, e.to_string()))?;
-    let addr = listener.local_addr().unwrap_or(addr);
-    let token = {
-        use std::hash::{BuildHasher, Hasher};
-        let mut t = String::new();
-        for i in 0..2u64 {
-            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-            h.write_u64(i);
-            h.write_u128(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_nanos()),
-            );
-            h.write_u32(std::process::id());
-            t.push_str(&format!("{:016x}", h.finish()));
-        }
-        t
-    };
-    let hosts = [addr.to_string(), format!("localhost:{}", addr.port())];
-    let (page_path, text_path) = (format!("/{token}/"), format!("/{token}/status.txt"));
-    eprintln!("serving status at http://{addr}{page_path} (Ctrl-C to stop)");
-    while !STOP.load(Ordering::SeqCst) {
-        let mut stream = match listener.accept() {
-            Ok((s, _)) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
+    use ui::Response;
+    ui::serve(addr, "--serve", "status", |r| {
+        match (r.method.as_str(), r.path.as_str()) {
+            ("GET", "") => {
+                Response::new("200 OK", "text/html; charset=utf-8", status_page(&text()))
             }
-            Err(e) => {
-                eprintln!("--serve: {e}");
-                continue;
+            ("GET", "status.txt") => Response::new("200 OK", "text/plain; charset=utf-8", text()),
+            ("GET", _) => {
+                Response::new("404 Not Found", "text/plain; charset=utf-8", "not found\n")
             }
-        };
-        let _ = stream.set_nonblocking(false);
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-        let mut buf = [0u8; 4096];
-        let mut req = Vec::new();
-        while !req.windows(4).any(|w| w == b"\r\n\r\n") && req.len() < buf.len() {
-            match stream.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => req.extend_from_slice(&buf[..n]),
-            }
-        }
-        let first = String::from_utf8_lossy(&req);
-        let mut words = first.lines().next().unwrap_or("").split(' ');
-        let (method, path) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
-        let host_ok = first.lines().skip(1).any(|l| {
-            l.split_once(':').is_some_and(|(k, v)| {
-                k.trim().eq_ignore_ascii_case("host") && hosts.iter().any(|h| h == v.trim())
-            })
-        });
-        let (code, kind, body) = match (method, path) {
-            _ if !host_ok => (
-                "421 Misdirected Request",
-                "text/plain; charset=utf-8",
-                "unexpected Host\n".into(),
-            ),
-            ("GET" | "HEAD", p) if p == page_path => {
-                ("200 OK", "text/html; charset=utf-8", status_page(&text()))
-            }
-            ("GET" | "HEAD", p) if p == text_path => {
-                ("200 OK", "text/plain; charset=utf-8", text())
-            }
-            ("GET" | "HEAD", _) => (
-                "404 Not Found",
-                "text/plain; charset=utf-8",
-                "not found\n".into(),
-            ),
-            _ => (
+            _ => Response::new(
                 "405 Method Not Allowed",
                 "text/plain; charset=utf-8",
-                "only GET and HEAD\n".into(),
+                "only GET and HEAD\n",
             ),
-        };
-        let head = format!(
-            "HTTP/1.1 {code}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        let _ = stream.write_all(head.as_bytes());
-        if method != "HEAD" {
-            let _ = stream.write_all(body.as_bytes());
         }
-    }
-    Ok(0)
+    })
 }
 
 /// The status text as a small self refreshing HTML page, every character
@@ -3020,7 +2954,9 @@ fn memory_entry(kind: BackendKind, p: u32) -> serde_json::Value {
     }
 }
 
-fn cmd_doctor(exponent: Option<u32>, as_json: bool) -> Result<u8, Failure> {
+/// The `doctor --json` report: build, backends, ranges, devices, and with
+/// an exponent the memory each backend would use.
+fn doctor_json(exponent: Option<u32>) -> serde_json::Value {
     let mut backends = Vec::new();
     for kind in [
         BackendKind::Cpu,
@@ -3068,7 +3004,7 @@ fn cmd_doctor(exponent: Option<u32>, as_json: bool) -> Result<u8, Failure> {
         }
         backends.push(entry);
     }
-    let out = json!({
+    json!({
         "name": "mersenne-forge",
         "version": env!("CARGO_PKG_VERSION"),
         "build": mersenne_forge::build_identity(),
@@ -3086,7 +3022,11 @@ fn cmd_doctor(exponent: Option<u32>, as_json: bool) -> Result<u8, Failure> {
             "listing a device is not validation of its arithmetic",
             "the proof file format follows PRPLL version 2; acceptance by an upstream verifier has not been tested",
         ],
-    });
+    })
+}
+
+fn cmd_doctor(exponent: Option<u32>, as_json: bool) -> Result<u8, Failure> {
+    let out = doctor_json(exponent);
     if as_json {
         println!(
             "{}",
@@ -3535,6 +3475,21 @@ fn main() -> ExitCode {
                 }
                 Ok(0)
             }
+            Cmd::Ui {
+                worktodo,
+                results,
+                checkpoint_dir,
+                status_file,
+                addr,
+            } => ui::run_ui(
+                addr,
+                ui::UiFiles {
+                    worktodo,
+                    results,
+                    checkpoint_dir,
+                    status_files: status_file,
+                },
+            ),
             Cmd::PrimenetV5 { state_dir, action } => cmd_primenet_v5(&state_dir, action),
             Cmd::Primenet {
                 user,
