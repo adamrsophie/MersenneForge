@@ -328,7 +328,7 @@ fn bench_writes_observations() {
         r#"{"name":"t","order":"randomized","seed":3,"repeats":2,"warmups":1,"entries":[
             {"kind":"engine","name":"prp-127","test":"prp","exponent":127,"backend":"cpu","options":{"block_size":200}},
             {"kind":"external","name":"true","argv":["true"]},
-            {"kind":"engine","name":"bad","test":"prp","exponent":128,"backend":"cpu"}]}"#,
+            {"kind":"external","name":"bad","argv":["false"]}]}"#,
     )
     .unwrap();
     let out = dir.path().join("out.json");
@@ -1146,7 +1146,7 @@ fn parse_csv(text: &str) -> Vec<Vec<String>> {
     records
 }
 
-/// Arbitrary text in a plan (here an invalid test name and an argv) cannot
+/// Arbitrary text in a plan (here names and argv) cannot
 /// break the CSV: one record per observation, every record full width, and a
 /// failed observation followed by a valid one keeps both.
 #[test]
@@ -1154,7 +1154,7 @@ fn bench_csv_quotes_every_text_field() {
     let dir = tempfile::tempdir().unwrap();
     let nasty = "ll,bogus\r\n\"quoted\"\nend";
     let plan = serde_json::json!({"name": "csv, \"edge\"\ncases", "order": "sequential", "repeats": 1, "entries": [
-        {"kind": "engine", "name": "bad,name", "test": nasty, "exponent": 89, "backend": "cpu"},
+        {"kind": "external", "name": "bad,name", "argv": ["false", nasty]},
         {"kind": "engine", "name": "good", "test": "ll", "exponent": 89, "backend": "cpu"},
         {"kind": "external", "name": "echo", "argv": ["echo", "a,b\n\"c\""]}]});
     let out = dir.path().join("r.csv");
@@ -1175,7 +1175,10 @@ fn bench_csv_quotes_every_text_field() {
     }
     let (bad, good, ext) = (&records[1], &records[2], &records[3]);
     assert_eq!(bad[col("entry")], "bad,name");
-    assert_eq!(bad[col("test")], nasty);
+    assert_eq!(
+        bad[col("argv")],
+        serde_json::to_string(&["false", nasty]).unwrap()
+    );
     assert_eq!(bad[col("status")], "failed");
     assert_eq!(bad[col("entry_index")], "0");
     assert_eq!(good[col("status")], "completed");
@@ -1323,7 +1326,7 @@ fn bench_analyze_pairs_by_repeat() {
         "entries": [
             {"kind": "engine", "name": "cpu", "test": "ll", "exponent": 521, "backend": "cpu"},
             {"kind": "engine", "name": "dwt", "test": "ll", "exponent": 521, "backend": "dwt"},
-            {"kind": "engine", "name": "bad", "test": "ll", "exponent": 520, "backend": "cpu"}]});
+            {"kind": "external", "name": "bad", "argv": ["false"]}]});
     let out = dir.path().join("a.json");
     assert_eq!(bench(&plan, &out).status.code(), Some(0));
     let run = |b: &str, c: &str| {
@@ -1390,7 +1393,9 @@ fn tune_compares_dwt_variants_and_they_agree() {
     );
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     let rows = v["variants"].as_array().unwrap();
-    assert_eq!(rows.len(), 2);
+    // The default and the packed transform, plus threaded variants on a
+    // machine with more than one core.
+    assert!(rows.len() >= 2, "{rows:?}");
     assert!(rows.iter().all(|r| r["agrees_with_default"] == true));
     assert!(v["fastest"]["ms_per_iteration"].as_f64().unwrap() > 0.0);
 }
