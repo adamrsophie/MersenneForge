@@ -167,7 +167,8 @@ fn work_runs_assignments_and_keeps_what_it_cannot_run() {
     let left: Vec<_> = std::fs::read_dir(dir.path().join("ckpt"))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("M1279-"))
+        // The advisory lock file stays by design (see `lock_checkpoint`).
+        .filter(|n| n.starts_with("M1279-") && !n.ends_with(".lock"))
         .collect();
     assert!(left.is_empty(), "{left:?}");
     // A results line torn by a crash is closed before the next one.
