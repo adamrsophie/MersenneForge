@@ -687,7 +687,8 @@ impl DwtBackend {
     /// tests directly.
     #[doc(hidden)]
     pub fn use_packed(&mut self) {
-        let plan = std::mem::replace(&mut self.plan, Plan::new(self.plan.p, self.plan.n));
+        let (p, n) = (self.plan.p, self.plan.n);
+        let plan = std::mem::replace(&mut self.plan, Plan::new(p, n));
         self.plan = plan.with_packing();
         if let Some(pk) = &self.plan.packed {
             let need = pk
