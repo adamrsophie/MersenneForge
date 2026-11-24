@@ -1423,27 +1423,35 @@ fn status_serves_a_local_page() {
     std::io::BufReader::new(child.stderr.take().unwrap())
         .read_line(&mut line)
         .unwrap();
-    let addr = line
+    let url = line
         .split("http://")
         .nth(1)
-        .and_then(|r| r.split('/').next())
         .unwrap()
-        .to_string();
-    let get = |path: &str| {
-        let mut c = std::net::TcpStream::connect(&addr).unwrap();
-        write!(c, "GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        .split_whitespace()
+        .next()
+        .unwrap();
+    let (addr, page_path) = url.split_once('/').unwrap();
+    let page_path = format!("/{page_path}");
+    let get = |path: &str, host: &str| {
+        let mut c = std::net::TcpStream::connect(addr).unwrap();
+        write!(c, "GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").unwrap();
         let mut r = String::new();
         c.read_to_string(&mut r).unwrap();
         r
     };
-    let page = get("/");
-    let text = get("/status.txt");
-    let missing = get("/nope");
+    let page = get(&page_path, addr);
+    let text = get(&format!("{page_path}status.txt"), addr);
+    let missing = get("/", addr);
+    let rebound = get(&page_path, "attacker.example:80");
     let _ = child.kill();
     let _ = child.wait();
     assert!(page.starts_with("HTTP/1.1 200"), "{page}");
     assert!(page.contains("<pre>") && page.contains("PRP=127"));
     assert!(page.contains("1 runnable"));
     assert!(text.starts_with("HTTP/1.1 200") && text.contains("1 runnable"));
-    assert!(missing.starts_with("HTTP/1.1 404"));
+    assert!(missing.starts_with("HTTP/1.1 404"), "the token is required");
+    assert!(
+        rebound.starts_with("HTTP/1.1 421"),
+        "a foreign Host is refused"
+    );
 }

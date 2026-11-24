@@ -2688,10 +2688,13 @@ fn status_text(
     out
 }
 
-/// Serve `text()` over HTTP on a loopback address until Ctrl-C: `/` is an
-/// HTML page that reloads every 5 s, `/status.txt` the plain text. Any
-/// other path is 404; only GET and HEAD are answered. Requests are handled
-/// one at a time. ponytail: a single threaded loop with no keep-alive; a
+/// Serve `text()` over HTTP on a loopback address until Ctrl-C:
+/// `/<token>/` is an HTML page that reloads every 5 s, `/<token>/status.txt`
+/// the plain text, where the token is random per run and printed at start
+/// (other local users and web pages cannot guess the URL). A request whose
+/// Host header is not this address or localhost is refused, which stops DNS
+/// rebinding. Any other path is 404; only GET and HEAD are answered.
+/// Requests are handled one at a time. ponytail: a single threaded loop with no keep-alive; a
 /// slow client delays the next one by at most the 5 s read timeout.
 fn serve_status(addr: std::net::SocketAddr, text: impl Fn() -> String) -> Result<u8, Failure> {
     use std::io::{Read, Write};
@@ -2709,7 +2712,25 @@ fn serve_status(addr: std::net::SocketAddr, text: impl Fn() -> String) -> Result
         .set_nonblocking(true)
         .map_err(|e| fail(EXIT_STATE, e.to_string()))?;
     let addr = listener.local_addr().unwrap_or(addr);
-    eprintln!("serving status at http://{addr}/ (Ctrl-C to stop)");
+    let token = {
+        use std::hash::{BuildHasher, Hasher};
+        let mut t = String::new();
+        for i in 0..2u64 {
+            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+            h.write_u64(i);
+            h.write_u128(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos()),
+            );
+            h.write_u32(std::process::id());
+            t.push_str(&format!("{:016x}", h.finish()));
+        }
+        t
+    };
+    let hosts = [addr.to_string(), format!("localhost:{}", addr.port())];
+    let (page_path, text_path) = (format!("/{token}/"), format!("/{token}/status.txt"));
+    eprintln!("serving status at http://{addr}{page_path} (Ctrl-C to stop)");
     while !STOP.load(Ordering::SeqCst) {
         let mut stream = match listener.accept() {
             Ok((s, _)) => s,
@@ -2735,9 +2756,23 @@ fn serve_status(addr: std::net::SocketAddr, text: impl Fn() -> String) -> Result
         let first = String::from_utf8_lossy(&req);
         let mut words = first.lines().next().unwrap_or("").split(' ');
         let (method, path) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+        let host_ok = first.lines().skip(1).any(|l| {
+            l.split_once(':').is_some_and(|(k, v)| {
+                k.trim().eq_ignore_ascii_case("host") && hosts.iter().any(|h| h == v.trim())
+            })
+        });
         let (code, kind, body) = match (method, path) {
-            ("GET" | "HEAD", "/") => ("200 OK", "text/html; charset=utf-8", status_page(&text())),
-            ("GET" | "HEAD", "/status.txt") => ("200 OK", "text/plain; charset=utf-8", text()),
+            _ if !host_ok => (
+                "421 Misdirected Request",
+                "text/plain; charset=utf-8",
+                "unexpected Host\n".into(),
+            ),
+            ("GET" | "HEAD", p) if p == page_path => {
+                ("200 OK", "text/html; charset=utf-8", status_page(&text()))
+            }
+            ("GET" | "HEAD", p) if p == text_path => {
+                ("200 OK", "text/plain; charset=utf-8", text())
+            }
             ("GET" | "HEAD", _) => (
                 "404 Not Found",
                 "text/plain; charset=utf-8",

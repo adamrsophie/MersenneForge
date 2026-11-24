@@ -42,7 +42,7 @@ Note: the changes after the validation record of 2026-11-19 (the rows marked wri
 | F34 | Structured logs and health state | written | `work --status-file` JSON health state and `status`; no metrics endpoint |
 | F35 | Cross version checkpoint migration | written | `checkpoint-export` writes the last verified state without its backend binding; `resume --backend` and `work` continue it on any backend or build |
 | F36 | Releases and platform CI | written | release workflow builds, tests, and drafts tagged releases for Linux and macOS (cpu and gpu builds); not yet run |
-| F37 | TUI or web interface | written | `status --watch N`: full screen terminal view (alternate screen) of queue, results, checkpoint progress bars, and workers; `status --serve ADDR`: the same report as a self refreshing web page and as text at `/status.txt`, read only, loopback addresses only |
+| F37 | TUI or web interface | written | `status --watch N`: full screen terminal view (alternate screen) of queue, results, checkpoint progress bars, and workers; `status --serve ADDR`: the same report as a self refreshing web page and as text at `/status.txt`, read only, loopback addresses only, behind a random per-run URL token and a Host header check |
 | F38 | Search policy research | not started | optional |
 | F39 | CERT work | written | `Cert=` lines run first, as gpuowl does, from `M<p>.cert` through the Gerbicz checked PRP engine; SHA3-256 hash in Prime95's form |
 | F40 | Self test | written | `selftest`: LL and PRP of small exponents against the host reference, CERT style squaring chains, known factors, P+1; `--full` adds larger exponents |
