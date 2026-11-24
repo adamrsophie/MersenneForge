@@ -137,7 +137,12 @@ fn adapters() -> Vec<wgpu::Adapter> {
     pollster::block_on(instance.enumerate_adapters(BACKENDS))
 }
 
-/// The adapter at index `device`, or the first hardware adapter.
+/// Set to 1 to let the default adapter be a software one (Mesa llvmpipe,
+/// WARP) when no hardware adapter exists, as in continuous integration.
+pub const ALLOW_SOFTWARE_ENV: &str = "MERSENNE_FORGE_ALLOW_SOFTWARE_GPU";
+
+/// The adapter at index `device`, or the first hardware adapter (or, with
+/// [`ALLOW_SOFTWARE_ENV`] set to 1, the first adapter of any kind).
 fn pick_adapter(device: Option<u32>) -> BackendResult<wgpu::Adapter> {
     let mut all = adapters();
     match device {
@@ -150,16 +155,24 @@ fn pick_adapter(device: Option<u32>) -> BackendResult<wgpu::Adapter> {
             }
             Ok(all.swap_remove(i as usize))
         }
-        None => all
-            .into_iter()
-            .find(|a| a.get_info().device_type != wgpu::DeviceType::Cpu)
-            .ok_or_else(|| {
-                BackendError::Unsupported(
+        None => {
+            let software = std::env::var(ALLOW_SOFTWARE_ENV).is_ok_and(|v| v == "1");
+            let hw = all
+                .iter()
+                .position(|a| a.get_info().device_type != wgpu::DeviceType::Cpu);
+            match hw.or(if software && !all.is_empty() {
+                Some(0)
+            } else {
+                None
+            }) {
+                Some(i) => Ok(all.swap_remove(i)),
+                None => Err(BackendError::Unsupported(format!(
                     "no hardware GPU adapter found through Metal, Vulkan, or DX12 \
-                     (software adapters are used only when selected by index)"
-                        .into(),
-                )
-            }),
+                     (software adapters are used only when selected by index or \
+                     with {ALLOW_SOFTWARE_ENV}=1)"
+                ))),
+            }
+        }
     }
 }
 

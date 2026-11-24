@@ -52,3 +52,23 @@ jobs:
         run: cargo test --locked
       - name: Compile every feature at the minimum supported Rust version
         run: cargo check --locked --all-targets --features gpu,cuda
+
+  # The GPU code on a software Vulkan device (Mesa llvmpipe). This runs the
+  # WGSL kernels for real, slowly; it says nothing about speed or about
+  # any particular GPU's driver.
+  gpu-software:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      MERSENNE_FORGE_ALLOW_SOFTWARE_GPU: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Mesa Vulkan drivers
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers vulkan-tools && vulkaninfo --summary
+      - name: Clippy with the gpu feature
+        run: cargo clippy --locked --all-targets --features gpu -- -D warnings
+      - name: GPU tests on llvmpipe
+        run: cargo test --locked --release --features gpu --lib --test gpu_backend --test protocol_gpu -- --test-threads=1
