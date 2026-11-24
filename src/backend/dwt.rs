@@ -283,7 +283,7 @@ struct ParFft {
 impl ParFft {
     /// None when n has no useful split (both factors at least 16).
     fn new(n: usize, inverse: bool, threads: usize) -> Option<ParFft> {
-        let n1 = (16..=n.isqrt()).rev().find(|d| n % d == 0)?;
+        let n1 = (16..=n.isqrt()).rev().find(|&d| n.is_multiple_of(d))?;
         let n2 = n / n1;
         let mut planner = FftPlanner::<f64>::new();
         let (f1, f2) = if inverse {
@@ -427,7 +427,7 @@ impl Plan {
 
     /// The same plan with the packed real transform, when n allows it.
     fn with_packing(mut self) -> Plan {
-        if self.n >= 4 && self.n % 2 == 0 {
+        if self.n >= 4 && self.n.is_multiple_of(2) {
             self.packed = Some(Packed::new(self.n, &mut FftPlanner::<f64>::new()));
         }
         self

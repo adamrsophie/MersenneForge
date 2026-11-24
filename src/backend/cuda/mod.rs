@@ -558,7 +558,8 @@ impl CudaBackend {
 
     fn read_residue(&mut self, r: Reg) -> BackendResult<Residue> {
         let words = self.read_words(r);
-        let words = self.plan.unpack(&self.note(words)?);
+        let words = self.note(words)?;
+        let words = self.plan.unpack(&words);
         self.plan
             .from_words(&words)
             .map_err(|e| BackendError::Fault(format!("export: {e}")))

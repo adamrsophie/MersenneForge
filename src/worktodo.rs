@@ -460,7 +460,7 @@ impl Md5 {
             .map(|w| u32::from_le_bytes(*w))
             .collect();
         let [mut a, mut b, mut c, mut d] = self.st;
-        for i in 0..64 {
+        for (i, &s) in S.iter().enumerate() {
             let (f, g) = match i / 16 {
                 0 => ((b & c) | (!b & d), i),
                 1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
@@ -475,7 +475,7 @@ impl Md5 {
                 a.wrapping_add(f)
                     .wrapping_add(k)
                     .wrapping_add(m[g])
-                    .rotate_left(S[i]),
+                    .rotate_left(s),
             );
             a = t;
         }
