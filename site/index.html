@@ -4,165 +4,812 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MersenneForge</title>
-<meta name="description" content="A Rust engine for Lucas-Lehmer and base 3 probable prime tests of Mersenne numbers, with Gerbicz error checking, PRP proofs, and durable checkpoints.">
+<meta name="description" content="MersenneForge: a pure Rust engine for Lucas-Lehmer and base 3 probable prime tests of Mersenne numbers, with Gerbicz error checking, PRP proofs, durable checkpoints, factoring, and CPU, GPU, and CUDA backends.">
+<meta name="theme-color" content="#14161b">
+<meta property="og:title" content="MersenneForge">
+<meta property="og:description" content="Checked primality tests for Mersenne numbers, in Rust.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://adamrsophie.github.io/MersenneForge/">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="icon" href="favicon.ico" sizes="any">
 <style>
 :root {
-  --bg: #ffffff; --fg: #1b1d22; --muted: #5b606b; --line: #e3e5ea;
-  --panel: #f6f7f9; --accent: #d9531a; --code: #f1f2f5;
+  --bg: #ffffff; --bg-2: #f7f7f5; --fg: #17191e; --muted: #5a5f6a; --faint: #8a8f99;
+  --line: #e4e4e0; --line-2: #d4d4ce; --panel: #fbfbfa; --code-bg: #14161b; --code-fg: #e8e6e1;
+  --code-muted: #8d919b; --accent: #c9461a; --accent-fg: #ffffff; --accent-soft: rgba(201, 70, 26, 0.09);
+  --ok: #1f7a3a; --ok-bg: rgba(31, 122, 58, 0.1); --warn: #8a5a00; --warn-bg: rgba(176, 116, 0, 0.12);
+  --no: #5a5f6a; --no-bg: rgba(90, 95, 106, 0.1); --shadow: 0 1px 2px rgba(20, 22, 27, 0.04), 0 8px 24px rgba(20, 22, 27, 0.05);
+  --radius: 12px; --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #14161b; --fg: #e8e9ec; --muted: #9aa0ab; --line: #2a2e36;
-    --panel: #1b1e24; --accent: #ff6a2b; --code: #1f2229;
+  :root:not([data-theme="light"]) {
+    --bg: #111317; --bg-2: #16191e; --fg: #e9e8e4; --muted: #a3a7b0; --faint: #747984;
+    --line: #262a31; --line-2: #333842; --panel: #171a1f; --code-bg: #0b0c0f; --code-fg: #e8e6e1;
+    --code-muted: #7d818b; --accent: #ff7a3d; --accent-fg: #14161b; --accent-soft: rgba(255, 122, 61, 0.1);
+    --ok: #5cc97c; --ok-bg: rgba(92, 201, 124, 0.12); --warn: #e6b450; --warn-bg: rgba(230, 180, 80, 0.12);
+    --no: #a3a7b0; --no-bg: rgba(163, 167, 176, 0.12); --shadow: none;
+    color-scheme: dark;
   }
 }
-* { box-sizing: border-box; }
-html { -webkit-text-size-adjust: 100%; }
-body {
-  margin: 0; background: var(--bg); color: var(--fg);
-  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+:root[data-theme="dark"] {
+  --bg: #111317; --bg-2: #16191e; --fg: #e9e8e4; --muted: #a3a7b0; --faint: #747984;
+  --line: #262a31; --line-2: #333842; --panel: #171a1f; --code-bg: #0b0c0f; --code-fg: #e8e6e1;
+  --code-muted: #7d818b; --accent: #ff7a3d; --accent-fg: #14161b; --accent-soft: rgba(255, 122, 61, 0.1);
+  --ok: #5cc97c; --ok-bg: rgba(92, 201, 124, 0.12); --warn: #e6b450; --warn-bg: rgba(230, 180, 80, 0.12);
+  --no: #a3a7b0; --no-bg: rgba(163, 167, 176, 0.12); --shadow: none;
+  color-scheme: dark;
 }
-a { color: var(--accent); text-decoration: none; }
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; scroll-padding-top: 76px; }
+@media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.6 var(--sans); }
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 3px; }
 a:hover { text-decoration: underline; }
-.wrap { max-width: 920px; margin: 0 auto; padding: 0 16px; }
-header.top { border-bottom: 1px solid var(--line); }
-header.top .wrap { display: flex; align-items: center; justify-content: space-between; height: 60px; }
-.brand { display: flex; align-items: center; gap: 10px; font-weight: 650; color: var(--fg); }
-.brand img { width: 28px; height: 28px; }
-nav a { margin-left: 20px; color: var(--muted); font-size: 15px; }
-.hero { padding: 72px 0 48px; display: grid; grid-template-columns: 1fr auto; gap: 40px; align-items: center; }
-.hero h1 { font-size: 44px; line-height: 1.1; margin: 0 0 16px; letter-spacing: -0.02em; }
-.hero p { font-size: 19px; color: var(--muted); margin: 0 0 28px; max-width: 34em; }
-.hero img { width: 180px; height: 180px; }
-.btn { display: inline-block; padding: 10px 18px; border-radius: 8px; font-weight: 600; margin-right: 10px; }
-.btn.primary { background: var(--accent); color: #fff; }
-.btn.ghost { border: 1px solid var(--line); color: var(--fg); }
-.btn:hover { text-decoration: none; opacity: 0.9; }
-section { padding: 40px 0; border-top: 1px solid var(--line); }
-h2 { font-size: 24px; margin: 0 0 16px; letter-spacing: -0.01em; }
-.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
-.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; }
-.card h3 { margin: 0 0 6px; font-size: 16px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+code, pre, kbd { font-family: var(--mono); }
+p code, li code:not(pre code), td code, summary code { font-size: 0.88em; background: var(--bg-2); border: 1px solid var(--line); border-radius: 5px; padding: 0.05em 0.35em; white-space: nowrap; }
+.wrap { max-width: 1080px; margin: 0 auto; padding: 0 20px; }
+.skip { position: absolute; left: -9999px; top: 8px; background: var(--accent); color: var(--accent-fg); padding: 8px 12px; border-radius: 8px; z-index: 100; }
+.skip:focus { left: 12px; }
+
+/* Header */
+header.top { position: sticky; top: 0; z-index: 50; background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: saturate(1.4) blur(10px); -webkit-backdrop-filter: saturate(1.4) blur(10px); border-bottom: 1px solid var(--line); }
+header.top .wrap { display: flex; align-items: center; gap: 16px; height: 60px; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 680; color: var(--fg); text-decoration: none; letter-spacing: -0.01em; flex: none; }
+.brand:hover { text-decoration: none; }
+.brand img { width: 28px; height: 28px; border-radius: 7px; }
+.brand .ver { font: 600 11px/1 var(--mono); color: var(--muted); border: 1px solid var(--line-2); border-radius: 999px; padding: 4px 7px; }
+nav.main { display: flex; gap: 4px; margin-left: auto; overflow-x: auto; scrollbar-width: none; }
+nav.main::-webkit-scrollbar { display: none; }
+nav.main a { color: var(--muted); font-size: 14.5px; padding: 6px 10px; border-radius: 8px; text-decoration: none; white-space: nowrap; }
+nav.main a:hover, nav.main a[aria-current="true"] { color: var(--fg); background: var(--bg-2); }
+.icon-btn { flex: none; display: inline-grid; place-items: center; width: 36px; height: 36px; border-radius: 9px; border: 1px solid var(--line); background: transparent; color: var(--muted); cursor: pointer; }
+.icon-btn:hover { color: var(--fg); border-color: var(--line-2); }
+.icon-btn svg { width: 18px; height: 18px; }
+
+/* Hero */
+.hero { padding: 76px 0 56px; display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); gap: 48px; align-items: center; }
+.eyebrow { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; color: var(--accent); background: var(--accent-soft); border-radius: 999px; padding: 5px 12px; margin-bottom: 20px; text-decoration: none; }
+.eyebrow:hover { text-decoration: none; filter: brightness(1.05); }
+.hero h1 { font-size: clamp(34px, 5vw, 52px); line-height: 1.06; margin: 0 0 18px; letter-spacing: -0.03em; font-weight: 750; }
+.hero h1 em { font-style: normal; color: var(--accent); }
+.lede { font-size: 18.5px; color: var(--muted); margin: 0 0 30px; max-width: 33em; }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.btn { display: inline-flex; align-items: center; gap: 8px; padding: 11px 18px; border-radius: 10px; font-weight: 620; font-size: 15px; text-decoration: none; border: 1px solid transparent; cursor: pointer; }
+.btn:hover { text-decoration: none; }
+.btn.primary { background: var(--accent); color: var(--accent-fg); }
+.btn.primary:hover { filter: brightness(1.06); }
+.btn.ghost { border-color: var(--line-2); color: var(--fg); background: var(--bg); }
+.btn.ghost:hover { background: var(--bg-2); }
+.btn svg { width: 16px; height: 16px; }
+.hero-meta { margin-top: 22px; font-size: 13.5px; color: var(--faint); }
+
+.term { background: var(--code-bg); color: var(--code-fg); border-radius: 14px; border: 1px solid var(--line); box-shadow: var(--shadow); overflow: hidden; min-width: 0; }
+.term-bar { display: flex; align-items: center; gap: 7px; padding: 12px 14px; border-bottom: 1px solid rgba(255, 255, 255, 0.07); }
+.term-bar i { width: 11px; height: 11px; border-radius: 50%; background: #3a3e46; display: block; }
+.term-bar span { margin-left: 8px; font: 12px var(--mono); color: var(--code-muted); }
+.term pre { margin: 0; padding: 18px 20px 22px; font-size: 13.5px; line-height: 1.75; overflow-x: auto; }
+.term .c { color: var(--code-muted); }
+.term .p { color: #ff7a3d; user-select: none; }
+
+/* Facts strip */
+.facts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); margin-bottom: 24px; }
+.fact { padding: 20px 22px; border-left: 1px solid var(--line); }
+.fact:first-child { border-left: 0; }
+.fact b { display: block; font-size: 22px; letter-spacing: -0.02em; font-weight: 720; font-variant-numeric: tabular-nums; }
+.fact span { color: var(--muted); font-size: 14px; }
+
+/* Sections */
+section { padding: 72px 0 8px; }
+.sec-head { max-width: 46em; margin-bottom: 28px; }
+.sec-head .kicker { font: 600 12.5px var(--mono); text-transform: uppercase; letter-spacing: 0.08em; color: var(--accent); margin: 0 0 8px; }
+h2 { font-size: clamp(26px, 3.2vw, 32px); line-height: 1.15; margin: 0 0 12px; letter-spacing: -0.025em; font-weight: 720; }
+h2 a.anchor { color: inherit; text-decoration: none; }
+h2 a.anchor:hover::after { content: " #"; color: var(--faint); }
+.sec-head p { color: var(--muted); margin: 0; font-size: 17px; }
+h3 { font-size: 17px; margin: 0 0 8px; letter-spacing: -0.01em; }
+
+.cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 22px; }
 .card p { margin: 0; color: var(--muted); font-size: 15px; }
-.table-scroll { overflow-x: auto; }
-table { width: 100%; border-collapse: collapse; font-size: 15px; }
-th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
-th { color: var(--muted); font-weight: 600; }
-.tag { display: inline-block; font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
-.ok { background: rgba(46, 160, 67, 0.15); color: #2ea043; }
-.part { background: rgba(210, 153, 34, 0.15); color: #b8860b; }
-.no { background: rgba(140, 140, 150, 0.15); color: var(--muted); }
-pre { background: var(--code); border: 1px solid var(--line); border-radius: 10px; padding: 16px; overflow-x: auto; font-size: 14px; line-height: 1.5; }
-code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-.note { color: var(--muted); font-size: 15px; }
-ul.links { padding-left: 18px; margin: 0; }
-footer { border-top: 1px solid var(--line); padding: 28px 0 40px; color: var(--muted); font-size: 14px; }
+.card .ico { width: 34px; height: 34px; border-radius: 9px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent); margin-bottom: 14px; }
+.card .ico svg { width: 18px; height: 18px; }
+
+/* Install */
+.install { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 24px; align-items: start; }
+.tabs { display: flex; gap: 4px; padding: 4px; background: var(--bg-2); border: 1px solid var(--line); border-radius: 11px; width: max-content; max-width: 100%; overflow-x: auto; }
+.tabs button { appearance: none; border: 0; background: transparent; color: var(--muted); font: 600 14px var(--sans); padding: 8px 14px; border-radius: 8px; cursor: pointer; white-space: nowrap; }
+.tabs button[aria-selected="true"] { background: var(--bg); color: var(--fg); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08); }
+.panel { margin-top: 16px; }
+.panel[hidden] { display: none; }
+.variant { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin: 0 0 14px; font-size: 14.5px; color: var(--muted); }
+.seg { display: inline-flex; border: 1px solid var(--line-2); border-radius: 9px; overflow: hidden; }
+.seg button { appearance: none; border: 0; background: transparent; color: var(--muted); font: 600 13.5px var(--sans); padding: 6px 12px; cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--line-2); }
+.seg button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); }
+.steps { counter-reset: step; list-style: none; padding: 0; margin: 0; }
+.steps > li { position: relative; padding: 0 0 22px 40px; }
+.steps > li::before { counter-increment: step; content: counter(step); position: absolute; left: 0; top: 1px; width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; font: 700 13px var(--sans); color: var(--accent); background: var(--accent-soft); }
+.steps > li > p { margin: 0 0 8px; }
+.steps > li > p.small { color: var(--muted); font-size: 14.5px; margin-top: 8px; }
+
+.code { position: relative; background: var(--code-bg); color: var(--code-fg); border-radius: 11px; border: 1px solid var(--line); }
+.code pre { margin: 0; padding: 14px 56px 14px 16px; overflow-x: auto; font-size: 13.5px; line-height: 1.65; }
+.code .c { color: var(--code-muted); }
+.copy { position: absolute; top: 8px; right: 8px; display: inline-grid; place-items: center; width: 32px; height: 32px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.12); background: rgba(255, 255, 255, 0.04); color: var(--code-muted); cursor: pointer; }
+.copy:hover { color: var(--code-fg); background: rgba(255, 255, 255, 0.08); }
+.copy svg { width: 15px; height: 15px; }
+.copy[data-done] { color: #5cc97c; }
+
+aside.box { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; position: sticky; top: 84px; }
+aside.box h3 { font-size: 15px; }
+aside.box dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 8px 12px; font-size: 14px; }
+aside.box dt { color: var(--muted); }
+aside.box dd { margin: 0; font-weight: 560; }
+aside.box hr { border: 0; border-top: 1px solid var(--line); margin: 16px 0; }
+aside.box ul { margin: 0; padding-left: 18px; color: var(--muted); font-size: 14px; }
+aside.box li + li { margin-top: 6px; }
+
+/* Tables */
+.table { border: 1px solid var(--line); border-radius: var(--radius); overflow-x: auto; background: var(--bg); }
+table { width: 100%; border-collapse: collapse; font-size: 14.5px; }
+th, td { text-align: left; padding: 12px 16px; border-bottom: 1px solid var(--line); vertical-align: top; }
+tr:last-child td { border-bottom: 0; }
+thead th { background: var(--bg-2); color: var(--muted); font-weight: 620; font-size: 13px; white-space: nowrap; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; font-family: var(--mono); font-size: 13.5px; }
+td.mono { font-family: var(--mono); font-size: 13px; }
+td .sub { display: block; color: var(--muted); font-size: 13.5px; margin-top: 2px; }
+.hash { font: 12.5px var(--mono); color: var(--muted); word-break: break-all; }
+.dl-name { font: 600 13.5px var(--mono); }
+
+.tag { display: inline-block; font-size: 12px; font-weight: 650; padding: 3px 9px; border-radius: 999px; white-space: nowrap; }
+.ok { background: var(--ok-bg); color: var(--ok); }
+.part { background: var(--warn-bg); color: var(--warn); }
+.no { background: var(--no-bg); color: var(--no); }
+
+.spec-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.spec { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 22px; }
+.spec ul { margin: 0; padding-left: 18px; color: var(--muted); font-size: 15px; }
+.spec li + li { margin-top: 7px; }
+.spec li b { color: var(--fg); font-weight: 600; }
+.sub-h { font-size: 19px; margin: 40px 0 14px; letter-spacing: -0.015em; }
+.note { color: var(--muted); font-size: 14.5px; margin: 14px 0 0; }
+
+details.faq { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+details.faq + details.faq { margin-top: 10px; }
+details.faq summary { cursor: pointer; padding: 16px 48px 16px 20px; font-weight: 620; list-style: none; position: relative; }
+details.faq summary::-webkit-details-marker { display: none; }
+details.faq summary::after { content: "+"; position: absolute; right: 20px; top: 15px; color: var(--faint); font-weight: 400; font-size: 20px; line-height: 1; }
+details.faq[open] summary::after { content: "\2212"; }
+details.faq > div { padding: 0 20px 18px; color: var(--muted); font-size: 15px; }
+details.faq > div p { margin: 0 0 10px; }
+
+.docs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.docs a { display: block; padding: 16px 18px; border: 1px solid var(--line); border-radius: 11px; color: var(--fg); text-decoration: none; background: var(--panel); }
+.docs a:hover { border-color: var(--line-2); background: var(--bg-2); }
+.docs a b { display: block; font-weight: 620; margin-bottom: 2px; }
+.docs a span { color: var(--muted); font-size: 14px; }
+
+footer { margin-top: 88px; border-top: 1px solid var(--line); padding: 32px 0 48px; color: var(--muted); font-size: 14px; }
+footer .wrap { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 16px; }
+footer p { margin: 0; max-width: 46em; }
+
+.toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px); opacity: 0; background: var(--fg); color: var(--bg); font-size: 14px; font-weight: 600; padding: 9px 16px; border-radius: 999px; pointer-events: none; transition: opacity 0.18s, transform 0.18s; }
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+@media (max-width: 960px) {
+  .hero { grid-template-columns: minmax(0, 1fr); gap: 36px; padding: 48px 0 40px; }
+  .install { grid-template-columns: minmax(0, 1fr); }
+  aside.box { position: static; }
+  .cards, .docs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 @media (max-width: 720px) {
-  .hero { grid-template-columns: 1fr; padding: 40px 0 32px; }
-  .hero img { display: none; }
-  .hero h1 { font-size: 34px; }
-  .grid { grid-template-columns: 1fr; }
-  nav a { margin-left: 14px; }
-  nav a.wide { display: none; }
+  .wrap { padding: 0 16px; }
+  .facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .fact:nth-child(3) { border-left: 0; }
+  .fact:nth-child(n + 3) { border-top: 1px solid var(--line); }
+  .cards, .docs, .spec-grid { grid-template-columns: minmax(0, 1fr); }
+  .brand .ver { display: none; }
+  section { padding-top: 56px; }
+  th, td { padding: 10px 12px; }
+  .table table { min-width: 620px; }
+}
+@media (max-width: 520px) {
+  nav.main a.opt { display: none; }
 }
 </style>
 </head>
 <body>
+<a class="skip" href="#main">Skip to content</a>
 <header class="top">
   <div class="wrap">
-    <a class="brand" href="./"><img src="logo.svg" alt="">MersenneForge</a>
-    <nav>
-      <a href="#status">Status</a>
-      <a class="wide" href="#usage">Usage</a>
-      <a href="https://github.com/adamrsophie/MersenneForge">GitHub</a>
+    <a class="brand" href="./"><img src="logo.svg" alt="" width="28" height="28">MersenneForge <span class="ver">v0.1.0</span></a>
+    <nav class="main" aria-label="Sections">
+      <a href="#install">Install</a>
+      <a class="opt" href="#quickstart">Quick start</a>
+      <a href="#specs">Specs</a>
+      <a class="opt" href="#status">Status</a>
+      <a class="opt" href="#docs">Docs</a>
+      <a class="opt" href="https://github.com/adamrsophie/MersenneForge">GitHub</a>
     </nav>
+    <button class="icon-btn" id="theme" type="button" aria-label="Color theme: system">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 3v18" /><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/></svg>
+    </button>
   </div>
 </header>
 
-<main class="wrap">
+<main id="main" class="wrap">
   <div class="hero">
     <div>
-      <h1>Checked primality tests for Mersenne numbers, in Rust.</h1>
-      <p>MersenneForge runs Lucas-Lehmer and base 3 probable prime tests of M<sub>p</sub> = 2<sup>p</sup> &minus; 1 with Gerbicz error checking, PRP proofs, and durable checkpoints.</p>
-      <a class="btn primary" href="https://github.com/adamrsophie/MersenneForge">View on GitHub</a>
-      <a class="btn ghost" href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/STATUS.md">Capability status</a>
+      <a class="eyebrow" href="https://github.com/adamrsophie/MersenneForge/releases/tag/v0.1.0">v0.1.0 released &middot; macOS and Linux builds</a>
+      <h1>Checked primality tests for <em>Mersenne numbers</em>, in Rust.</h1>
+      <p class="lede">MersenneForge runs Lucas-Lehmer and base 3 probable prime tests of M<sub>p</sub> = 2<sup>p</sup> &minus; 1 with Gerbicz error checking, verifiable PRP proofs, and crash safe checkpoints, on the CPU or the GPU.</p>
+      <div class="actions">
+        <a class="btn primary" href="#install">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg>
+          Install v0.1.0
+        </a>
+        <a class="btn ghost" href="https://github.com/adamrsophie/MersenneForge">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2a10 10 0 0 0-3.16 19.49c.5.09.68-.22.68-.48v-1.7c-2.78.6-3.37-1.34-3.37-1.34-.46-1.16-1.11-1.47-1.11-1.47-.9-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.9 1.52 2.34 1.08 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.64 0 0 .84-.27 2.75 1.02a9.6 9.6 0 0 1 5 0c1.91-1.29 2.75-1.02 2.75-1.02.55 1.37.2 2.39.1 2.64.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.69-4.57 4.93.36.31.68.92.68 1.85v2.74c0 .27.18.58.69.48A10 10 0 0 0 12 2Z"/></svg>
+          Source on GitHub
+        </a>
+      </div>
+      <p class="hero-meta">GPL-3.0-only &middot; Pure Rust, no linked native libraries &middot; Rust 1.89 or newer to build</p>
     </div>
-    <img src="logo.svg" alt="MersenneForge logo">
+    <div class="term" role="img" aria-label="Example commands: doctor, a PRP run with a proof, and proof verification">
+      <div class="term-bar"><i></i><i></i><i></i><span>zsh</span></div>
+<pre><code><span class="c"># What can this machine run?</span>
+<span class="p">$ </span>mersenne-forge doctor --exponent 44497
+
+<span class="c"># A checked PRP test with a power 8 proof</span>
+<span class="p">$ </span>mersenne-forge run --test prp --exponent 44497 \
+    --backend dwt --proof-power 8 \
+    --proof-dir work/proof --checkpoint-dir work/ckpt \
+    --budget 1h
+
+<span class="c"># Anyone can check the proof, on any backend</span>
+<span class="p">$ </span>mersenne-forge verify --proof work/proof/44497-8.proof</code></pre>
+    </div>
   </div>
 
-  <section>
-    <h2>Design</h2>
-    <div class="grid">
-      <div class="card"><h3>One protocol layer</h3><p>The LL, PRP, Gerbicz, proof, and checkpoint state machines are written once over a small arithmetic trait. Backends only do modular arithmetic.</p></div>
-      <div class="card"><h3>Errors caught, not hidden</h3><p>Gerbicz checks with rollback for PRP, the Jacobi check for LL, hashed and versioned checkpoints, and atomic writes.</p></div>
-      <div class="card"><h3>Pure Rust</h3><p>No linked native library and no upstream code. Protocol semantics and the proof format follow PRPLL (gpuowl).</p></div>
+  <div class="facts" aria-label="Key facts">
+    <div class="fact"><b>4</b><span>backends: exact CPU, f64 DWT, wgpu GPU, CUDA</span></div>
+    <div class="fact"><b>p &le; 301,989,546</b><span>GPU exponent range, wavefront included</span></div>
+    <div class="fact"><b>Gerbicz + Jacobi</b><span>error checks for PRP and LL, with rollback</span></div>
+    <div class="fact"><b>Proof v2</b><span>PRPLL compatible proof files</span></div>
+  </div>
+
+  <section id="why" aria-labelledby="why-h">
+    <div class="sec-head">
+      <p class="kicker">Design</p>
+      <h2 id="why-h"><a class="anchor" href="#why">One protocol, many kinds of arithmetic</a></h2>
+      <p>The test protocols are written once over a small arithmetic interface. A backend only squares, multiplies, and moves residues; Rust owns everything that decides whether a result is right.</p>
+    </div>
+    <div class="cards">
+      <div class="card">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 6v6c0 4.5 3.4 8.3 8 9 4.6-.7 8-4.5 8-9V6z"/><path d="m9 12 2 2 4-4"/></svg></div>
+        <h3>Errors caught, not hidden</h3>
+        <p>Gerbicz checks with rollback for PRP, the Jacobi check for LL, roundoff checks on the DWT, coefficient bound checks on the GPU, and a stop after repeated failures.</p>
+      </div>
+      <div class="card">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 4v6h8V4"/><path d="M8 20v-5h8v5"/></svg></div>
+        <h3>Durable by default</h3>
+        <p>Atomic, versioned, hashed checkpoints bound to the build and backend, file locks, a fsynced result journal, and a queue that only drops a line once its result is on disk.</p>
+      </div>
+      <div class="card">
+        <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m8 6-6 6 6 6"/><path d="m16 6 6 6-6 6"/><path d="m14 4-4 16"/></svg></div>
+        <h3>Pure Rust</h3>
+        <p>No upstream code and no linked native library. GPU kernels are WGSL and CUDA C written here. Protocol semantics and the proof format follow PRPLL (gpuowl).</p>
+      </div>
     </div>
   </section>
 
-  <section>
-    <h2>Backends</h2>
-    <div class="table-scroll">
-    <table>
-      <tr><th>Backend</th><th>Arithmetic</th><th>Status</th></tr>
-      <tr><td><code>cpu</code></td><td>Exact big integer, Mersenne folding</td><td><span class="tag ok">CPU tested</span></td></tr>
-      <tr><td><code>dwt</code></td><td>f64 irrational base DWT, roundoff checked</td><td><span class="tag ok">CPU tested</span></td></tr>
-      <tr><td><code>gpu</code></td><td>Exact integer NTT over GF(M31<sup>2</sup>) via wgpu</td><td><span class="tag part">Apple GPU (Metal) only</span></td></tr>
-      <tr><td><code>cuda</code></td><td>CUDA C kernels via cudarc</td><td><span class="tag no">Never run on CUDA hardware</span></td></tr>
-    </table>
+  <section id="install" aria-labelledby="install-h">
+    <div class="sec-head">
+      <p class="kicker">Install</p>
+      <h2 id="install-h"><a class="anchor" href="#install">Get MersenneForge</a></h2>
+      <p>Prebuilt binaries for Apple Silicon Macs and x86_64 Linux, or a build from source on any platform Rust supports.</p>
     </div>
+
+    <div class="install">
+      <div>
+        <div class="tabs" role="tablist" aria-label="Platform">
+          <button role="tab" id="tab-mac" aria-controls="panel-mac" aria-selected="true">macOS</button>
+          <button role="tab" id="tab-linux" aria-controls="panel-linux" aria-selected="false" tabindex="-1">Linux</button>
+          <button role="tab" id="tab-src" aria-controls="panel-src" aria-selected="false" tabindex="-1">From source</button>
+        </div>
+
+        <div class="panel" role="tabpanel" id="panel-mac" aria-labelledby="tab-mac" tabindex="0">
+          <div class="variant">
+            <span>Build</span>
+            <div class="seg" data-platform="mac" role="group" aria-label="macOS build">
+              <button type="button" data-v="gpu" aria-pressed="true">GPU (Metal)</button>
+              <button type="button" data-v="cpu" aria-pressed="false">CPU only</button>
+            </div>
+            <span>Apple Silicon (aarch64)</span>
+          </div>
+          <ol class="steps">
+            <li><p>Download the archive and the checksum list, and check the archive.</p>
+              <div class="code"><pre><code data-tpl="mac-dl">U=https://github.com/adamrsophie/MersenneForge/releases/download/v0.1.0
+F=mersenne-forge-v0.1.0-aarch64-apple-darwin-gpu
+curl -LO "$U/$F.tar.gz" -O "$U/SHA256SUMS"
+grep "$F" SHA256SUMS | shasum -a 256 -c</code></pre></div>
+              <p class="small">The last line must print <code>OK</code>.</p></li>
+            <li><p>Unpack it and put the binary on your <code>PATH</code>.</p>
+              <div class="code"><pre><code data-tpl="mac-x">F=mersenne-forge-v0.1.0-aarch64-apple-darwin-gpu
+tar xzf "$F.tar.gz"
+sudo install -m 755 "$F/mersenne-forge" /usr/local/bin/</code></pre></div>
+              <p class="small">The binary is not signed or notarized. <code>curl</code> downloads are not quarantined; if you downloaded with a browser, run <code>xattr -d com.apple.quarantine</code> on the binary first.</p></li>
+            <li><p>Check the install against known answers.</p>
+              <div class="code"><pre><code>mersenne-forge doctor
+mersenne-forge selftest --backend dwt</code></pre></div></li>
+          </ol>
+        </div>
+
+        <div class="panel" role="tabpanel" id="panel-linux" aria-labelledby="tab-linux" tabindex="0" hidden>
+          <div class="variant">
+            <span>Build</span>
+            <div class="seg" data-platform="linux" role="group" aria-label="Linux build">
+              <button type="button" data-v="gpu" aria-pressed="true">GPU (Vulkan)</button>
+              <button type="button" data-v="cpu" aria-pressed="false">CPU only</button>
+            </div>
+            <span>x86_64, glibc</span>
+          </div>
+          <ol class="steps">
+            <li><p>Download the archive and the checksum list, and check the archive.</p>
+              <div class="code"><pre><code data-tpl="linux-dl">U=https://github.com/adamrsophie/MersenneForge/releases/download/v0.1.0
+F=mersenne-forge-v0.1.0-x86_64-unknown-linux-gnu-gpu
+curl -LO "$U/$F.tar.gz" -O "$U/SHA256SUMS"
+grep "$F" SHA256SUMS | sha256sum -c</code></pre></div>
+              <p class="small">The last line must print <code>OK</code>.</p></li>
+            <li><p>Unpack it and put the binary on your <code>PATH</code>.</p>
+              <div class="code"><pre><code data-tpl="linux-x">F=mersenne-forge-v0.1.0-x86_64-unknown-linux-gnu-gpu
+tar xzf "$F.tar.gz"
+sudo install -m 755 "$F/mersenne-forge" /usr/local/bin/</code></pre></div>
+              <p class="small" data-gpu-only="linux">The GPU build needs a Vulkan driver and loader (for example the vendor driver, or Mesa with <code>libvulkan1</code>). <code>vulkaninfo --summary</code> shows what is installed. A software rasterizer such as llvmpipe is refused unless <code>MERSENNE_FORGE_ALLOW_SOFTWARE_GPU=1</code> is set. Binaries are built on GitHub's current Ubuntu runner; on an older distribution, build from source.</p></li>
+            <li><p>Check the install against known answers.</p>
+              <div class="code"><pre><code>mersenne-forge doctor
+mersenne-forge selftest --backend dwt</code></pre></div></li>
+          </ol>
+        </div>
+
+        <div class="panel" role="tabpanel" id="panel-src" aria-labelledby="tab-src" tabindex="0" hidden>
+          <ol class="steps">
+            <li><p>Install Rust 1.89 or newer with <a href="https://rustup.rs">rustup</a>, then fetch the tagged source.</p>
+              <div class="code"><pre><code>git clone https://github.com/adamrsophie/MersenneForge.git
+cd MersenneForge
+git checkout v0.1.0</code></pre></div></li>
+            <li><p>Build the features you need. Every build has the <code>cpu</code> and <code>dwt</code> backends.</p>
+              <div class="code"><pre><code>cargo build --release --locked                    <span class="c"># cpu and dwt</span>
+cargo build --release --locked --features gpu     <span class="c"># + wgpu: Metal, Vulkan, DX12</span>
+cargo build --release --locked --features cuda    <span class="c"># + CUDA (loads libcuda and NVRTC at run time)</span></code></pre></div>
+              <p class="small">The binary is <code>target/release/mersenne-forge</code>. The CUDA build compiles without a CUDA toolkit; the driver and NVRTC are needed only to run it.</p></li>
+            <li><p>Run the test suite.</p>
+              <div class="code"><pre><code>cargo test --release --locked
+cargo test --release --locked --features gpu --test gpu_backend -- --test-threads=1</code></pre></div></li>
+          </ol>
+        </div>
+      </div>
+
+      <aside class="box" aria-label="Release v0.1.0">
+        <h3>Release v0.1.0</h3>
+        <dl>
+          <dt>Published</dt><dd>2026-11-24</dd>
+          <dt>License</dt><dd>GPL-3.0-only</dd>
+          <dt>Targets</dt><dd>aarch64-apple-darwin, x86_64-unknown-linux-gnu</dd>
+          <dt>MSRV</dt><dd>Rust 1.89</dd>
+        </dl>
+        <hr>
+        <ul>
+          <li>Choose the <b>GPU</b> build if the machine has a supported GPU; it includes the CPU backends too.</li>
+          <li>Each archive holds the binary, <code>LICENSE</code>, <code>README.md</code>, and the build's <code>doctor</code> output.</li>
+          <li><a href="https://github.com/adamrsophie/MersenneForge/releases/tag/v0.1.0">All release files</a></li>
+        </ul>
+      </aside>
+    </div>
+
+    <h3 class="sub-h">Downloads</h3>
+    <div class="table">
+      <table>
+        <thead><tr><th>File</th><th>Platform</th><th class="num">Size</th><th>SHA-256</th></tr></thead>
+        <tbody>
+          <tr><td><a class="dl-name" href="https://github.com/adamrsophie/MersenneForge/releases/download/v0.1.0/mersenne-forge-v0.1.0-aarch64-apple-darwin-gpu.tar.gz">aarch64-apple-darwin-gpu</a></td><td>macOS, Apple Silicon, Metal</td><td class="num">3.8 MB</td><td class="hash">515bef35d3d06223f092c2af97d2a686e0173448c00ff6c6732ea3b926853e96</td></tr>
+          <tr><td><a class="dl-name" href="https://github.com/adamrsophie/MersenneForge/releases/download/v0.1.0/mersenne-forge-v0.1.0-aarch64-apple-darwin-cpu.tar.gz">aarch64-apple-darwin-cpu</a></td><td>macOS, Apple Silicon</td><td class="num">2.0 MB</td><td class="hash">6a42c3e2b731ae699d71c4da5f8b9777e2de3d8e8206255be1df0a459f2e2708</td></tr>
+          <tr><td><a class="dl-name" href="https://github.com/adamrsophie/MersenneForge/releases/download/v0.1.0/mersenne-forge-v0.1.0-x86_64-unknown-linux-gnu-gpu.tar.gz">x86_64-unknown-linux-gnu-gpu</a></td><td>Linux x86_64, Vulkan</td><td class="num">4.4 MB</td><td class="hash">09a217f4f6789363b7582b01a62dce1c2bc983453df5a671700aaf9cba3323be</td></tr>
+          <tr><td><a class="dl-name" href="https://github.com/adamrsophie/MersenneForge/releases/download/v0.1.0/mersenne-forge-v0.1.0-x86_64-unknown-linux-gnu-cpu.tar.gz">x86_64-unknown-linux-gnu-cpu</a></td><td>Linux x86_64</td><td class="num">2.3 MB</td><td class="hash">8e608e3bc9302f6975c6aa72099db2a0ab3f7a2dc7104b5810e92cc82868194b</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">File names start with <code>mersenne-forge-v0.1.0-</code> and end in <code>.tar.gz</code>. The list is also in <a href="https://github.com/adamrsophie/MersenneForge/releases/download/v0.1.0/SHA256SUMS">SHA256SUMS</a>.</p>
   </section>
 
-  <section id="status">
-    <h2>Status</h2>
-    <div class="table-scroll">
-    <table>
-      <tr><th>Area</th><th>Status</th></tr>
-      <tr><td>Checked PRP (Gerbicz), rollback, stop conditions</td><td><span class="tag ok">Implemented, tested</span></td></tr>
-      <tr><td>LL with Jacobi check</td><td><span class="tag ok">Implemented, tested</span></td></tr>
-      <tr><td>Checkpoints and resume</td><td><span class="tag ok">Implemented, tested</span></td></tr>
-      <tr><td>PRP proofs (format version 2); an upstream proof verifies here</td><td><span class="tag ok">Implemented, tested</span></td></tr>
-      <tr><td>Assignment queue, worktodo and result lines, factor checks</td><td><span class="tag part">Never submitted to PrimeNet</span></td></tr>
-      <tr><td>Our proofs accepted by an upstream verifier</td><td><span class="tag no">Not tested</span></td></tr>
-      <tr><td>NVIDIA, AMD, or Intel GPUs</td><td><span class="tag no">Not validated</span></td></tr>
-      <tr><td>Performance comparison</td><td><span class="tag no">Not measured</span></td></tr>
-    </table>
+  <section id="quickstart" aria-labelledby="qs-h">
+    <div class="sec-head">
+      <p class="kicker">Quick start</p>
+      <h2 id="qs-h"><a class="anchor" href="#quickstart">From one test to a work queue</a></h2>
+      <p>Add <code>--json</code> to any command for machine readable output. GPU and CUDA runs need <code>--budget</code>; <code>--device N</code> picks the adapter.</p>
     </div>
-    <p class="note">Every capability, with its evidence or what is missing, is listed in <a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/STATUS.md">docs/STATUS.md</a>. No local result is a discovery claim.</p>
-  </section>
+    <div class="spec-grid">
+      <div>
+        <h3>Single tests</h3>
+        <div class="code"><pre><code><span class="c"># Lucas-Lehmer with the Jacobi check</span>
+mersenne-forge run --test ll --exponent 4423 --backend cpu
 
-  <section id="usage">
-    <h2>Build and run</h2>
-<pre><code>cargo build --release                  # cpu and dwt backends
-cargo build --release --features gpu   # adds the wgpu backend
+<span class="c"># PRP on the GPU, with a proof</span>
+mersenne-forge run --test prp --exponent 1257787 --backend gpu \
+  --proof-power 8 --proof-dir work/proof \
+  --checkpoint-dir work/ckpt --budget 2h
 
-mersenne-forge doctor --json --exponent 44497
-mersenne-forge run --test prp --exponent 44497 --backend dwt \
-    --proof-power 8 --proof-dir work/proof --checkpoint-dir work/ckpt --budget 1h
-mersenne-forge verify --proof work/proof/44497-8.proof --backend cpu
+<span class="c"># Continue after Ctrl-C or a budget stop</span>
+mersenne-forge resume --checkpoint work/ckpt/M1257787-prp.ckpt --budget 2h
+
+<span class="c"># A second run with every bit rotated (shift count)</span>
+mersenne-forge run --test prp --exponent 44497 --shift 12345 --backend dwt</code></pre></div>
+      </div>
+      <div>
+        <h3>Queues and factoring</h3>
+        <div class="code"><pre><code><span class="c"># Run a Prime95 style worktodo file</span>
 mersenne-forge work --worktodo worktodo.txt --results results.json.txt \
-    --checkpoint-dir work/ckpt --proof-dir work/proof --backend dwt
-mersenne-forge check-factor --exponent 11 --factor 23</code></pre>
-    <p class="note">Requires Rust 1.89 or newer.</p>
+  --checkpoint-dir work/ckpt --proof-dir work/proof --backend gpu
+
+<span class="c"># Trial factoring, on the GPU below 2^95</span>
+mersenne-forge tf --exponent 100000007 --from 60 --to 70 --gpu
+
+<span class="c"># P-1, P+1, ECM</span>
+mersenne-forge pm1 --exponent 67 --b1 1000 --b2 3000
+mersenne-forge pp1 --exponent 67 --b1 2000 --b2 50000 --run 1
+mersenne-forge ecm --exponent 67 --b1 2000 --curves 40
+
+<span class="c"># How much factoring does an exponent deserve?</span>
+mersenne-forge policy --exponent 100000007 --tf-bits 77</code></pre></div>
+      </div>
+    </div>
   </section>
 
-  <section>
-    <h2>Documentation</h2>
-    <ul class="links">
-      <li><a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/ARCHITECTURE.md">Architecture</a></li>
-      <li><a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/PROTOCOL.md">Protocol and formats</a></li>
-      <li><a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/VALIDATION.md">Validation report</a></li>
-      <li><a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/BENCHMARK.md">Benchmark method</a></li>
-      <li><a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/GPU.md">GPU backend</a> and <a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/CUDA.md">CUDA backend</a></li>
-    </ul>
+  <section id="specs" aria-labelledby="specs-h">
+    <div class="sec-head">
+      <p class="kicker">Technical specifications</p>
+      <h2 id="specs-h"><a class="anchor" href="#specs">What it computes, and how</a></h2>
+      <p>Exponent ranges are what each backend accepts; the protocol layer also requires p to be prime.</p>
+    </div>
+
+    <h3 class="sub-h" style="margin-top:0">Backends</h3>
+    <div class="table">
+      <table>
+        <thead><tr><th>Backend</th><th>Arithmetic</th><th class="num">Exponents</th><th>Validation</th></tr></thead>
+        <tbody>
+          <tr><td><code>cpu</code><span class="sub">default</span></td><td>Exact big integer squaring with Mersenne folding; the reference</td><td class="num">2 to 4,294,967,295</td><td><span class="tag ok">Tested</span></td></tr>
+          <tr><td><code>dwt</code><span class="sub">default</span></td><td>f64 irrational base DWT (rustfft), lengths to 2<sup>22</sup>, roundoff checked; optional packed real transform and threaded four step FFT</td><td class="num">2 to 50,331,648</td><td><span class="tag ok">Tested</span></td></tr>
+          <tr><td><code>gpu</code><span class="sub">--features gpu</span></td><td>Exact integer NTT on wgpu (Metal, Vulkan, DX12), WGSL kernels. GF((2<sup>31</sup>&minus;1)<sup>2</sup>) to 40.9M, and GF((2<sup>61</sup>&minus;1)<sup>2</sup>) for its gaps and above. No floating point.</td><td class="num">8 to 301,989,546</td><td><span class="tag part">Apple M2 (Metal); Mesa llvmpipe in CI</span></td></tr>
+          <tr><td><code>cuda</code><span class="sub">--features cuda</span></td><td>CUDA C kernels compiled by NVRTC at run time, loaded through cudarc</td><td class="num">12 to 285,212,672</td><td><span class="tag no">CPU emulation only</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 class="sub-h">GPU transform lengths</h3>
+    <div class="table">
+      <table>
+        <thead><tr><th>Field</th><th class="num">Length n</th><th class="num">Largest p</th><th class="num">Word bits</th><th class="num">Carry passes</th></tr></thead>
+        <tbody>
+          <tr><td>GF((2<sup>31</sup>&minus;1)<sup>2</sup>)</td><td class="num">2<sup>16</sup></td><td class="num">456,056</td><td class="num">6..7</td><td class="num">5</td></tr>
+          <tr><td>GF((2<sup>31</sup>&minus;1)<sup>2</sup>)</td><td class="num">2<sup>20</sup></td><td class="num">5,076,519</td><td class="num">4..5</td><td class="num">8</td></tr>
+          <tr><td>GF((2<sup>31</sup>&minus;1)<sup>2</sup>)</td><td class="num">2<sup>22</sup></td><td class="num">15,503,945</td><td class="num">3..4</td><td class="num">10</td></tr>
+          <tr><td>GF((2<sup>31</sup>&minus;1)<sup>2</sup>)</td><td class="num">2<sup>24</sup></td><td class="num">40,894,464</td><td class="num">2..3</td><td class="num">15</td></tr>
+          <tr><td>GF((2<sup>61</sup>&minus;1)<sup>2</sup>)</td><td class="num">2<sup>22</sup></td><td class="num">79,691,733</td><td class="num">18..19</td><td class="num">2</td></tr>
+          <tr><td>GF((2<sup>61</sup>&minus;1)<sup>2</sup>)</td><td class="num">2<sup>23</sup></td><td class="num">153,791,089</td><td class="num">18..19</td><td class="num">2</td></tr>
+          <tr><td>GF((2<sup>61</sup>&minus;1)<sup>2</sup>)</td><td class="num">2<sup>24</sup></td><td class="num">301,989,546</td><td class="num">17..18</td><td class="num">2</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">A plan is accepted only when the proven coefficient bound 2S is at most half the exact recovery limit. Wavefront exponents (100M and up) use n = 2<sup>23</sup>, 128 MiB per transform buffer; n = 2<sup>24</sup> needs an adapter that allows 256 MiB bindings. Full tables are in <a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/GPU.md">GPU.md</a>.</p>
+
+    <h3 class="sub-h">Capabilities</h3>
+    <div class="spec-grid">
+      <div class="spec">
+        <h3>Primality tests</h3>
+        <ul>
+          <li><b>PRP</b>, base 3, Gerbicz checked, residue types 1 to 5; cofactor tests with known factors</li>
+          <li><b>LL</b> with the Jacobi check, rewinding to the last verified residue</li>
+          <li><b>Proofs</b>: format version 2, as PRPLL writes them; self verified after generation</li>
+          <li><b>CERT</b> squarings with a SHA3-256 hash</li>
+          <li><b>Shift counts</b> for PRP and LL, as Prime95 uses for double checks</li>
+          <li><b>k&middot;b<sup>n</sup>+c</b> PRP and Fermat Pépin tests on the host, to 2<sup>20</sup> bits</li>
+        </ul>
+      </div>
+      <div class="spec">
+        <h3>Factoring</h3>
+        <ul>
+          <li><b>Trial factoring</b> with a sieve to 2<sup>16</sup> in mfaktc's 4620 classes; GPU kernel and device sieve below 2<sup>95</sup></li>
+          <li><b>P-1</b>: stage 1 on any backend, paired stage 2 (D = 210), optional polynomial stage 2</li>
+          <li><b>P+1</b> and <b>ECM</b> (Montgomery curves, Suyama sigma) on the host; ECM stage 2 from GMP-ECM save files</li>
+          <li><b>Policy</b>: P-1 bounds and trial factoring depth from a cost model</li>
+          <li>Every factor is checked to divide 2<sup>p</sup>&minus;1 before it is reported</li>
+        </ul>
+      </div>
+      <div class="spec">
+        <h3>Reliability</h3>
+        <ul>
+          <li>Checkpoints written atomically, versioned, hashed, and bound to a SHA3-256 build identity</li>
+          <li>Portable checkpoint export to move a run between builds or backends</li>
+          <li>Locks on checkpoints, proof stores, worktodo, and results files</li>
+          <li>Result journal: an assignment leaves the queue only after its result is fsynced</li>
+          <li>Disk preflight for proof points; faults roll back, repeated faults stop</li>
+        </ul>
+      </div>
+      <div class="spec">
+        <h3>Interoperability</h3>
+        <ul>
+          <li>Prime95 worktodo grammar: <code>PRP=</code>, <code>Test=</code>, <code>DoubleCheck=</code>, <code>Cert=</code>, <code>Factor=</code>, <code>Pminus1=</code>, <code>Pfactor=</code>, <code>Pplus1=</code>, <code>ECM=</code>, <code>ECMSTAGE2=</code></li>
+          <li>JSON result lines in PRPLL's form, with proof MD5</li>
+          <li>PrimeNet v5 client (register, fetch, submit, progress, unreserve) and manual forms</li>
+          <li><code>supervise</code> runs one worker per device; <code>status --serve</code> shows a local page</li>
+        </ul>
+      </div>
+    </div>
+
+    <h3 class="sub-h">Requirements</h3>
+    <div class="table">
+      <table>
+        <thead><tr><th>Component</th><th>Needs</th></tr></thead>
+        <tbody>
+          <tr><td>Building</td><td>Rust 1.89 or newer; <code>cargo build --locked</code> uses the pinned lockfile</td></tr>
+          <tr><td><code>gpu</code> backend</td><td>An adapter through wgpu 30: Metal (macOS), Vulkan (Linux, Windows), or DX12 (Windows); storage bindings of 128 MiB for wavefront exponents</td></tr>
+          <tr><td><code>cuda</code> backend</td><td><code>libcuda</code> and NVRTC at run time; no toolkit needed to build</td></tr>
+          <tr><td>PrimeNet commands</td><td>The system <code>curl</code>; requests go only to mersenne.org over https</td></tr>
+          <tr><td>Power telemetry</td><td>RAPL or <code>powermetrics</code> (root), or an NVIDIA device</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 class="sub-h">Exit codes</h3>
+    <div class="table">
+      <table>
+        <thead><tr><th class="num">Code</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td class="num">0</td><td>Success</td></tr>
+          <tr><td class="num">2</td><td>Usage error</td></tr>
+          <tr><td class="num">3</td><td>Incomplete: budget reached or Ctrl-C; a checkpoint is written when a checkpoint directory was given</td></tr>
+          <tr><td class="num">4</td><td>Unsupported: exponent out of range, missing device, or refused option</td></tr>
+          <tr><td class="num">5</td><td>Execution failure, including a failed proof generation or write</td></tr>
+          <tr><td class="num">6</td><td>Checkpoint or file error</td></tr>
+          <tr><td class="num">7</td><td>Proof rejected, including a rejected self verification</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 class="sub-h">Opt-in variants</h3>
+    <div class="table">
+      <table>
+        <thead><tr><th>Environment variable</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">MERSENNE_FORGE_DWT_PACKED=1</td><td>DWT packed real transform, about half the transform work</td></tr>
+          <tr><td class="mono">MERSENNE_FORGE_DWT_THREADS=N</td><td>DWT four step FFT on N threads</td></tr>
+          <tr><td class="mono">MERSENNE_FORGE_GPU_RADIX4=1</td><td>Two NTT stages per GPU pass, bit identical to one per stage</td></tr>
+          <tr><td class="mono">MERSENNE_FORGE_GPU_PACKED=1</td><td>Two words per GPU element: half length transform and half size buffers</td></tr>
+          <tr><td class="mono">MERSENNE_FORGE_GPU_WIDE=1</td><td>Use the GF((2<sup>61</sup>&minus;1)<sup>2</sup>) field at every exponent</td></tr>
+          <tr><td class="mono">MERSENNE_FORGE_PM1_POLY=1</td><td>Polynomial P-1 stage 2 (B1 &ge; 11, p &le; 2,000,000)</td></tr>
+          <tr><td class="mono">MERSENNE_FORGE_CUDA_GRAPHS=1</td><td>CUDA graph replay of squaring batches</td></tr>
+          <tr><td class="mono">MERSENNE_FORGE_CUDA_NARROW=1</td><td>32-bit CUDA registers</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Each variant has its own plan name, so checkpoints never mix them. <code>mersenne-forge tune</code> times the default against the variants and checks that their residues agree.</p>
+  </section>
+
+  <section id="status" aria-labelledby="status-h">
+    <div class="sec-head">
+      <p class="kicker">Status</p>
+      <h2 id="status-h"><a class="anchor" href="#status">What has been tested, and what has not</a></h2>
+      <p>Each line names its evidence. No local result is a discovery claim.</p>
+    </div>
+    <div class="table">
+      <table>
+        <thead><tr><th>Area</th><th>Status</th><th>Evidence</th></tr></thead>
+        <tbody>
+          <tr><td>PRP with Gerbicz checks, LL with Jacobi checks, checkpoints, resume</td><td><span class="tag ok">Tested</span></td><td>CI on Linux; Apple M2 by hand</td></tr>
+          <tr><td>Proof generation and verification</td><td><span class="tag ok">Tested</span></td><td>An upstream PRPLL proof verifies here; our M786433 proof was byte identical to upstream's</td></tr>
+          <tr><td>GPU, 31-bit field</td><td><span class="tag ok">Tested</span></td><td>Apple M2 through Metal; Mesa llvmpipe in CI</td></tr>
+          <tr><td>GPU, 61-bit field, packed and radix 4 paths, GPU trial factoring</td><td><span class="tag part">Software GPU only</span></td><td>Mesa llvmpipe in CI; not yet on a hardware GPU</td></tr>
+          <tr><td>Factoring, queue, result lines, policy</td><td><span class="tag ok">Tested</span></td><td>CI on Linux</td></tr>
+          <tr><td>PrimeNet v5</td><td><span class="tag part">Register only</span></td><td>Anonymous registration accepted on 2026-11-24; other calls not yet sent</td></tr>
+          <tr><td>CUDA backend</td><td><span class="tag no">Not run on hardware</span></td><td>Model tests and kernel emulation on the CPU</td></tr>
+          <tr><td>NVIDIA, AMD, Intel GPUs through wgpu</td><td><span class="tag no">Not validated</span></td><td>No such device has been available</td></tr>
+          <tr><td>Our proofs accepted by an upstream verifier</td><td><span class="tag no">Not tested</span></td><td>The adapter exists; the upstream verifier does not run on the available Mac</td></tr>
+          <tr><td>Performance against gpuowl or Prime95</td><td><span class="tag no">Not measured</span></td><td>A benchmark harness exists; no tuned baseline has run</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Every capability, with its evidence or what is missing: <a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/STATUS.md">STATUS.md</a>. Commands and observed results: <a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/VALIDATION.md">VALIDATION.md</a>.</p>
+  </section>
+
+  <section id="faq" aria-labelledby="faq-h">
+    <div class="sec-head">
+      <p class="kicker">Notes</p>
+      <h2 id="faq-h"><a class="anchor" href="#faq">Good to know</a></h2>
+    </div>
+    <details class="faq">
+      <summary>What does a PRP pass or an accepted proof mean?</summary>
+      <div>
+        <p>A PRP pass means M<sub>p</sub> is a base 3 probable prime. A proof accepted below p = 2<sup>17</sup> has had its terminal residue recomputed directly; above that, acceptance means the file satisfies the version 2 proof equation, which is sound against computation errors and skipped work but not against a prover who knows a factor of M<sub>p</sub>.</p>
+        <p>No proof establishes that M<sub>p</sub> is prime; an independent test does.</p>
+      </div>
+    </details>
+    <details class="faq">
+      <summary>Can I move a run to another machine or backend?</summary>
+      <div><p>Checkpoints are bound to the build and backend that wrote them. <code>checkpoint-export</code> writes the last verified state without that binding, and <code>resume --backend</code> continues it elsewhere. Proof files are portable across builds and backends.</p></div>
+    </details>
+    <details class="faq">
+      <summary>Does <code>work</code> talk to PrimeNet?</summary>
+      <div><p>No. <code>work</code> reads and writes local files only. The separate <code>primenet-v5</code> and <code>primenet</code> commands contact mersenne.org, and only when you run them.</p></div>
+    </details>
+    <details class="faq">
+      <summary>Why is the GPU backend refusing my device?</summary>
+      <div><p><code>doctor</code> lists the adapters and the plan for an exponent. The backend checks storage binding size, buffer size, storage buffers per stage, and workgroup size, and returns "unsupported" when a plan does not fit. Software rasterizers are refused unless <code>MERSENNE_FORGE_ALLOW_SOFTWARE_GPU=1</code> is set.</p></div>
+    </details>
+  </section>
+
+  <section id="docs" aria-labelledby="docs-h">
+    <div class="sec-head">
+      <p class="kicker">Documentation</p>
+      <h2 id="docs-h"><a class="anchor" href="#docs">Read further</a></h2>
+    </div>
+    <div class="docs">
+      <a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/ARCHITECTURE.md"><b>Architecture</b><span>Modules and the backend interface</span></a>
+      <a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/PROTOCOL.md"><b>Protocol and formats</b><span>LL, PRP, Gerbicz, proofs, result lines</span></a>
+      <a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/GPU.md"><b>GPU backend</b><span>Fields, capacity bound, carries, memory</span></a>
+      <a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/CUDA.md"><b>CUDA backend</b><span>Kernels, range, and its emulation tests</span></a>
+      <a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/BENCHMARK.md"><b>Benchmark method</b><span>Modes, provenance, paired analysis</span></a>
+      <a href="https://github.com/adamrsophie/MersenneForge/blob/main/docs/UPSTREAM.md"><b>Upstream features</b><span>Prime95, gpuowl, mfaktc, Mlucas coverage</span></a>
+    </div>
   </section>
 </main>
 
 <footer>
   <div class="wrap">
-    GPL-3.0-only. The protocol logic was written by studying the GPLv3 source of PRPLL/gpuowl by Mihai Preda and George Woltman. Copyright &copy; 2026 Adam R Sophie.
+    <p>GPL-3.0-only. The protocol logic was written by studying the GPLv3 source of PRPLL/gpuowl by Mihai Preda and George Woltman. Copyright &copy; 2026 Adam R Sophie.</p>
+    <p><a href="https://github.com/adamrsophie/MersenneForge">GitHub</a> &middot; <a href="https://github.com/adamrsophie/MersenneForge/releases">Releases</a> &middot; <a href="https://github.com/adamrsophie/MersenneForge/issues">Issues</a></p>
   </div>
 </footer>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+(function () {
+  var root = document.documentElement;
+  var store = {
+    get: function (k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    set: function (k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+  };
+
+  // Theme: system, light, dark.
+  var themeBtn = document.getElementById("theme");
+  var modes = ["system", "light", "dark"];
+  function applyTheme(m) {
+    if (m === "system") root.removeAttribute("data-theme"); else root.setAttribute("data-theme", m);
+    themeBtn.setAttribute("aria-label", "Color theme: " + m);
+    themeBtn.title = "Theme: " + m;
+  }
+  var saved = store.get("mf-theme");
+  applyTheme(modes.indexOf(saved) >= 0 ? saved : "system");
+  themeBtn.addEventListener("click", function () {
+    var cur = root.getAttribute("data-theme") || "system";
+    var next = modes[(modes.indexOf(cur) + 1) % modes.length];
+    applyTheme(next);
+    store.set("mf-theme", next);
+  });
+
+  // Toast.
+  var toast = document.getElementById("toast");
+  var toastTimer;
+  function say(msg) {
+    toast.textContent = msg;
+    toast.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { toast.classList.remove("show"); }, 1400);
+  }
+
+  // Copy buttons on every code block.
+  var copyIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>';
+  var doneIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 5 5 9-10"/></svg>';
+  function plainCommands(code) {
+    // Drop trailing comments so the copied text runs as is.
+    return code.innerText.split("\n").map(function (l) { return l.replace(/\s+#\s.*$/, ""); }).join("\n").trim() + "\n";
+  }
+  document.querySelectorAll(".code").forEach(function (box) {
+    var code = box.querySelector("code");
+    var b = document.createElement("button");
+    b.type = "button"; b.className = "copy"; b.innerHTML = copyIcon;
+    b.setAttribute("aria-label", "Copy commands");
+    b.addEventListener("click", function () {
+      var text = plainCommands(code);
+      var ok = function () {
+        b.innerHTML = doneIcon; b.setAttribute("data-done", "");
+        say("Copied");
+        setTimeout(function () { b.innerHTML = copyIcon; b.removeAttribute("data-done"); }, 1400);
+      };
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(ok, function () { say("Copy failed"); });
+      } else {
+        var t = document.createElement("textarea");
+        t.value = text; t.style.position = "fixed"; t.style.opacity = "0";
+        document.body.appendChild(t); t.select();
+        try { document.execCommand("copy"); ok(); } catch (e) { say("Copy failed"); }
+        document.body.removeChild(t);
+      }
+    });
+    box.appendChild(b);
+  });
+
+  // Platform tabs (WAI-ARIA tabs pattern).
+  var tabs = Array.prototype.slice.call(document.querySelectorAll('[role="tab"]'));
+  function select(tab, focus) {
+    tabs.forEach(function (t) {
+      var on = t === tab;
+      t.setAttribute("aria-selected", on ? "true" : "false");
+      t.tabIndex = on ? 0 : -1;
+      document.getElementById(t.getAttribute("aria-controls")).hidden = !on;
+    });
+    if (focus) tab.focus();
+    store.set("mf-tab", tab.id);
+  }
+  tabs.forEach(function (t, i) {
+    t.addEventListener("click", function () { select(t, false); });
+    t.addEventListener("keydown", function (e) {
+      var j = null;
+      if (e.key === "ArrowRight") j = (i + 1) % tabs.length;
+      else if (e.key === "ArrowLeft") j = (i - 1 + tabs.length) % tabs.length;
+      else if (e.key === "Home") j = 0;
+      else if (e.key === "End") j = tabs.length - 1;
+      if (j !== null) { e.preventDefault(); select(tabs[j], true); }
+    });
+  });
+  var savedTab = document.getElementById(store.get("mf-tab") || "");
+  if (savedTab && tabs.indexOf(savedTab) >= 0) select(savedTab, false);
+  else if (/Linux/.test(navigator.userAgent) && !/Android/.test(navigator.userAgent)) select(document.getElementById("tab-linux"), false);
+
+  // CPU or GPU build: rewrite the archive names in that platform's steps.
+  var names = {
+    mac: "aarch64-apple-darwin",
+    linux: "x86_64-unknown-linux-gnu"
+  };
+  document.querySelectorAll(".seg").forEach(function (seg) {
+    var plat = seg.getAttribute("data-platform");
+    var panel = seg.closest(".panel");
+    var blocks = Array.prototype.slice.call(panel.querySelectorAll("code[data-tpl]"));
+    var originals = blocks.map(function (c) { return c.textContent; });
+    var gpuNote = panel.querySelector('[data-gpu-only]');
+    function setVariant(v) {
+      seg.querySelectorAll("button").forEach(function (b) { b.setAttribute("aria-pressed", b.getAttribute("data-v") === v ? "true" : "false"); });
+      blocks.forEach(function (c, k) {
+        c.textContent = originals[k].split(names[plat] + "-gpu").join(names[plat] + "-" + v);
+      });
+      if (gpuNote) gpuNote.hidden = v !== "gpu";
+      store.set("mf-variant-" + plat, v);
+    }
+    seg.querySelectorAll("button").forEach(function (b) {
+      b.addEventListener("click", function () { setVariant(b.getAttribute("data-v")); });
+    });
+    var sv = store.get("mf-variant-" + plat);
+    if (sv === "cpu" || sv === "gpu") setVariant(sv);
+  });
+
+  // Highlight the section in view.
+  var links = Array.prototype.slice.call(document.querySelectorAll('nav.main a[href^="#"]'));
+  if ("IntersectionObserver" in window) {
+    var byId = {};
+    links.forEach(function (a) { byId[a.getAttribute("href").slice(1)] = a; });
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (en) {
+        if (en.isIntersecting && byId[en.target.id]) {
+          links.forEach(function (a) { a.removeAttribute("aria-current"); });
+          byId[en.target.id].setAttribute("aria-current", "true");
+        }
+      });
+    }, { rootMargin: "-45% 0px -50% 0px" });
+    Object.keys(byId).forEach(function (id) { var s = document.getElementById(id); if (s) io.observe(s); });
+  }
+})();
+</script>
 </body>
 </html>
