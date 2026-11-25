@@ -1,6 +1,6 @@
 [package]
 name = "mersenne-forge"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.89"
 description = "Rust Mersenne Lucas-Lehmer and base-3 PRP engine with Gerbicz checks and PRP proofs"
