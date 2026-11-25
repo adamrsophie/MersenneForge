@@ -121,7 +121,15 @@ pub fn serve(
     let prefix = format!("/{token}/");
     let url = format!("http://{addr}{prefix}");
     eprintln!("serving {what} at {url} (Ctrl-C to stop)");
-    let launcher = launcher.filter(|page| open_browser(&url, page));
+    // A second secret in the private launcher page: the server returns it
+    // only to requests that carry the token, so a later launch can tell
+    // this server from another program squatting on the same port.
+    let key = token();
+    let launcher = launcher.filter(|page| open_browser(&url, &key, page));
+    let key_header = match &launcher {
+        Some(_) => format!("X-Launcher-Key: {key}\r\n"),
+        None => String::new(),
+    };
     while !STOP.load(Ordering::SeqCst) {
         let mut stream = match listener.accept() {
             Ok((s, _)) => s,
@@ -141,10 +149,11 @@ pub fn serve(
             "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\
              X-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n\
              Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n\
-             Connection: close\r\n\r\n",
+             {}Connection: close\r\n\r\n",
             r.0.code,
             r.0.kind,
-            r.0.body.len()
+            r.0.body.len(),
+            if r.0.code.starts_with("200") { key_header.as_str() } else { "" }
         );
         let _ = stream.write_all(head.as_bytes());
         if !r.1 {
@@ -289,7 +298,19 @@ pub fn temp_launcher() -> PathBuf {
 /// handler gets `page`, a private (0600) local page that redirects to it.
 /// False when the page could not be written; a failed open only prints a
 /// note, since the URL is already on stderr.
-fn open_browser(url: &str, page: &Path) -> bool {
+fn open_browser(url: &str, key: &str, page: &Path) -> bool {
+    if !open_browser_page(url, key, page) {
+        eprintln!("could not open a browser; open the address above by hand");
+        return false;
+    }
+    if open_path(page).is_err() {
+        eprintln!("could not open a browser; open the address above by hand");
+    }
+    true
+}
+
+/// Write the private launcher page for `url`, with `key`.
+fn open_browser_page(url: &str, key: &str, page: &Path) -> bool {
     let _ = std::fs::remove_file(page);
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create_new(true);
@@ -298,20 +319,13 @@ fn open_browser(url: &str, page: &Path) -> bool {
     let written = o.open(page).and_then(|mut f| {
         write!(
             f,
-            "<!doctype html><!--url:{url}--><meta charset=\"utf-8\">\
+            "<!doctype html><!--url:{url}--><!--key:{key}--><meta charset=\"utf-8\">\
              <meta name=\"referrer\" content=\"no-referrer\"><title>MersenneForge</title>\
              <script>location.replace({url:?})</script>\
              <a href=\"{url}\">Open the MersenneForge control page</a>"
         )
     });
-    if written.is_err() {
-        eprintln!("could not open a browser; open the address above by hand");
-        return false;
-    }
-    if open_path(page).is_err() {
-        eprintln!("could not open a browser; open the address above by hand");
-    }
-    true
+    written.is_ok()
 }
 
 fn open_path(page: &Path) -> std::io::Result<std::process::Child> {
@@ -355,11 +369,12 @@ fn alive(page: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(page) else {
         return false;
     };
-    let Some(url) = text
-        .split_once("<!--url:http://")
-        .and_then(|(_, r)| r.split_once("-->"))
-        .map(|(u, _)| u)
-    else {
+    let field = |name: &str| {
+        text.split_once(name)
+            .and_then(|(_, r)| r.split_once("-->"))
+            .map(|(v, _)| v)
+    };
+    let (Some(url), Some(key)) = (field("<!--url:http://"), field("<!--key:")) else {
         return false;
     };
     let Some((host, path)) = url.split_once('/') else {
@@ -372,10 +387,16 @@ fn alive(page: &Path) -> bool {
         return false;
     };
     let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-    let mut head = [0u8; 12];
-    write!(s, "HEAD /{path} HTTP/1.1\r\nHost: {host}\r\n\r\n").is_ok()
-        && s.read_exact(&mut head).is_ok()
-        && head.starts_with(b"HTTP/1.1 200")
+    if write!(s, "HEAD /{path} HTTP/1.1\r\nHost: {host}\r\n\r\n").is_err() {
+        return false;
+    }
+    let mut head = Vec::new();
+    let _ = s.take(16 * 1024).read_to_end(&mut head);
+    let head = String::from_utf8_lossy(&head);
+    head.starts_with("HTTP/1.1 200")
+        && head
+            .lines()
+            .any(|l| l.trim_end() == format!("X-Launcher-Key: {key}"))
 }
 
 /// A launch with no command, as from a double click: keep the files in the
@@ -398,6 +419,9 @@ pub fn launch_app() -> u8 {
             EXIT_STATE
         };
     }
+    // Left over from a server that did not stop cleanly, or answered by
+    // something else: never open it.
+    let _ = std::fs::remove_file(&page);
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -557,6 +581,30 @@ fn append_line(worktodo: &Path, body: &[u8]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A launcher page is trusted only when the server returns its key: a
+    /// program answering 200 on the same port without it is not reused.
+    #[test]
+    fn launcher_pages_need_the_servers_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let page = dir.path().join("open.html");
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let reply = |l: &std::net::TcpListener, key: &str| {
+            let (mut c, _) = l.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = c.read(&mut buf);
+            write!(c, "HTTP/1.1 200 OK\r\n{key}Content-Length: 0\r\n\r\n").unwrap();
+        };
+        assert!(open_browser_page(&format!("http://{addr}/t/"), "k1", &page));
+        let t = std::thread::spawn(move || {
+            reply(&l, "");
+            reply(&l, "X-Launcher-Key: k1\r\n");
+        });
+        assert!(!alive(&page), "a 200 without the key is not this server");
+        assert!(alive(&page), "the key proves it");
+        t.join().unwrap();
+    }
 
     #[test]
     fn appended_lines_are_checked_and_kept_whole() {
