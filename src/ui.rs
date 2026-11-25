@@ -592,8 +592,16 @@ mod tests {
         let addr = l.local_addr().unwrap();
         let reply = |l: &std::net::TcpListener, key: &str| {
             let (mut c, _) = l.accept().unwrap();
+            // Read the whole request first: closing with unread bytes
+            // sends a reset that can discard the reply.
+            let mut got = Vec::new();
             let mut buf = [0u8; 1024];
-            let _ = c.read(&mut buf);
+            while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                match c.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
             write!(c, "HTTP/1.1 200 OK\r\n{key}Content-Length: 0\r\n\r\n").unwrap();
         };
         assert!(open_browser_page(&format!("http://{addr}/t/"), "k1", &page));
