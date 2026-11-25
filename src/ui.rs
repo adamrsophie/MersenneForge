@@ -119,9 +119,7 @@ pub fn serve(
     let prefix = format!("/{token}/");
     let url = format!("http://{addr}{prefix}");
     eprintln!("serving {what} at {url} (Ctrl-C to stop)");
-    if open {
-        open_browser(&url);
-    }
+    let launcher = if open { open_browser(&url) } else { None };
     while !STOP.load(Ordering::SeqCst) {
         let mut stream = match listener.accept() {
             Ok((s, _)) => s,
@@ -150,6 +148,9 @@ pub fn serve(
         if !r.1 {
             let _ = stream.write_all(r.0.body.as_bytes());
         }
+    }
+    if let Some(f) = launcher {
+        let _ = std::fs::remove_file(f);
     }
     Ok(0)
 }
@@ -267,9 +268,30 @@ pub fn run_ui(addr: std::net::SocketAddr, files: UiFiles, open: bool) -> Result<
     })
 }
 
-/// Open `url` with the desktop's handler. A failure only prints a note,
-/// since the URL is already on stderr.
-fn open_browser(url: &str) {
+/// Open `url` with the desktop's handler. The URL carries the access
+/// token, and process arguments are visible to other local users, so the
+/// handler gets a private (0600) local page that redirects to it instead.
+/// Returns that page's path, to delete when the server stops. A failure
+/// only prints a note, since the URL is already on stderr.
+fn open_browser(url: &str) -> Option<PathBuf> {
+    let page = std::env::temp_dir().join(format!("mersenne-forge-{}.html", token()));
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let written = o.open(&page).and_then(|mut f| {
+        write!(
+            f,
+            "<!doctype html><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"no-referrer\">\
+             <title>MersenneForge</title><script>location.replace({:?})</script>\
+             <a href=\"{url}\">Open the MersenneForge control page</a>",
+            url
+        )
+    });
+    if written.is_err() {
+        eprintln!("could not open a browser; open the address above by hand");
+        return None;
+    }
     let mut c = if cfg!(target_os = "macos") {
         std::process::Command::new("open")
     } else if cfg!(windows) {
@@ -280,7 +302,7 @@ fn open_browser(url: &str) {
         std::process::Command::new("xdg-open")
     };
     let r = c
-        .arg(url)
+        .arg(&page)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -288,6 +310,7 @@ fn open_browser(url: &str) {
     if r.is_err() {
         eprintln!("could not open a browser; open the address above by hand");
     }
+    Some(page)
 }
 
 /// How the worktodo parsers read a line: Some((kind, exponent, error)) for
