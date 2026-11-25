@@ -124,7 +124,7 @@ pub fn serve(
     // A second secret in the private launcher page: the server returns it
     // only to requests that carry the token, so a later launch can tell
     // this server from another program squatting on the same port.
-    let key = token();
+    let key = self::token();
     let launcher = launcher.filter(|page| open_browser(&url, &key, page));
     let key_header = match &launcher {
         Some(_) => format!("X-Launcher-Key: {key}\r\n"),
