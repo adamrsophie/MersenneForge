@@ -288,10 +288,11 @@ enum Cmd {
         #[arg(long, default_value_t = 5)]
         max_restarts: u32,
     },
-    /// Open the control page: a local web app with the workers, the queue,
-    /// results, and devices, which can also add assignments to the
-    /// worktodo file. Loopback addresses only, behind a random per-run URL
-    /// token; runs until Ctrl-C.
+    /// Open the control page in the browser: a local web app with the
+    /// workers, the queue, results, and devices, which can also add
+    /// assignments to the worktodo file. Runs when no command is given.
+    /// Loopback addresses only, behind a random per-run URL token; runs
+    /// until Ctrl-C.
     Ui {
         #[arg(long, default_value = "worktodo.txt")]
         worktodo: PathBuf,
@@ -304,6 +305,9 @@ enum Cmd {
         status_file: Vec<PathBuf>,
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: std::net::SocketAddr,
+        /// Print the address without opening a browser.
+        #[arg(long)]
+        no_open: bool,
     },
     /// Print queue, checkpoint, and worker state; with --watch, refresh
     /// every N seconds until Ctrl-C.
@@ -2852,7 +2856,7 @@ fn status_text(
 /// `/<token>/status.txt` the plain text. Only GET and HEAD are answered.
 fn serve_status(addr: std::net::SocketAddr, text: impl Fn() -> String) -> Result<u8, Failure> {
     use ui::Response;
-    ui::serve(addr, "--serve", "status", |r| {
+    ui::serve(addr, "--serve", "status", false, |r| {
         match (r.method.as_str(), r.path.as_str()) {
             ("GET", "") => {
                 Response::new("200 OK", "text/html; charset=utf-8", status_page(&text()))
@@ -3122,7 +3126,13 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    let cli = match Cli::try_parse() {
+    // No command at all (for example a double click on the binary) opens
+    // the control page.
+    let mut args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.len() == 1 {
+        args.push("ui".into());
+    }
+    let cli = match Cli::try_parse_from(args) {
         Ok(c) => c,
         Err(e) => {
             if !json || !e.use_stderr() {
@@ -3482,6 +3492,7 @@ fn main() -> ExitCode {
                 checkpoint_dir,
                 status_file,
                 addr,
+                no_open,
             } => ui::run_ui(
                 addr,
                 ui::UiFiles {
@@ -3490,6 +3501,7 @@ fn main() -> ExitCode {
                     checkpoint_dir,
                     status_files: status_file,
                 },
+                !no_open,
             ),
             Cmd::PrimenetV5 { state_dir, action } => cmd_primenet_v5(&state_dir, action),
             Cmd::Primenet {

@@ -1480,6 +1480,7 @@ fn ui_serves_the_control_page_and_appends_lines() {
             s(&results),
             "--addr",
             "127.0.0.1:0",
+            "--no-open",
         ])
         .stderr(std::process::Stdio::piped())
         .spawn()

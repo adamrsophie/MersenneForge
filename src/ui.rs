@@ -85,11 +85,13 @@ fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// Serve `handle` on a loopback address until Ctrl-C. `flag` names the
-/// option in messages; `what` is printed with the URL.
+/// option in messages; `what` is printed with the URL. With `open`, a busy
+/// port falls back to a free one and the page opens in the default browser.
 pub fn serve(
     addr: std::net::SocketAddr,
     flag: &str,
     what: &str,
+    open: bool,
     mut handle: impl FnMut(&Request) -> Response,
 ) -> Result<u8, Failure> {
     // The pages show local paths and queue contents: never on a public
@@ -100,8 +102,14 @@ pub fn serve(
             format!("{flag} {addr}: only loopback addresses are allowed"),
         ));
     }
-    let listener = std::net::TcpListener::bind(addr)
-        .map_err(|e| fail(EXIT_STATE, format!("{flag} {addr}: {e}")))?;
+    let listener = match std::net::TcpListener::bind(addr) {
+        Err(e) if open && e.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!("{addr} is in use; picking a free port");
+            std::net::TcpListener::bind((addr.ip(), 0))
+        }
+        r => r,
+    }
+    .map_err(|e| fail(EXIT_STATE, format!("{flag} {addr}: {e}")))?;
     listener
         .set_nonblocking(true)
         .map_err(|e| fail(EXIT_STATE, e.to_string()))?;
@@ -109,7 +117,11 @@ pub fn serve(
     let token = token();
     let hosts = [addr.to_string(), format!("localhost:{}", addr.port())];
     let prefix = format!("/{token}/");
-    eprintln!("serving {what} at http://{addr}{prefix} (Ctrl-C to stop)");
+    let url = format!("http://{addr}{prefix}");
+    eprintln!("serving {what} at {url} (Ctrl-C to stop)");
+    if open {
+        open_browser(&url);
+    }
     while !STOP.load(Ordering::SeqCst) {
         let mut stream = match listener.accept() {
             Ok((s, _)) => s,
@@ -232,8 +244,8 @@ pub struct UiFiles {
 }
 
 /// `mersenne-forge ui`.
-pub fn run_ui(addr: std::net::SocketAddr, files: UiFiles) -> Result<u8, Failure> {
-    serve(addr, "ui --addr", "the control page", |r| {
+pub fn run_ui(addr: std::net::SocketAddr, files: UiFiles, open: bool) -> Result<u8, Failure> {
+    serve(addr, "ui --addr", "the control page", open, |r| {
         match (r.method.as_str(), r.path.as_str()) {
             ("GET", "") => Response::new("200 OK", "text/html; charset=utf-8", UI_HTML),
             ("GET", "api/state") => Response::json("200 OK", &state(&files)),
@@ -253,6 +265,29 @@ pub fn run_ui(addr: std::net::SocketAddr, files: UiFiles) -> Result<u8, Failure>
             _ => Response::text("405 Method Not Allowed", "only GET, HEAD, and POST"),
         }
     })
+}
+
+/// Open `url` with the desktop's handler. A failure only prints a note,
+/// since the URL is already on stderr.
+fn open_browser(url: &str) {
+    let mut c = if cfg!(target_os = "macos") {
+        std::process::Command::new("open")
+    } else if cfg!(windows) {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", ""]);
+        c
+    } else {
+        std::process::Command::new("xdg-open")
+    };
+    let r = c
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if r.is_err() {
+        eprintln!("could not open a browser; open the address above by hand");
+    }
 }
 
 /// How the worktodo parsers read a line: Some((kind, exponent, error)) for
