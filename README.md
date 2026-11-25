@@ -38,6 +38,14 @@ Everything in this repository is Rust (plus WGSL and CUDA C kernel sources embed
 
 CI runs CPU tests, CUDA model and kernel host emulation, strict documentation checks, and feature compilation. GPU hardware tests are run by hand. Details, commands, and observed results: [docs/VALIDATION.md](docs/VALIDATION.md). Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Protocol and formats: [docs/PROTOCOL.md](docs/PROTOCOL.md). Benchmark method: [docs/BENCHMARK.md](docs/BENCHMARK.md). Every capability and what is missing: [docs/STATUS.md](docs/STATUS.md).
 
+## Install
+
+Release archives for x86_64 Linux and Apple Silicon macOS, with `SHA256SUMS`, are on the [releases page](https://github.com/adamrsophie/MersenneForge/releases). The macOS binaries are not signed or notarized, so macOS refuses one downloaded with a browser ("Apple could not verify ... is free of malware"). Download with `curl`, which does not quarantine files, or clear the flag after unpacking:
+
+```sh
+xattr -dr com.apple.quarantine mersenne-forge-v0.2.0-aarch64-apple-darwin-gpu
+```
+
 ## Build
 
 Rust 1.89 or newer builds and tests every feature (1.89 is the first version with `std::fs::File::try_lock`, used for the checkpoint lock; it also covers the minimums of `wgpu` and `proptest`). CI builds and tests at 1.89.
