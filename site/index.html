@@ -342,7 +342,8 @@ grep "$F" SHA256SUMS | shasum -a 256 -c</code></pre></div>
 tar xzf "$F.tar.gz"
 sudo install -m 755 "$F/mersenne-forge" /usr/local/bin/</code></pre></div>
               <p class="small">The binary is not signed or notarized, so macOS refuses an archive downloaded with a browser ("Apple could not verify ... is free of malware"). <code>curl</code> downloads are not quarantined. After a browser download, clear the flag on the unpacked binary, then install it:</p>
-              <div class="code"><pre><code>xattr -dr com.apple.quarantine "$F"</code></pre></div></li>
+              <div class="code"><pre><code>xattr -dr com.apple.quarantine "$F"</code></pre></div>
+              <p class="small">The archive also holds <code>MersenneForge.app</code>. Move it to Applications and double click it to open the control page in the browser, with no terminal window.</p></li>
             <li><p>Check the install against known answers.</p>
               <div class="code"><pre><code>mersenne-forge doctor
 mersenne-forge selftest --backend dwt</code></pre></div></li>
@@ -456,7 +457,7 @@ mersenne-forge work --worktodo worktodo.txt --results results.json.txt \
   --checkpoint-dir work/ckpt --proof-dir work/proof --backend gpu
 
 <span class="c"># A local control page in the browser: progress, queue, results,</span>
-<span class="c"># devices. Running mersenne-forge with no command does the same.</span>
+<span class="c"># devices. On macOS, double click MersenneForge.app instead.</span>
 mersenne-forge ui --worktodo worktodo.txt --results results.json.txt \
   --checkpoint-dir work/ckpt
 

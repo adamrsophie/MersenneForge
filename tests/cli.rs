@@ -1516,8 +1516,13 @@ fn ui_serves_the_control_page_and_appends_lines() {
     let refused = ask("POST", "api/queue", &own, "Test=4");
     let foreign = ask("POST", "api/queue", "http://attacker.example", "Test=607");
     let state = ask("GET", "api/state", &own, "");
-    let _ = child.kill();
-    let _ = child.wait();
+    let quit = ask("POST", "api/quit", &own, "");
+    assert!(quit.contains("\"ok\":true"), "{quit}");
+    assert_eq!(
+        child.wait().unwrap().code(),
+        Some(0),
+        "Stop ends the server"
+    );
     assert!(
         page.starts_with("HTTP/1.1 200") && page.contains("MersenneForge"),
         "{page}"

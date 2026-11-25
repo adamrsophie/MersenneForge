@@ -85,13 +85,15 @@ fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// Serve `handle` on a loopback address until Ctrl-C. `flag` names the
-/// option in messages; `what` is printed with the URL. With `open`, a busy
-/// port falls back to a free one and the page opens in the default browser.
+/// option in messages; `what` is printed with the URL. With a `launcher`
+/// path, a busy port falls back to a free one, a private page that
+/// redirects to the URL is written there, and the browser opens it; the
+/// page is removed when the server stops.
 pub fn serve(
     addr: std::net::SocketAddr,
     flag: &str,
     what: &str,
-    open: bool,
+    launcher: Option<PathBuf>,
     mut handle: impl FnMut(&Request) -> Response,
 ) -> Result<u8, Failure> {
     // The pages show local paths and queue contents: never on a public
@@ -103,7 +105,7 @@ pub fn serve(
         ));
     }
     let listener = match std::net::TcpListener::bind(addr) {
-        Err(e) if open && e.kind() == std::io::ErrorKind::AddrInUse => {
+        Err(e) if launcher.is_some() && e.kind() == std::io::ErrorKind::AddrInUse => {
             eprintln!("{addr} is in use; picking a free port");
             std::net::TcpListener::bind((addr.ip(), 0))
         }
@@ -119,7 +121,7 @@ pub fn serve(
     let prefix = format!("/{token}/");
     let url = format!("http://{addr}{prefix}");
     eprintln!("serving {what} at {url} (Ctrl-C to stop)");
-    let launcher = if open { open_browser(&url) } else { None };
+    let launcher = launcher.filter(|page| open_browser(&url, page));
     while !STOP.load(Ordering::SeqCst) {
         let mut stream = match listener.accept() {
             Ok((s, _)) => s,
@@ -245,53 +247,74 @@ pub struct UiFiles {
 }
 
 /// `mersenne-forge ui`.
-pub fn run_ui(addr: std::net::SocketAddr, files: UiFiles, open: bool) -> Result<u8, Failure> {
-    serve(addr, "ui --addr", "the control page", open, |r| {
-        match (r.method.as_str(), r.path.as_str()) {
-            ("GET", "") => Response::new("200 OK", "text/html; charset=utf-8", UI_HTML),
-            ("GET", "api/state") => Response::json("200 OK", &state(&files)),
-            ("GET", "api/doctor") => {
-                let p = r
-                    .query
-                    .split('&')
-                    .find_map(|kv| kv.strip_prefix("exponent="))
-                    .and_then(|v| v.parse::<u32>().ok());
-                Response::json("200 OK", &crate::doctor_json(p))
-            }
-            ("POST", "api/queue") => match append_line(&files.worktodo, &r.body) {
-                Ok(line) => Response::json("200 OK", &json!({ "ok": true, "line": line })),
-                Err(e) => Response::json("400 Bad Request", &json!({ "ok": false, "error": e })),
-            },
-            ("GET", _) | ("POST", _) => Response::text("404 Not Found", "not found"),
-            _ => Response::text("405 Method Not Allowed", "only GET, HEAD, and POST"),
+pub fn run_ui(
+    addr: std::net::SocketAddr,
+    files: UiFiles,
+    launcher: Option<PathBuf>,
+) -> Result<u8, Failure> {
+    serve(addr, "ui --addr", "the control page", launcher, |r| match (
+        r.method.as_str(),
+        r.path.as_str(),
+    ) {
+        ("GET", "") => Response::new("200 OK", "text/html; charset=utf-8", UI_HTML),
+        ("GET", "api/state") => Response::json("200 OK", &state(&files)),
+        ("GET", "api/doctor") => {
+            let p = r
+                .query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("exponent="))
+                .and_then(|v| v.parse::<u32>().ok());
+            Response::json("200 OK", &crate::doctor_json(p))
         }
+        ("POST", "api/queue") => match append_line(&files.worktodo, &r.body) {
+            Ok(line) => Response::json("200 OK", &json!({ "ok": true, "line": line })),
+            Err(e) => Response::json("400 Bad Request", &json!({ "ok": false, "error": e })),
+        },
+        ("POST", "api/quit") => {
+            STOP.store(true, Ordering::SeqCst);
+            Response::json("200 OK", &json!({ "ok": true }))
+        }
+        ("GET", _) | ("POST", _) => Response::text("404 Not Found", "not found"),
+        _ => Response::text("405 Method Not Allowed", "only GET, HEAD, and POST"),
     })
+}
+
+/// A fresh launcher page path in the temp directory.
+pub fn temp_launcher() -> PathBuf {
+    std::env::temp_dir().join(format!("mersenne-forge-{}.html", token()))
 }
 
 /// Open `url` with the desktop's handler. The URL carries the access
 /// token, and process arguments are visible to other local users, so the
-/// handler gets a private (0600) local page that redirects to it instead.
-/// Returns that page's path, to delete when the server stops. A failure
-/// only prints a note, since the URL is already on stderr.
-fn open_browser(url: &str) -> Option<PathBuf> {
-    let page = std::env::temp_dir().join(format!("mersenne-forge-{}.html", token()));
+/// handler gets `page`, a private (0600) local page that redirects to it.
+/// False when the page could not be written; a failed open only prints a
+/// note, since the URL is already on stderr.
+fn open_browser(url: &str, page: &Path) -> bool {
+    let _ = std::fs::remove_file(page);
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-    let written = o.open(&page).and_then(|mut f| {
+    let written = o.open(page).and_then(|mut f| {
         write!(
             f,
-            "<!doctype html><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"no-referrer\">\
-             <title>MersenneForge</title><script>location.replace({:?})</script>\
-             <a href=\"{url}\">Open the MersenneForge control page</a>",
-            url
+            "<!doctype html><!--url:{url}--><meta charset=\"utf-8\">\
+             <meta name=\"referrer\" content=\"no-referrer\"><title>MersenneForge</title>\
+             <script>location.replace({url:?})</script>\
+             <a href=\"{url}\">Open the MersenneForge control page</a>"
         )
     });
     if written.is_err() {
         eprintln!("could not open a browser; open the address above by hand");
-        return None;
+        return false;
     }
+    if open_path(page).is_err() {
+        eprintln!("could not open a browser; open the address above by hand");
+    }
+    true
+}
+
+fn open_path(page: &Path) -> std::io::Result<std::process::Child> {
     let mut c = if cfg!(target_os = "macos") {
         std::process::Command::new("open")
     } else if cfg!(windows) {
@@ -301,16 +324,116 @@ fn open_browser(url: &str) -> Option<PathBuf> {
     } else {
         std::process::Command::new("xdg-open")
     };
-    let r = c
-        .arg(&page)
+    c.arg(page)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn();
-    if r.is_err() {
-        eprintln!("could not open a browser; open the address above by hand");
+        .spawn()
+}
+
+/// Where a launch without a command keeps its files: the platform's
+/// per-user application data directory.
+fn data_dir() -> Option<PathBuf> {
+    let var = |k: &str| {
+        std::env::var_os(k)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    if cfg!(target_os = "macos") {
+        var("HOME").map(|h| h.join("Library/Application Support/MersenneForge"))
+    } else if cfg!(windows) {
+        var("APPDATA").map(|a| a.join("MersenneForge"))
+    } else {
+        var("XDG_DATA_HOME")
+            .or_else(|| var("HOME").map(|h| h.join(".local/share")))
+            .map(|d| d.join("mersenne-forge"))
     }
-    Some(page)
+}
+
+/// True when the launcher page points at a server that answers.
+fn alive(page: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(page) else {
+        return false;
+    };
+    let Some(url) = text
+        .split_once("<!--url:http://")
+        .and_then(|(_, r)| r.split_once("-->"))
+        .map(|(u, _)| u)
+    else {
+        return false;
+    };
+    let Some((host, path)) = url.split_once('/') else {
+        return false;
+    };
+    let Ok(addr) = host.parse::<std::net::SocketAddr>() else {
+        return false;
+    };
+    let Ok(mut s) = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1)) else {
+        return false;
+    };
+    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut head = [0u8; 12];
+    write!(s, "HEAD /{path} HTTP/1.1\r\nHost: {host}\r\n\r\n").is_ok()
+        && s.read_exact(&mut head).is_ok()
+        && head.starts_with(b"HTTP/1.1 200")
+}
+
+/// A launch with no command, as from a double click: keep the files in the
+/// per-user data directory, reuse a control page that is already running,
+/// or start one in the background (no terminal needed) and open it.
+pub fn launch_app() -> u8 {
+    let Some(dir) = data_dir() else {
+        eprintln!("no home directory; run mersenne-forge ui instead");
+        return 2;
+    };
+    if let Err(e) = std::fs::create_dir_all(dir.join("checkpoints")) {
+        eprintln!("{}: {e}", dir.display());
+        return EXIT_STATE;
+    }
+    let page = dir.join("open.html");
+    if alive(&page) {
+        return if open_path(&page).is_ok() {
+            0
+        } else {
+            EXIT_STATE
+        };
+    }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("ui.log"));
+    let Ok(exe) = std::env::current_exe() else {
+        eprintln!("cannot find this program's path; run mersenne-forge ui instead");
+        return EXIT_STATE;
+    };
+    let mut c = std::process::Command::new(exe);
+    c.arg("ui")
+        .arg("--worktodo")
+        .arg(dir.join("worktodo.txt"))
+        .arg("--results")
+        .arg(dir.join("results.txt"))
+        .arg("--checkpoint-dir")
+        .arg(dir.join("checkpoints"))
+        .arg("--launcher")
+        .arg(&page)
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
+    match log {
+        Ok(f) => c.stderr(f),
+        Err(_) => c.stderr(std::process::Stdio::null()),
+    };
+    // Its own process group, so closing whatever launched it does not stop
+    // the server; the page's Stop button does.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut c, 0);
+    match c.spawn() {
+        Ok(_) => 0,
+        Err(e) => {
+            eprintln!("could not start the control page: {e}");
+            EXIT_STATE
+        }
+    }
 }
 
 /// How the worktodo parsers read a line: Some((kind, exponent, error)) for

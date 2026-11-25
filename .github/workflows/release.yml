@@ -61,6 +61,43 @@ jobs:
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/mersenne-forge" LICENSE README.md "$name/"
           "$name/mersenne-forge" doctor > "$name/doctor.txt" 2>&1 || true
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            # An app bundle, so a double click opens the control page
+            # without a terminal window.
+            app="$name/MersenneForge.app"
+            mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+            cp "target/${{ matrix.target }}/release/mersenne-forge" "$app/Contents/MacOS/"
+            iconset="$RUNNER_TEMP/AppIcon.iconset"
+            mkdir -p "$iconset"
+            for s in 16 32 128 256 512; do
+              sips -z $s $s assets/logo.png --out "$iconset/icon_${s}x${s}.png" >/dev/null
+              sips -z $((s * 2)) $((s * 2)) assets/logo.png --out "$iconset/icon_${s}x${s}@2x.png" >/dev/null
+            done
+            iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
+            version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+            cat > "$app/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key><string>mersenne-forge</string>
+            <key>CFBundleIdentifier</key><string>io.github.adamrsophie.mersenneforge</string>
+            <key>CFBundleName</key><string>MersenneForge</string>
+            <key>CFBundleDisplayName</key><string>MersenneForge</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
+            <key>CFBundleShortVersionString</key><string>$version</string>
+            <key>CFBundleVersion</key><string>$version</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>LSUIElement</key><true/>
+          </dict>
+          </plist>
+          PLIST
+            plutil -lint "$app/Contents/Info.plist"
+            codesign --force --deep --sign - "$app"
+            codesign --verify --deep "$app"
+            "$app/Contents/MacOS/mersenne-forge" --version
+          fi
           tar czf "$name.tar.gz" "$name"
       - uses: actions/upload-artifact@v4
         with:

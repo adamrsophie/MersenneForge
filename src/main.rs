@@ -290,9 +290,11 @@ enum Cmd {
     },
     /// Open the control page in the browser: a local web app with the
     /// workers, the queue, results, and devices, which can also add
-    /// assignments to the worktodo file. Runs when no command is given.
-    /// Loopback addresses only, behind a random per-run URL token; runs
-    /// until Ctrl-C.
+    /// assignments to the worktodo file. Loopback addresses only, behind a
+    /// random per-run URL token; runs until Ctrl-C or the page's Stop
+    /// button. Launching the program with no command (a double click)
+    /// runs this in the background, with its files in the per-user data
+    /// directory.
     Ui {
         #[arg(long, default_value = "worktodo.txt")]
         worktodo: PathBuf,
@@ -308,6 +310,10 @@ enum Cmd {
         /// Print the address without opening a browser.
         #[arg(long)]
         no_open: bool,
+        /// Where to write the private page that opens the browser (it
+        /// redirects to the tokened address); a temp file by default.
+        #[arg(long, hide = true)]
+        launcher: Option<PathBuf>,
     },
     /// Print queue, checkpoint, and worker state; with --watch, refresh
     /// every N seconds until Ctrl-C.
@@ -2856,7 +2862,7 @@ fn status_text(
 /// `/<token>/status.txt` the plain text. Only GET and HEAD are answered.
 fn serve_status(addr: std::net::SocketAddr, text: impl Fn() -> String) -> Result<u8, Failure> {
     use ui::Response;
-    ui::serve(addr, "--serve", "status", false, |r| {
+    ui::serve(addr, "--serve", "status", None, |r| {
         match (r.method.as_str(), r.path.as_str()) {
             ("GET", "") => {
                 Response::new("200 OK", "text/html; charset=utf-8", status_page(&text()))
@@ -3126,11 +3132,12 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    // No command at all (for example a double click on the binary) opens
-    // the control page.
-    let mut args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if args.len() == 1 {
-        args.push("ui".into());
+    // No command at all (a double click on the app or the binary) starts
+    // the control page in the background and opens it. Older macOS adds a
+    // -psn_ argument when launching an app.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.len() == 1 || (args.len() == 2 && args[1].to_string_lossy().starts_with("-psn_")) {
+        return ExitCode::from(ui::launch_app());
     }
     let cli = match Cli::try_parse_from(args) {
         Ok(c) => c,
@@ -3493,6 +3500,7 @@ fn main() -> ExitCode {
                 status_file,
                 addr,
                 no_open,
+                launcher,
             } => ui::run_ui(
                 addr,
                 ui::UiFiles {
@@ -3501,7 +3509,7 @@ fn main() -> ExitCode {
                     checkpoint_dir,
                     status_files: status_file,
                 },
-                !no_open,
+                (!no_open).then(|| launcher.unwrap_or_else(ui::temp_launcher)),
             ),
             Cmd::PrimenetV5 { state_dir, action } => cmd_primenet_v5(&state_dir, action),
             Cmd::Primenet {

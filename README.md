@@ -40,10 +40,10 @@ CI runs CPU tests, CUDA model and kernel host emulation, strict documentation ch
 
 ## Install
 
-Release archives for x86_64 Linux and Apple Silicon macOS, with `SHA256SUMS`, are on the [releases page](https://github.com/adamrsophie/MersenneForge/releases). The macOS binaries are not signed or notarized, so macOS refuses one downloaded with a browser ("Apple could not verify ... is free of malware"). Download with `curl`, which does not quarantine files, or clear the flag after unpacking:
+Release archives for x86_64 Linux and Apple Silicon macOS, with `SHA256SUMS`, are on the [releases page](https://github.com/adamrsophie/MersenneForge/releases). Each macOS archive also holds `MersenneForge.app`: double click it (or the bare binary on Linux) and the control page opens in the browser, with no terminal; its files live in `~/Library/Application Support/MersenneForge` (`~/.local/share/mersenne-forge` on Linux), and the page's Stop button ends it. Every other command runs from a terminal as `mersenne-forge <command>`. The macOS builds are not signed or notarized, so macOS refuses one downloaded with a browser ("Apple could not verify ... is free of malware"). Download with `curl`, which does not quarantine files, or clear the flag after unpacking:
 
 ```sh
-xattr -dr com.apple.quarantine mersenne-forge-v0.2.0-aarch64-apple-darwin-gpu
+xattr -dr com.apple.quarantine mersenne-forge-v0.2.1-aarch64-apple-darwin-gpu
 ```
 
 ## Build
@@ -86,7 +86,7 @@ mersenne-forge supervise --config workers.json
 mersenne-forge status --worktodo worktodo.txt --results results.json.txt --checkpoint-dir work/ckpt
 mersenne-forge status --worktodo worktodo.txt --results results.json.txt --serve 127.0.0.1:8080   # web page, loopback only
 mersenne-forge ui --worktodo worktodo.txt --results results.json.txt --checkpoint-dir work/ckpt --status-file w1.json   # control page in the browser, loopback only
-mersenne-forge                     # no command: the same control page with the defaults
+mersenne-forge                     # no command: the control page in the background, files in the per-user data directory
 mersenne-forge tune --exponent 1000003 --backend dwt
 mersenne-forge power --source rapl
 ```

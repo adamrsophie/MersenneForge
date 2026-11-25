@@ -158,6 +158,7 @@ dl.kv dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
       <span class="cap">Connection</span>
       <span class="live"><span class="dot" id="conn-dot"></span><span id="conn">Connecting</span></span>
       <span class="muted">Local only. Nothing on this page is sent to PrimeNet.</span>
+      <button type="button" class="btn" id="stop" style="min-height:36px;font-size:13px">Stop the server</button>
     </div>
   </aside>
   <main id="view" tabindex="-1" aria-live="polite"></main>
@@ -203,7 +204,9 @@ dl.kv dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
     return r.json();
   }
 
+  let stopped = false;
   async function poll() {
+    if (stopped) return;
     try {
       state = await getJSON("api/state");
       failed = false;
@@ -530,6 +533,14 @@ dl.kv dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
     }).join("");
     el.innerHTML = '<div class="table"><table style="min-width:560px"><thead><tr><th scope="col">Backend</th><th scope="col">Plan</th><th scope="col">Peak PRP</th><th scope="col">Peak LL</th><th scope="col">Proof generation</th></tr></thead><tbody>' + rows + "</tbody></table></div>";
   }
+
+  document.getElementById("stop").addEventListener("click", async () => {
+    try { await fetch("api/quit", { method: "POST" }); } catch (e) { /* already gone */ }
+    stopped = true;
+    document.getElementById("conn").textContent = "Stopped";
+    document.getElementById("conn-dot").className = "dot idle";
+    view.innerHTML = '<div class="empty"><b>The server has stopped.</b><span>Close this tab. Open MersenneForge again to bring the page back.</span></div>';
+  });
 
   window.addEventListener("hashchange", setRoute);
   setRoute();
